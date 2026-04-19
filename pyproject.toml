@@ -34,7 +34,7 @@ dev   = [
 Homepage = "https://github.com/canhotuctor/vsss-sim"
 
 [tool.setuptools.packages.find]
-where   = ["."]
+where   = ["src"]
 include = ["vsss_sim*"]
 
 # ---------------------------------------------------------------------------

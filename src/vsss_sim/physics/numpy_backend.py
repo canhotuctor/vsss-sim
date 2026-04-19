@@ -1,5 +1,5 @@
 """
-2-D physics engine for the VSSS simulator.
+2-D physics engine for the VSSS simulator (NumPy backend).
 
 Coordinate system
 -----------------
@@ -38,7 +38,7 @@ from typing import Optional
 
 import numpy as np
 
-from . import config
+from .. import config
 
 # ---------------------------------------------------------------------------
 # State container

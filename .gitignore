@@ -28,5 +28,8 @@ htmlcov/
 *.swp
 *~
 
+# MLflow
+mlflow.db
+
 # macOS
 .DS_Store

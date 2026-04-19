@@ -15,7 +15,7 @@ from __future__ import annotations
 import gymnasium as gym
 
 from . import config  # noqa: F401 – expose constants at package level
-from .env import VSSEnv
+from .envs import VSSEnv
 
 __version__ = "0.1.0"
 __all__ = ["VSSEnv", "config"]
@@ -25,6 +25,6 @@ __all__ = ["VSSEnv", "config"]
 # ---------------------------------------------------------------------------
 gym.register(
     id="VSSS-v0",
-    entry_point="vsss_sim.env:VSSEnv",
+    entry_point="vsss_sim.envs:VSSEnv",
     max_episode_steps=config.MAX_EPISODE_STEPS,
 )

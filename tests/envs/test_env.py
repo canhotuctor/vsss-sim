@@ -1,4 +1,4 @@
-"""Tests for vsss_sim.env (VSSEnv Gymnasium interface)."""
+"""Tests for vsss_sim.envs (VSSEnv Gymnasium interface)."""
 
 import gymnasium as gym
 import numpy as np
@@ -7,7 +7,7 @@ from gymnasium.utils.env_checker import check_env
 
 import vsss_sim  # noqa: F401 – registers "VSSS-v0"
 from vsss_sim import config
-from vsss_sim.env import VSSEnv
+from vsss_sim.envs import VSSEnv
 
 # ---------------------------------------------------------------------------
 # Fixtures

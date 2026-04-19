@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 
-from . import config
+from .. import config
 
 try:
     import pygame
