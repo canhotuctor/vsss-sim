@@ -48,8 +48,9 @@ class VSSEnv(VSSBaseEnv):
         opponent_policy: str | Callable = "stationary",
         render_mode: Optional[str] = None,
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
+        render_fps: Optional[float] = None,
     ) -> None:
-        super().__init__(render_mode=render_mode, max_episode_steps=max_episode_steps)
+        super().__init__(render_mode=render_mode, max_episode_steps=max_episode_steps, render_fps=render_fps)
 
         if callable(opponent_policy):
             self._opponent_policy: Callable = opponent_policy
@@ -136,7 +137,7 @@ class VSSEnv(VSSBaseEnv):
 
         if self._renderer is None:
             from ..rendering import VSSRenderer
-            self._renderer = VSSRenderer(render_mode=self.render_mode)
+            self._renderer = VSSRenderer(render_mode=self.render_mode, fps=self._render_fps)
 
         return self._renderer.render(
             self._state.ball,

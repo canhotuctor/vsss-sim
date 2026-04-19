@@ -7,7 +7,7 @@ Finishes in under a minute; inspect the MLflow UI to confirm metrics flow.
 
 Usage
 -----
-    python scripts/smoke.py [--seed SEED]
+    python scripts/smoke.py [--seed SEED] [--render]
 
 Requires
 --------
@@ -52,17 +52,22 @@ class _MLflowCallback(BaseCallback):
         return True
 
 
-def main(seed: int) -> None:
+def main(seed: int, render: bool, fps: float | None) -> None:
     mlflow.set_experiment("vsss-smoke")
 
     with mlflow.start_run(run_name=f"smoke-seed{seed}"):
         mlflow.log_params({**PARAMS, "seed": seed})
 
+        env_kwargs = {"opponent_policy": PARAMS["opponent"]}
+        if render:
+            env_kwargs["render_mode"] = "human"
+            env_kwargs["render_fps"] = fps
+
         env = make_vec_env(
             "VSSS-v0",
             n_envs=PARAMS["n_envs"],
             seed=seed,
-            env_kwargs={"opponent_policy": PARAMS["opponent"]},
+            env_kwargs=env_kwargs,
         )
 
         model = PPO(
@@ -87,5 +92,7 @@ def main(seed: int) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VSSS smoke test")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--render", action="store_true", help="Open a live pygame window")
+    parser.add_argument("--fps", type=float, default=None, help="Cap render FPS (e.g. 30). Uncapped by default.")
     args = parser.parse_args()
-    main(args.seed)
+    main(args.seed, args.render, args.fps)

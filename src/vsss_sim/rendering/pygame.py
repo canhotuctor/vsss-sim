@@ -56,11 +56,13 @@ class VSSRenderer:
         render_mode: str = "rgb_array",
         scale: float = config.RENDER_SCALE,
         margin: int = config.RENDER_MARGIN,
+        fps: Optional[float] = None,
     ) -> None:
         _require_pygame()
         self.render_mode = render_mode
         self.scale = scale
         self.margin = margin
+        self._fps = fps
 
         self._field_px_w = int(config.FIELD_LENGTH * scale)
         self._field_px_h = int(config.FIELD_WIDTH * scale)
@@ -95,7 +97,8 @@ class VSSRenderer:
         if self.render_mode == "human":
             self._screen = pygame.display.set_mode((self._win_w, self._win_h))
             pygame.display.set_caption("VSSS Simulator")
-            self._clock = pygame.time.Clock()
+            if self._fps is not None:
+                self._clock = pygame.time.Clock()
         self._surface = pygame.Surface((self._win_w, self._win_h))
 
     # ------------------------------------------------------------------
@@ -257,8 +260,9 @@ class VSSRenderer:
         if self.render_mode == "human":
             self._screen.blit(surf, (0, 0))
             pygame.display.flip()
-            if self._clock:
-                self._clock.tick(config.FPS)
+            pygame.event.pump()  # required on macOS to keep the window alive
+            if self._clock is not None:
+                self._clock.tick(self._fps)
             return None
 
         # rgb_array: return numpy array (H, W, 3)

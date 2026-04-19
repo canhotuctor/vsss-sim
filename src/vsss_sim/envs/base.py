@@ -44,11 +44,13 @@ class VSSBaseEnv(gym.Env):
         self,
         render_mode: Optional[str] = None,
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
+        render_fps: Optional[float] = None,
     ) -> None:
         super().__init__()
 
         self.render_mode = render_mode
         self.max_episode_steps = max_episode_steps
+        self._render_fps = render_fps
         self._rng = np.random.default_rng()
         self._state = SimState()
         self._step_count = 0
