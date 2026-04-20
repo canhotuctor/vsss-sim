@@ -42,19 +42,23 @@ PARAMS = {
 
 
 class _MLflowCallback(BaseCallback):
-    """Log SB3 rollout metrics to MLflow after each rollout buffer flush."""
+    """Log per-episode reward/length to MLflow as each episode finishes."""
 
-    def _on_rollout_end(self) -> None:
-        if "rollout/ep_rew_mean" in self.logger.name_to_value:
-            mlflow.log_metrics(
-                {
-                    "ep_rew_mean": self.logger.name_to_value["rollout/ep_rew_mean"],
-                    "ep_len_mean": self.logger.name_to_value["rollout/ep_len_mean"],
-                },
-                step=self.num_timesteps,
-            )
+    def __init__(self):
+        super().__init__()
+        self._episode = 0
 
     def _on_step(self) -> bool:
+        for info in self.locals["infos"]:
+            if "episode" in info:
+                self._episode += 1
+                mlflow.log_metrics(
+                    {
+                        "ep_reward": info["episode"]["r"],
+                        "ep_length": info["episode"]["l"],
+                    },
+                    step=self._episode,
+                )
         return True
 
 
