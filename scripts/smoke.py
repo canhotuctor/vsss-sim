@@ -29,7 +29,6 @@ PARAMS = {
     "policy": "MlpPolicy",
     "opponent": "stationary",
     "n_envs": 1,
-    "total_timesteps": 10_000,
     "learning_rate": 3e-4,
     "n_steps": 512,
 }
@@ -52,11 +51,11 @@ class _MLflowCallback(BaseCallback):
         return True
 
 
-def main(seed: int, render: bool, fps: float | None) -> None:
+def main(seed: int, render: bool, fps: float | None, timesteps: int) -> None:
     mlflow.set_experiment("vsss-smoke")
 
     with mlflow.start_run(run_name=f"smoke-seed{seed}"):
-        mlflow.log_params({**PARAMS, "seed": seed})
+        mlflow.log_params({**PARAMS, "seed": seed, "total_timesteps": timesteps})
 
         env_kwargs = {"opponent_policy": PARAMS["opponent"]}
         if render:
@@ -80,7 +79,7 @@ def main(seed: int, render: bool, fps: float | None) -> None:
         )
 
         model.learn(
-            total_timesteps=PARAMS["total_timesteps"],
+            total_timesteps=timesteps,
             callback=_MLflowCallback(),
         )
 
@@ -94,5 +93,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--render", action="store_true", help="Open a live pygame window")
     parser.add_argument("--fps", type=float, default=None, help="Cap render FPS (e.g. 30). Uncapped by default.")
+    parser.add_argument("--timesteps", type=int, default=10_000, help="Number of timesteps to run (default: 10 000).")
     args = parser.parse_args()
-    main(args.seed, args.render, args.fps)
+    main(args.seed, args.render, args.fps, args.timesteps)
