@@ -134,7 +134,9 @@ def _ball_wall_collisions(state: SimState) -> int:
 
     if bx - r < -half_l:
         if abs(by) <= half_goal:
-            # Ball in blue's goal → yellow scores
+            # Ball in blue's goal → yellow scores; clamp to back of net
+            state.ball[0] = -half_l - config.GOAL_DEPTH + r
+            state.ball[2] = abs(state.ball[2]) * config.BALL_WALL_RESTITUTION
             return -1
         # Bounce off back wall
         state.ball[0] = -half_l + r
@@ -142,7 +144,9 @@ def _ball_wall_collisions(state: SimState) -> int:
 
     elif bx + r > half_l:
         if abs(by) <= half_goal:
-            # Ball in yellow's goal → blue scores
+            # Ball in yellow's goal → blue scores; clamp to back of net
+            state.ball[0] = half_l + config.GOAL_DEPTH - r
+            state.ball[2] = -abs(state.ball[2]) * config.BALL_WALL_RESTITUTION
             return 1
         # Bounce off back wall
         state.ball[0] = half_l - r
@@ -152,22 +156,28 @@ def _ball_wall_collisions(state: SimState) -> int:
 
 
 def _robot_wall_collisions(state: SimState) -> None:
-    """Clamp robots inside field boundaries."""
-    r = config.ROBOT_RADIUS
-    half_l = config.FIELD_LENGTH / 2.0 - r
-    half_w = config.FIELD_WIDTH / 2.0 - r
+    """Clamp robots (OBB) inside field boundaries."""
+    half_l = config.FIELD_LENGTH / 2.0
+    half_w = config.FIELD_WIDTH / 2.0
+    half = config.ROBOT_SIZE / 2.0
 
-    # x clamp
-    state.robots[:, :, 0] = np.clip(state.robots[:, :, 0], -half_l, half_l)
-    # y clamp
-    state.robots[:, :, 1] = np.clip(state.robots[:, :, 1], -half_w, half_w)
+    # Per-robot OBB extent: max projection of a square onto world x / y axes
+    theta = state.robots[:, :, 2]
+    extent = half * (np.abs(np.cos(theta)) + np.abs(np.sin(theta)))  # (N_TEAMS, N_ROBOTS)
 
-    # Zero out velocity components that would push further into wall
-    # (simple inelastic clamping)
-    exceeded_neg_x = state.robots[:, :, 0] <= -half_l
-    exceeded_pos_x = state.robots[:, :, 0] >= half_l
-    exceeded_neg_y = state.robots[:, :, 1] <= -half_w
-    exceeded_pos_y = state.robots[:, :, 1] >= half_w
+    lim_x = half_l - extent
+    lim_y = half_w - extent
+
+    x = state.robots[:, :, 0]
+    y = state.robots[:, :, 1]
+
+    exceeded_neg_x = x < -lim_x
+    exceeded_pos_x = x > lim_x
+    exceeded_neg_y = y < -lim_y
+    exceeded_pos_y = y > lim_y
+
+    state.robots[:, :, 0] = np.clip(x, -lim_x, lim_x)
+    state.robots[:, :, 1] = np.clip(y, -lim_y, lim_y)
 
     state.robots[:, :, 3] = np.where(
         exceeded_neg_x & (state.robots[:, :, 3] < 0), 0.0, state.robots[:, :, 3]
@@ -184,99 +194,182 @@ def _robot_wall_collisions(state: SimState) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ball-robot collision (circle–circle)
+# Ball-robot collision (circle vs OBB)
 # ---------------------------------------------------------------------------
 
+def _ball_obb_penetration(
+    ball_pos: np.ndarray,
+    rob_pos: np.ndarray,
+    theta: float,
+) -> tuple[np.ndarray, float]:
+    """
+    Return (normal, penetration) for a ball (circle) vs robot (square OBB).
+
+    normal  – world-space unit vector pointing from robot toward ball.
+    penetration > 0 means the shapes overlap by that depth.
+    """
+    half = config.ROBOT_SIZE / 2.0
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+
+    # Ball centre in robot-local frame
+    dx = ball_pos[0] - rob_pos[0]
+    dy = ball_pos[1] - rob_pos[1]
+    local_x =  cos_t * dx + sin_t * dy
+    local_y = -sin_t * dx + cos_t * dy
+
+    # Closest point on the AABB (local frame)
+    clamp_x = max(-half, min(half, local_x))
+    clamp_y = max(-half, min(half, local_y))
+
+    diff_x = local_x - clamp_x
+    diff_y = local_y - clamp_y
+    dist = math.hypot(diff_x, diff_y)
+
+    if dist < 1e-9:
+        # Ball centre inside OBB: push out along shortest face
+        pen_x = half - abs(local_x)
+        pen_y = half - abs(local_y)
+        if pen_x <= pen_y:
+            lnx, lny = math.copysign(1.0, local_x), 0.0
+            penetration = pen_x + config.BALL_RADIUS
+        else:
+            lnx, lny = 0.0, math.copysign(1.0, local_y)
+            penetration = pen_y + config.BALL_RADIUS
+    else:
+        lnx, lny = diff_x / dist, diff_y / dist
+        penetration = config.BALL_RADIUS - dist
+
+    # Rotate normal back to world frame
+    nx = cos_t * lnx - sin_t * lny
+    ny = sin_t * lnx + cos_t * lny
+    return np.array([nx, ny]), penetration
+
+
 def _ball_robot_collisions(state: SimState) -> None:
-    """Resolve elastic collisions between the ball and all robots."""
-    ball_pos = state.ball[0:2]
-    ball_vel = state.ball[2:4]
-    min_dist = config.BALL_RADIUS + config.ROBOT_RADIUS
+    """Resolve elastic collisions between the ball and all robots (OBB)."""
+    ball_pos = state.ball[0:2].copy()
+    ball_vel = state.ball[2:4].copy()
 
     for team in range(config.N_TEAMS):
         for r_idx in range(config.N_ROBOTS):
-            rob_pos = state.robots[team, r_idx, 0:2]
-            rob_vel = state.robots[team, r_idx, 3:5]
+            rob_pos = state.robots[team, r_idx, 0:2].copy()
+            rob_vel = state.robots[team, r_idx, 3:5].copy()
+            theta   = float(state.robots[team, r_idx, 2])
 
-            delta = ball_pos - rob_pos
-            dist = float(np.linalg.norm(delta))
-
-            if dist >= min_dist or dist < 1e-9:
+            normal, penetration = _ball_obb_penetration(ball_pos, rob_pos, theta)
+            if penetration <= 0:
                 continue
 
-            normal = delta / dist
-            overlap = min_dist - dist
-
-            # Push objects apart proportionally to mass
             m_b = config.BALL_MASS
             m_r = config.ROBOT_MASS
             total_m = m_b + m_r
-            ball_pos = ball_pos + normal * overlap * (m_r / total_m)
-            rob_pos = rob_pos - normal * overlap * (m_b / total_m)
+
+            # Separate proportionally to mass
+            ball_pos = ball_pos + normal * penetration * (m_r / total_m)
+            rob_pos  = rob_pos  - normal * penetration * (m_b / total_m)
 
             # Impulse along collision normal
-            rel_vel = ball_vel - rob_vel
+            rel_vel   = ball_vel - rob_vel
             vel_along = float(np.dot(rel_vel, normal))
             if vel_along >= 0:
-                # Already separating
                 state.ball[0:2] = ball_pos
                 state.robots[team, r_idx, 0:2] = rob_pos
                 continue
 
             e = config.BALL_ROBOT_RESTITUTION
             j = -(1.0 + e) * vel_along / (1.0 / m_b + 1.0 / m_r)
-            impulse = j * normal
+            impulse  = j * normal
             ball_vel = ball_vel + impulse / m_b
-            rob_vel = rob_vel - impulse / m_r
+            rob_vel  = rob_vel  - impulse / m_r
 
-            # Write back
             state.ball[0:2] = ball_pos
             state.ball[2:4] = ball_vel
             state.robots[team, r_idx, 0:2] = rob_pos
             state.robots[team, r_idx, 3:5] = rob_vel
 
-            # Refresh local references after write-back
             ball_pos = state.ball[0:2]
             ball_vel = state.ball[2:4]
 
 
 # ---------------------------------------------------------------------------
-# Robot-robot collisions
+# Robot-robot collisions (OBB vs OBB via SAT)
 # ---------------------------------------------------------------------------
 
-def _robot_robot_collisions(state: SimState) -> None:
-    """Resolve inelastic collisions between robots (both teams)."""
-    min_dist = 2.0 * config.ROBOT_RADIUS
-    e = config.ROBOT_WALL_RESTITUTION
+def _sat_square_overlap(
+    pos_a: np.ndarray, theta_a: float,
+    pos_b: np.ndarray, theta_b: float,
+) -> tuple[bool, np.ndarray, float]:
+    """
+    SAT overlap test for two square OBBs of side ROBOT_SIZE.
 
-    # Flatten to (N_TOTAL_ROBOTS, 6)
+    Returns (overlapping, normal, min_overlap).
+    normal points from B toward A (push-out direction for A).
+    """
+    half = config.ROBOT_SIZE / 2.0
+    delta = pos_a - pos_b
+
+    # Four candidate separating axes (local axes of each box)
+    ca, sa = math.cos(theta_a), math.sin(theta_a)
+    cb, sb = math.cos(theta_b), math.sin(theta_b)
+    axes = (
+        np.array([ ca,  sa]),
+        np.array([-sa,  ca]),
+        np.array([ cb,  sb]),
+        np.array([-sb,  cb]),
+    )
+
+    min_overlap = float("inf")
+    best_axis: np.ndarray = axes[0]
+
+    for axis in axes:
+        ax, ay = float(axis[0]), float(axis[1])
+        # Support of each square along axis = half*(|u1·axis|+|u2·axis|)
+        sup_a = half * (abs(ca * ax + sa * ay) + abs(-sa * ax + ca * ay))
+        sup_b = half * (abs(cb * ax + sb * ay) + abs(-sb * ax + cb * ay))
+        dist = abs(float(np.dot(delta, axis)))
+        overlap = sup_a + sup_b - dist
+        if overlap <= 0:
+            return False, np.zeros(2), 0.0
+        if overlap < min_overlap:
+            min_overlap = overlap
+            sign = 1.0 if float(np.dot(delta, axis)) >= 0 else -1.0
+            best_axis = axis * sign
+
+    return True, best_axis, min_overlap
+
+
+def _robot_robot_collisions(state: SimState) -> None:
+    """Resolve inelastic collisions between robots (OBB vs OBB)."""
+    e = config.ROBOT_WALL_RESTITUTION
     n_total = config.N_TEAMS * config.N_ROBOTS
     robots_flat = state.robots.reshape(n_total, 6)
 
     for i in range(n_total - 1):
         for j in range(i + 1, n_total):
-            pos_i = robots_flat[i, 0:2]
-            pos_j = robots_flat[j, 0:2]
-            vel_i = robots_flat[i, 3:5]
-            vel_j = robots_flat[j, 3:5]
+            pos_i   = robots_flat[i, 0:2].copy()
+            pos_j   = robots_flat[j, 0:2].copy()
+            theta_i = float(robots_flat[i, 2])
+            theta_j = float(robots_flat[j, 2])
+            vel_i   = robots_flat[i, 3:5].copy()
+            vel_j   = robots_flat[j, 3:5].copy()
 
-            delta = pos_i - pos_j
-            dist = float(np.linalg.norm(delta))
-            if dist >= min_dist or dist < 1e-9:
+            overlapping, normal, overlap = _sat_square_overlap(
+                pos_i, theta_i, pos_j, theta_j
+            )
+            if not overlapping:
                 continue
 
-            normal = delta / dist
-            overlap = min_dist - dist
-            # Equal-mass push
+            # Equal-mass separation
             robots_flat[i, 0:2] = pos_i + normal * overlap * 0.5
             robots_flat[j, 0:2] = pos_j - normal * overlap * 0.5
 
-            rel_vel = vel_i - vel_j
+            rel_vel   = vel_i - vel_j
             vel_along = float(np.dot(rel_vel, normal))
             if vel_along >= 0:
                 continue
 
-            j_imp = -(1.0 + e) * vel_along * 0.5  # equal mass
+            j_imp = -(1.0 + e) * vel_along * 0.5
             robots_flat[i, 3:5] = vel_i + j_imp * normal
             robots_flat[j, 3:5] = vel_j - j_imp * normal
 

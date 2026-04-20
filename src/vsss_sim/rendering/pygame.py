@@ -173,26 +173,31 @@ class VSSRenderer:
         theta: float,
         team: int,
     ) -> None:
-        cx, cy = self._to_px(x, y)
-        r_px = self._m_to_px(config.ROBOT_RADIUS)
+        half = config.ROBOT_SIZE / 2.0
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+
+        # Rotate the four corners of the square into world coords, then to pixels
+        corners_px = [
+            self._to_px(
+                x + cos_t * lx - sin_t * ly,
+                y + sin_t * lx + cos_t * ly,
+            )
+            for lx, ly in ((-half, -half), (half, -half), (half, half), (-half, half))
+        ]
 
         color = (
             config.COLOR_ROBOT_BLUE
             if team == config.TEAM_BLUE
             else config.COLOR_ROBOT_YELLOW
         )
-        pygame.draw.circle(surf, color, (cx, cy), r_px)
-        pygame.draw.circle(surf, config.COLOR_ROBOT_OUTLINE, (cx, cy), r_px, 2)
+        pygame.draw.polygon(surf, color, corners_px)
+        pygame.draw.polygon(surf, config.COLOR_ROBOT_OUTLINE, corners_px, 2)
 
-        # Direction indicator (line from centre toward heading)
-        dx = math.cos(theta) * r_px * 0.8
-        dy = -math.sin(theta) * r_px * 0.8
-        pygame.draw.line(
-            surf, config.COLOR_ROBOT_OUTLINE,
-            (cx, cy),
-            (int(cx + dx), int(cy + dy)),
-            2,
-        )
+        # Direction indicator from centre to front face midpoint
+        cx, cy = self._to_px(x, y)
+        tip = self._to_px(x + cos_t * half * 0.85, y + sin_t * half * 0.85)
+        pygame.draw.line(surf, config.COLOR_ROBOT_OUTLINE, (cx, cy), tip, 2)
 
     def _draw_ball(self, surf: pygame.Surface, x: float, y: float) -> None:
         cx, cy = self._to_px(x, y)
