@@ -341,3 +341,103 @@ def _ball_robot_collisions(state: SimState) -> SimState:
         ball=new_ball,
         robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6),
     )
+
+
+# ---------------------------------------------------------------------------
+# Robot–robot collisions (OBB vs OBB via SAT) — fori_loop over 15 pairs
+# ---------------------------------------------------------------------------
+
+# Pre-compute the 15 unique (i, j) pairs for 6 robots.
+_PAIR_I, _PAIR_J = jnp.triu_indices(_N_ROBOTS_TOTAL, k=1)
+_N_PAIRS = int(_PAIR_I.shape[0])
+
+
+def _sat_square_overlap(
+    pos_a: jnp.ndarray, theta_a: jnp.ndarray,
+    pos_b: jnp.ndarray, theta_b: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """SAT overlap test for two square OBBs of side ROBOT_SIZE.
+
+    Returns ``(overlapping_bool, normal_from_B_to_A, min_overlap)``.
+    """
+    half = jnp.float32(config.ROBOT_SIZE / 2.0)
+    delta = pos_a - pos_b
+    ca, sa = jnp.cos(theta_a), jnp.sin(theta_a)
+    cb, sb = jnp.cos(theta_b), jnp.sin(theta_b)
+
+    axes = jnp.stack([
+        jnp.stack([ca, sa]),
+        jnp.stack([-sa, ca]),
+        jnp.stack([cb, sb]),
+        jnp.stack([-sb, cb]),
+    ])  # (4, 2)
+
+    # Support of each square along each axis: half * (|u1·axis| + |u2·axis|).
+    def support(axis, c, s):
+        ax, ay = axis[0], axis[1]
+        return half * (jnp.abs(c * ax + s * ay) + jnp.abs(-s * ax + c * ay))
+
+    sup_a = jax.vmap(support, in_axes=(0, None, None))(axes, ca, sa)  # (4,)
+    sup_b = jax.vmap(support, in_axes=(0, None, None))(axes, cb, sb)
+    proj = axes @ delta  # (4,)
+    dist = jnp.abs(proj)
+    overlaps = sup_a + sup_b - dist  # (4,)
+
+    overlapping = jnp.all(overlaps > 0)
+
+    # Pick the axis with the minimum overlap (only meaningful when overlapping).
+    min_idx = jnp.argmin(overlaps)
+    min_overlap = overlaps[min_idx]
+    axis = axes[min_idx]
+    sign = jnp.where(proj[min_idx] >= 0, 1.0, -1.0)
+    normal = axis * sign
+
+    # When not overlapping, return safe zeros.
+    normal = jnp.where(overlapping, normal, jnp.zeros(2, dtype=jnp.float32))
+    min_overlap = jnp.where(overlapping, min_overlap, jnp.float32(0.0))
+    return overlapping, normal, min_overlap
+
+
+def _resolve_robot_pair(
+    robots_flat: jnp.ndarray, i: jnp.ndarray, j: jnp.ndarray
+) -> jnp.ndarray:
+    e = jnp.float32(config.ROBOT_WALL_RESTITUTION)
+    a = robots_flat[i]
+    b = robots_flat[j]
+    pos_a, theta_a, vel_a = a[0:2], a[2], a[3:5]
+    pos_b, theta_b, vel_b = b[0:2], b[2], b[3:5]
+
+    overlapping, normal, overlap = _sat_square_overlap(pos_a, theta_a, pos_b, theta_b)
+
+    pa_new = pos_a + normal * overlap * 0.5
+    pb_new = pos_b - normal * overlap * 0.5
+
+    rel_vel = vel_a - vel_b
+    vel_along = jnp.dot(rel_vel, normal)
+    do_impulse = overlapping & (vel_along < 0)
+    j_imp = -(1.0 + e) * vel_along * 0.5
+    va_new = jnp.where(do_impulse, vel_a + j_imp * normal, vel_a)
+    vb_new = jnp.where(do_impulse, vel_b - j_imp * normal, vel_b)
+
+    pa_final = jnp.where(overlapping, pa_new, pos_a)
+    pb_final = jnp.where(overlapping, pb_new, pos_b)
+
+    new_a = a.at[0:2].set(pa_final).at[3:5].set(va_new)
+    new_b = b.at[0:2].set(pb_final).at[3:5].set(vb_new)
+    robots_flat = robots_flat.at[i].set(new_a).at[j].set(new_b)
+    return robots_flat
+
+
+def _robot_robot_collisions(state: SimState) -> SimState:
+    """Resolve inelastic collisions between robots (OBB vs OBB)."""
+    robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
+
+    def body(k, robots_flat):
+        i = _PAIR_I[k]
+        j = _PAIR_J[k]
+        return _resolve_robot_pair(robots_flat, i, j)
+
+    new_robots_flat = jax.lax.fori_loop(0, _N_PAIRS, body, robots_flat)
+    return state._replace(
+        robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6)
+    )

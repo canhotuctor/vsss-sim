@@ -203,3 +203,37 @@ class TestBallRobotCollisions:
         s2 = jb._ball_robot_collisions(s)
         assert jnp.allclose(s2.ball, s.ball)
         assert jnp.allclose(s2.robots, s.robots)
+
+
+class TestRobotRobotCollisions:
+    def _spread_state(self) -> "jb.SimState":
+        positions = jnp.array(
+            [
+                [-0.5, -0.4], [-0.5, 0.0], [-0.5, 0.4],
+                [0.5, -0.4], [0.5, 0.0], [0.5, 0.4],
+            ],
+            dtype=jnp.float32,
+        )
+        s = jb.empty_state()
+        robots_flat = s.robots.reshape(6, 6)
+        robots_flat = robots_flat.at[:, 0:2].set(positions)
+        return s._replace(robots=robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6))
+
+    def test_separates_overlapping_pair(self):
+        s = self._spread_state()
+        # Force robots[0,0] and robots[0,1] to overlap.
+        s = s._replace(
+            robots=s.robots
+            .at[0, 0, 0:2].set(jnp.array([0.0, 0.0]))
+            .at[0, 1, 0:2].set(jnp.array([0.03, 0.0]))
+        )
+        s2 = jb._robot_robot_collisions(s)
+        d = jnp.linalg.norm(s2.robots[0, 0, 0:2] - s2.robots[0, 1, 0:2])
+        assert float(d) >= config.ROBOT_SIZE - 1e-3
+
+    def test_no_change_when_separated(self):
+        s = jb.reset_kickoff(jax.random.PRNGKey(0))
+        before = jnp.array(s.robots)
+        s2 = jb._robot_robot_collisions(s)
+        # Kickoff places robots > 0.2m apart, so no overlap → no change.
+        assert jnp.allclose(s2.robots, before)
