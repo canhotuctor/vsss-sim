@@ -55,13 +55,19 @@ class _MLflowCallback(BaseCallback):
         return True
 
 
-def main(seed: int, render: bool, fps: float | None, timesteps: int) -> None:
+def main(seed: int, render: bool, fps: float | None, timesteps: int,
+         backend: str | None) -> None:
     mlflow.set_experiment("vsss-smoke")
 
     with mlflow.start_run(run_name=f"smoke-seed{seed}"):
-        mlflow.log_params({**PARAMS, "seed": seed, "total_timesteps": timesteps})
+        mlflow.log_params({
+            **PARAMS, "seed": seed, "total_timesteps": timesteps,
+            "backend": backend or "default",
+        })
 
         env_kwargs = {"opponent_policy": PARAMS["opponent"]}
+        if backend is not None:
+            env_kwargs["backend"] = backend
         if render:
             env_kwargs["render_mode"] = "human"
             env_kwargs["render_fps"] = fps
@@ -98,5 +104,12 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Open a live pygame window")
     parser.add_argument("--fps", type=float, default=None, help="Cap render FPS (e.g. 30). Uncapped by default.")
     parser.add_argument("--timesteps", type=int, default=10_000, help="Number of timesteps to run (default: 10 000).")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        choices=["numpy", "jax"],
+        help="Physics backend to use (default: VSSS_PHYSICS_BACKEND or numpy).",
+    )
     args = parser.parse_args()
-    main(args.seed, args.render, args.fps, args.timesteps)
+    main(args.seed, args.render, args.fps, args.timesteps, args.backend)
