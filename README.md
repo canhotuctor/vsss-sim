@@ -87,7 +87,7 @@ obs, rew, term, trunc, info = envs.step(envs.action_space.sample())
 
 Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256)`.
 
-### Training with SB3 PPO + batched env (~80× wall-clock speedup at `num_envs=256`)
+### Training with SB3 PPO + batched env (~4–8× wall-clock speedup)
 
 ```python
 from stable_baselines3 import PPO
@@ -180,14 +180,23 @@ Raw physics throughput:
 | `VSSVecEnv` (Gymnasium wrapper), batch=256 | ~120,000 fps | ~34× |
 | `VSSVecEnv`, batch=1024 | ~155,000 fps | ~44× |
 
-End-to-end SB3 PPO training (PyTorch policy + JAX physics, via the adapter):
+End-to-end SB3 PPO training, **`n_steps=32` (rollout-friendly)**, PyTorch policy + JAX physics via the adapter:
 
 | `num_envs` | fps | Speedup vs `num_envs=1` |
 |---|---|---|
 | 1 | ~600 | 1× |
 | 8 | ~4,400 | 7× |
 | 64 | ~23,800 | 40× |
-| 256 | ~47,500 | **80×** |
+| 256 | ~47,500 | ~80× (rollout-dominated) |
+
+End-to-end SB3 PPO training, **`n_steps=512` (smoke.py default, gradient-dominated)**:
+
+| `num_envs` | Wall-clock fps | Speedup vs `num_envs=1` |
+|---|---|---|
+| 1 (numpy) | ~660 | 1× |
+| 256 (jax + adapter) | ~5,600 | **~8×** |
+
+The gap is Amdahl: bigger rollouts mean PyTorch spends more time in the gradient update phase between rollouts (~25 s per 131k-sample rollout on Mac CPU), and that phase doesn't benefit from `num_envs`. GPU (PR 4) and JAX-native RL (PR 5) close the gap.
 
 Reproduce with `python scripts/bench_backends.py`. The gap between raw vmap
 and `VSSVecEnv` is the Gymnasium numpy↔JAX boundary cost (per-step Python
