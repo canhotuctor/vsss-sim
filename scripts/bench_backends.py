@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from vsss_sim import config
+from vsss_sim.envs import VSSVecEnv
 from vsss_sim.physics import jax_backend as jb
 from vsss_sim.physics import numpy_backend as nb
 
@@ -77,22 +78,50 @@ def _bench_jax_vmap(steps: int, batch: int, seed: int) -> tuple[float, float]:
     return steps / elapsed, (steps * batch) / elapsed
 
 
+def _bench_vssvecenv(steps: int, batch: int, seed: int) -> tuple[float, float]:
+    """Return (per-env fps, total fps) for VSSVecEnv at given batch size.
+
+    This is what RL libraries actually consume — it includes the Gymnasium
+    wrapper overhead (numpy ↔ jax conversion per step, opponent policy,
+    obs/reward shaping)."""
+    env = VSSVecEnv(num_envs=batch, opponent_policy="stationary")
+    env.reset(seed=seed)
+    a = np.zeros((batch, config.N_ROBOTS * 2), dtype=np.float32)
+
+    # Warm-up
+    for _ in range(10):
+        env.step(a)
+
+    t0 = time.perf_counter()
+    for _ in range(steps):
+        env.step(a)
+    elapsed = time.perf_counter() - t0
+    env.close()
+    return steps / elapsed, (steps * batch) / elapsed
+
+
 def main(steps: int, seed: int) -> None:
     print(f"JAX devices: {jax.devices()}   default backend: {jax.default_backend()}")
     print(f"Steps per measurement: {steps}\n")
 
-    print("== Single env ==")
+    print("== Single env (raw physics calls) ==")
     np_fps = _bench_numpy(steps, seed)
     print(f"  numpy            : {np_fps:>10,.0f} fps")
     jx1 = _bench_jax_single(steps, seed)
     print(f"  jax  (no vmap)   : {jx1:>10,.0f} fps")
     print(f"  ratio jax/numpy  : {jx1 / np_fps:>10.2f}x\n")
 
-    print("== JAX vmap (what VSSVecEnv will become) ==")
-    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}  {'speedup vs numpy':>18}")
+    print("== Raw jax.vmap(step) — physics ceiling ==")
+    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}  {'vs numpy':>10}")
     for batch in (1, 8, 64, 256, 1024):
         per_env, total = _bench_jax_vmap(steps, batch, seed)
-        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}  {total / np_fps:>17.1f}x")
+        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}  {total / np_fps:>9.1f}x")
+
+    print("\n== VSSVecEnv — what your RL trainer actually sees ==")
+    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}  {'vs numpy':>10}")
+    for batch in (1, 8, 64, 256, 1024):
+        per_env, total = _bench_vssvecenv(steps, batch, seed)
+        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}  {total / np_fps:>9.1f}x")
 
 
 if __name__ == "__main__":
