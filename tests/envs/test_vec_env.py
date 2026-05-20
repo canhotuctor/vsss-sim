@@ -138,6 +138,17 @@ class TestOpponents:
 # single VSSEnv kickoff (ball at centre, robots split by team across midfield).
 # ---------------------------------------------------------------------------
 
+class TestGymMakeVec:
+    def test_make_vec_uses_vssvecenv(self):
+        envs = gym.make_vec(
+            "VSSS-v0", num_envs=3, vectorization_mode="vector_entry_point",
+        )
+        assert envs.num_envs == 3
+        obs, _ = envs.reset(seed=0)
+        assert obs.shape == (3, 46)
+        envs.close()
+
+
 class TestKickoffStructure:
     def test_ball_at_centre_for_all_envs(self):
         vec = VSSVecEnv(num_envs=4, opponent_policy="stationary")
