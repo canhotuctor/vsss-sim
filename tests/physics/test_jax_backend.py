@@ -237,3 +237,116 @@ class TestRobotRobotCollisions:
         s2 = jb._robot_robot_collisions(s)
         # Kickoff places robots > 0.2m apart, so no overlap → no change.
         assert jnp.allclose(s2.robots, before)
+
+
+class TestStep:
+    def _make_state(self):
+        return jb.reset_kickoff(jax.random.PRNGKey(0))
+
+    def _zero_actions(self):
+        return jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32)
+
+    def test_step_advances_time(self):
+        s = self._make_state()
+        t0 = float(s.t)
+        s2, _ = jb.step(s, self._zero_actions())
+        assert float(s2.t) == pytest.approx(t0 + config.DT, abs=1e-5)
+
+    def test_step_stationary_zero_action(self):
+        s = self._make_state()
+        initial = s.robots[:, :, 0:2]
+        s2, _ = jb.step(s, self._zero_actions())
+        assert jnp.allclose(s2.robots[:, :, 0:2], initial, atol=1e-5)
+
+    def test_robot_moves_forward(self):
+        s = jb.reset_kickoff(jax.random.PRNGKey(1))
+        initial_x = float(s.robots[config.TEAM_BLUE, 0, 0])
+        actions = self._zero_actions().at[config.TEAM_BLUE, 0, :].set(1.0)
+        for _ in range(5):
+            s, _ = jb.step(s, actions)
+        assert float(s.robots[config.TEAM_BLUE, 0, 0]) > initial_x
+
+    def test_goal_registered(self):
+        s = self._make_state()
+        s = s._replace(ball=jnp.array(
+            [config.FIELD_LENGTH / 2.0 + 0.01, 0.0, 0.1, 0.0],
+            dtype=jnp.float32,
+        ))
+        _, info = jb.step(s, self._zero_actions())
+        assert int(info["goal"]) == 1
+
+    def test_no_goal_centre(self):
+        s = self._make_state()
+        for _ in range(30):
+            s, _ = jb.step(s, self._zero_actions())
+        # No score should have accumulated externally; score stays zero.
+        assert int(s.score[0]) == 0
+        assert int(s.score[1]) == 0
+
+    def test_ball_stays_in_field(self):
+        s = self._make_state()
+        s = s._replace(ball=s.ball.at[2].set(config.ROBOT_MAX_WHEEL_SPEED * 10))
+        for _ in range(10):
+            s, _ = jb.step(s, self._zero_actions())
+        half_l = config.FIELD_LENGTH / 2.0 + config.GOAL_DEPTH + 0.1
+        half_w = config.FIELD_WIDTH / 2.0 + 0.1
+        assert abs(float(s.ball[0])) <= half_l
+        assert abs(float(s.ball[1])) <= half_w
+
+    def test_jit_compiles(self):
+        """step should be jittable end-to-end."""
+        s = self._make_state()
+        a = self._zero_actions()
+        step_jit = jax.jit(jb.step)
+        s2, info = step_jit(s, a)
+        assert s2.robots.shape == s.robots.shape
+        assert "goal" in info
+
+
+class TestParityWithNumpy:
+    """Trajectories from numpy and jax backends should match within tolerance."""
+
+    def test_step_parity_zero_actions(self):
+        from vsss_sim.physics import numpy_backend as nb
+
+        np_s = nb.SimState()
+        nb.reset_kickoff(np_s, rng=np.random.default_rng(0))
+        j_s = jb.from_numpy(np_s)
+
+        np_a = np.zeros((config.N_TEAMS, config.N_ROBOTS, 2))
+        j_a = jnp.asarray(np_a, dtype=jnp.float32)
+
+        for _ in range(20):
+            nb.step(np_s, np_a)
+            j_s, _ = jb.step(j_s, j_a)
+
+        np.testing.assert_allclose(
+            np.asarray(j_s.robots[:, :, 0:2]),
+            np_s.robots[:, :, 0:2],
+            atol=1e-3,
+        )
+        np.testing.assert_allclose(
+            np.asarray(j_s.ball[0:2]), np_s.ball[0:2], atol=1e-3,
+        )
+
+    def test_step_parity_forward_action(self):
+        from vsss_sim.physics import numpy_backend as nb
+
+        np_s = nb.SimState()
+        nb.reset_kickoff(np_s, rng=np.random.default_rng(2))
+        j_s = jb.from_numpy(np_s)
+
+        np_a = np.zeros((config.N_TEAMS, config.N_ROBOTS, 2))
+        np_a[config.TEAM_BLUE, 0, :] = 1.0
+        j_a = jnp.asarray(np_a, dtype=jnp.float32)
+
+        for _ in range(15):
+            nb.step(np_s, np_a)
+            j_s, _ = jb.step(j_s, j_a)
+
+        # The moving robot's x position should match within a few mm.
+        np.testing.assert_allclose(
+            float(j_s.robots[config.TEAM_BLUE, 0, 0]),
+            np_s.robots[config.TEAM_BLUE, 0, 0],
+            atol=5e-3,
+        )

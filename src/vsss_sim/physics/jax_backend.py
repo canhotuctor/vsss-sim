@@ -8,6 +8,7 @@ float64 numpy backend within a generous tolerance.
 """
 from __future__ import annotations
 
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -441,3 +442,84 @@ def _robot_robot_collisions(state: SimState) -> SimState:
     return state._replace(
         robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6)
     )
+
+
+# ---------------------------------------------------------------------------
+# Public step (jit-compiled)
+# ---------------------------------------------------------------------------
+
+def _substep(
+    state: SimState, wheel_speeds: jnp.ndarray, sub_dt: jnp.ndarray
+) -> tuple[SimState, jnp.ndarray]:
+    """One physics sub-step. Returns ``(new_state, goal_event)``."""
+    v_l = wheel_speeds[:, :, 0]
+    v_r = wheel_speeds[:, :, 1]
+    theta = state.robots[:, :, 2]
+    vx, vy, omega = _diff_drive(v_l, v_r, theta)
+
+    robots = state.robots
+    robots = robots.at[:, :, 3].set(vx)
+    robots = robots.at[:, :, 4].set(vy)
+    robots = robots.at[:, :, 5].set(omega)
+    robots = robots.at[:, :, 0].add(vx * sub_dt)
+    robots = robots.at[:, :, 1].add(vy * sub_dt)
+    new_theta = robots[:, :, 2] + omega * sub_dt
+    new_theta = (new_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
+    robots = robots.at[:, :, 2].set(new_theta)
+    state = state._replace(robots=robots)
+
+    # Ball friction (rolling).
+    ball_vel = state.ball[2:4]
+    speed = jnp.linalg.norm(ball_vel)
+    safe_speed = jnp.where(speed > 1e-6, speed, 1.0)
+    decel = jnp.minimum(speed, config.BALL_FRICTION * 9.81 * sub_dt)
+    new_vel = ball_vel - (ball_vel / safe_speed) * decel
+    new_vel = jnp.where(speed > 1e-6, new_vel, ball_vel)
+    ball = state.ball.at[2:4].set(new_vel)
+    ball = ball.at[0:2].add(new_vel * sub_dt)
+    state = state._replace(ball=ball)
+
+    # Collisions.
+    state = _robot_wall_collisions(state)
+    state, goal = _ball_wall_collisions(state)
+    state = _ball_robot_collisions(state)
+    state = _robot_robot_collisions(state)
+    return state, goal
+
+
+@partial(jax.jit, static_argnames=("sub_steps",))
+def step(
+    state: SimState,
+    actions: jnp.ndarray,
+    dt: float = config.DT,
+    sub_steps: int = 4,
+) -> tuple[SimState, dict]:
+    """Advance the simulation by one control timestep (functional + jitted).
+
+    Parameters
+    ----------
+    state : SimState
+    actions : (N_TEAMS, N_ROBOTS, 2) jnp.float32 — normalised wheel speeds in [-1, 1].
+    dt : float — control timestep (default ``config.DT``).
+    sub_steps : int — physics sub-steps per control step (static, default 4).
+
+    Returns
+    -------
+    new_state : SimState
+    info : dict with ``"goal"`` (int32 scalar).
+    """
+    actions = jnp.clip(actions, -1.0, 1.0).astype(jnp.float32)
+    wheel_speeds = actions * jnp.float32(config.ROBOT_MAX_WHEEL_SPEED)
+    sub_dt = jnp.float32(dt / sub_steps)
+
+    def body(_, carry):
+        state, goal_acc = carry
+        state, g = _substep(state, wheel_speeds, sub_dt)
+        goal_acc = jnp.where(goal_acc == 0, g, goal_acc)
+        return state, goal_acc
+
+    state, goal = jax.lax.fori_loop(
+        0, sub_steps, body, (state, jnp.int32(0))
+    )
+    state = state._replace(t=state.t + jnp.float32(dt))
+    return state, {"goal": goal}
