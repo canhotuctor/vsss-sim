@@ -271,7 +271,7 @@ class VSSRenderer:
         surf.blit(text, (8, 8))
 
     def _draw_step(self, surf: pygame.Surface, step: int) -> None:
-        """Draw the current control-step count just below the FPS readout."""
+        """Draw the current control-step count in the bottom-left corner."""
         font = self._hud_font_or_none()
         if font is None:
             return
@@ -280,7 +280,7 @@ class VSSRenderer:
         text = font.render(
             f"step {step:>5d}  ({sim_t:5.2f}s)", True, config.COLOR_FIELD_LINES,
         )
-        surf.blit(text, (8, 8 + font.get_linesize()))
+        surf.blit(text, (8, self._win_h - font.get_linesize() - 8))
 
     # ------------------------------------------------------------------
     # Public render method
