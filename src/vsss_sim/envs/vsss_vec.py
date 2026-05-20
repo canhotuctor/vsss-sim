@@ -170,6 +170,36 @@ class VSSVecEnv(VectorEnv):
         self._kickoff_subset(mask)
         self._step_count[mask] = 0
 
+    # ------------------------------------------------------------------
+    # Public helpers for wrappers (e.g. SB3 adapter)
+    # ------------------------------------------------------------------
+
+    def reset_envs(self, mask: np.ndarray) -> np.ndarray:
+        """Reset (kickoff + zero step counter) the envs where ``mask`` is True.
+
+        Returns the full batched observation after the reset. Wrappers that
+        want eager auto-reset semantics (e.g. SB3's VecEnv) call this after
+        ``step`` to bring done envs to their post-reset state immediately,
+        rather than waiting for the next ``step`` call.
+        """
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (self.num_envs,):
+            raise ValueError(
+                f"mask shape {mask.shape} != (num_envs,) = ({self.num_envs},)"
+            )
+        if mask.any():
+            self._reset_subset(mask)
+            # Cancel any pending NEXT_STEP auto-reset for these envs — they
+            # were just reset eagerly.
+            self._needs_reset[mask] = False
+        return np.asarray(_build_obs_batched(self._state))
+
+    def current_obs(self) -> np.ndarray:
+        """Return the current batched observation without stepping."""
+        if self._state is None:
+            raise RuntimeError("call reset() before current_obs()")
+        return np.asarray(_build_obs_batched(self._state))
+
     def _opponent_actions(self, obs_np: np.ndarray) -> np.ndarray:
         """Build a (num_envs, N_ROBOTS, 2) opponent action array."""
         if self._opponent_policy_spec == "stationary":
