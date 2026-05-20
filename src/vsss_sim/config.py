@@ -57,6 +57,12 @@ ROBOT_WHEEL_RADIUS: float = 0.026        # wheel radius (m)
 ROBOT_MAX_MOTOR_SPEED: float = 50.0      # rad/s → ~1.30 m/s linear
 ROBOT_MAX_WHEEL_SPEED: float = ROBOT_MAX_MOTOR_SPEED * ROBOT_WHEEL_RADIUS  # ≈ 1.30 m/s
 
+# Maximum wheel-speed change rate (m/s²). Wheel commands are slewed toward the
+# target each physics sub-step at this rate, modelling motor torque limits and
+# producing smoother (less jerky) trajectories. 2 g ≈ 19.62 m/s² is a typical
+# bound for VSSS-class robots; 0 → max takes ~66 ms (~4 control steps).
+ROBOT_WHEEL_ACCEL_LIMIT: float = 2.0 * 9.81  # m/s² (≈ 2 g)
+
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------

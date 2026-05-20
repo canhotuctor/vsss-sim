@@ -34,7 +34,7 @@ class TestSimState:
     def test_is_pytree(self):
         s = jb.empty_state()
         leaves = jax.tree_util.tree_leaves(s)
-        assert len(leaves) == 4  # ball, robots, score, t
+        assert len(leaves) == 5  # ball, robots, score, t, wheel_speeds
 
     def test_from_numpy_round_trip(self):
         np_s = NumpySimState()

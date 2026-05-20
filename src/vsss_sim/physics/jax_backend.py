@@ -26,10 +26,11 @@ from .numpy_backend import SimState as NumpySimState
 class SimState(NamedTuple):
     """Immutable simulation state. Fields are JAX arrays."""
 
-    ball: jnp.ndarray    # (4,)   float32   [x, y, vx, vy]
-    robots: jnp.ndarray  # (N_TEAMS, N_ROBOTS, 6) float32 [x, y, theta, vx, vy, omega]
-    score: jnp.ndarray   # (2,)   int32
-    t: jnp.ndarray       # ()     float32
+    ball: jnp.ndarray          # (4,)   float32   [x, y, vx, vy]
+    robots: jnp.ndarray        # (N_TEAMS, N_ROBOTS, 6) float32 [x, y, theta, vx, vy, omega]
+    score: jnp.ndarray         # (2,)   int32
+    t: jnp.ndarray             # ()     float32
+    wheel_speeds: jnp.ndarray  # (N_TEAMS, N_ROBOTS, 2) float32 — last applied (m/s)
 
 
 def empty_state() -> SimState:
@@ -39,6 +40,7 @@ def empty_state() -> SimState:
         robots=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 6), dtype=jnp.float32),
         score=jnp.zeros(2, dtype=jnp.int32),
         t=jnp.zeros((), dtype=jnp.float32),
+        wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
     )
 
 
@@ -49,6 +51,7 @@ def from_numpy(np_state: NumpySimState) -> SimState:
         robots=jnp.asarray(np_state.robots, dtype=jnp.float32),
         score=jnp.asarray(np_state.score, dtype=jnp.int32),
         t=jnp.asarray(np_state.t, dtype=jnp.float32),
+        wheel_speeds=jnp.asarray(np_state.wheel_speeds, dtype=jnp.float32),
     )
 
 
@@ -59,6 +62,7 @@ def to_numpy(state: SimState) -> NumpySimState:
         robots=np.asarray(state.robots, dtype=np.float64),
         score=np.asarray(state.score, dtype=np.int32),
         t=float(state.t),
+        wheel_speeds=np.asarray(state.wheel_speeds, dtype=np.float64),
     )
 
 
@@ -124,6 +128,9 @@ def reset_kickoff(key: jnp.ndarray) -> SimState:
         robots=robots,
         score=jnp.zeros(2, dtype=jnp.int32),
         t=jnp.zeros((), dtype=jnp.float32),
+        wheel_speeds=jnp.zeros(
+            (config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32
+        ),
     )
 
 
@@ -449,9 +456,17 @@ def _robot_robot_collisions(state: SimState) -> SimState:
 # ---------------------------------------------------------------------------
 
 def _substep(
-    state: SimState, wheel_speeds: jnp.ndarray, sub_dt: jnp.ndarray
+    state: SimState,
+    target_speeds: jnp.ndarray,
+    sub_dt: jnp.ndarray,
+    max_delta: jnp.ndarray,
 ) -> tuple[SimState, jnp.ndarray]:
     """One physics sub-step. Returns ``(new_state, goal_event)``."""
+    # Slew current wheel speeds toward the commanded target (torque limit).
+    delta = jnp.clip(target_speeds - state.wheel_speeds, -max_delta, max_delta)
+    wheel_speeds = state.wheel_speeds + delta
+    state = state._replace(wheel_speeds=wheel_speeds)
+
     v_l = wheel_speeds[:, :, 0]
     v_r = wheel_speeds[:, :, 1]
     theta = state.robots[:, :, 2]
@@ -509,12 +524,13 @@ def step(
     info : dict with ``"goal"`` (int32 scalar).
     """
     actions = jnp.clip(actions, -1.0, 1.0).astype(jnp.float32)
-    wheel_speeds = actions * jnp.float32(config.ROBOT_MAX_WHEEL_SPEED)
+    target_speeds = actions * jnp.float32(config.ROBOT_MAX_WHEEL_SPEED)
     sub_dt = jnp.float32(dt / sub_steps)
+    max_delta = jnp.float32(config.ROBOT_WHEEL_ACCEL_LIMIT) * sub_dt
 
     def body(_, carry):
         state, goal_acc = carry
-        state, g = _substep(state, wheel_speeds, sub_dt)
+        state, g = _substep(state, target_speeds, sub_dt, max_delta)
         goal_acc = jnp.where(goal_acc == 0, g, goal_acc)
         return state, goal_acc
 

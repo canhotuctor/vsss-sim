@@ -60,6 +60,14 @@ class SimState:
         default_factory=lambda: np.zeros(2, dtype=np.int32)
     )
     t: float = 0.0
+    # Per-robot wheel speeds last applied (m/s), shape (N_TEAMS, N_ROBOTS, 2).
+    # Tracked across sub-steps so the torque-limited slew toward the commanded
+    # wheel speeds is continuous.
+    wheel_speeds: np.ndarray = field(
+        default_factory=lambda: np.zeros(
+            (config.N_TEAMS, config.N_ROBOTS, 2), dtype=np.float64
+        )
+    )
 
     def copy(self) -> "SimState":
         """Return a deep copy of this state."""
@@ -68,6 +76,7 @@ class SimState:
             robots=self.robots.copy(),
             score=self.score.copy(),
             t=self.t,
+            wheel_speeds=self.wheel_speeds.copy(),
         )
 
 
@@ -408,11 +417,17 @@ def step(
     info : dict
         ``'goal'`` : +1 (blue scored), -1 (yellow scored), 0 (no goal).
     """
-    wheel_speeds = np.clip(actions, -1.0, 1.0) * config.ROBOT_MAX_WHEEL_SPEED
+    target_speeds = np.clip(actions, -1.0, 1.0) * config.ROBOT_MAX_WHEEL_SPEED
     sub_dt = dt / sub_steps
+    max_delta = config.ROBOT_WHEEL_ACCEL_LIMIT * sub_dt  # per sub-step slew cap
     goal_result = 0
 
     for _ in range(sub_steps):
+        # --- slew current wheel speeds toward the commanded target ---
+        delta = np.clip(target_speeds - state.wheel_speeds, -max_delta, max_delta)
+        state.wheel_speeds += delta
+        wheel_speeds = state.wheel_speeds
+
         # --- robot velocities via diff-drive kinematics ---
         v_l = wheel_speeds[:, :, 0]   # (N_TEAMS, N_ROBOTS)
         v_r = wheel_speeds[:, :, 1]
@@ -479,6 +494,7 @@ def reset_kickoff(
     rng = _default_rng(rng)
     state.ball[:] = 0.0
     state.robots[:] = 0.0
+    state.wheel_speeds[:] = 0.0
 
     half_l = config.FIELD_LENGTH / 2.0 - config.ROBOT_RADIUS
     clear = config.KICKOFF_CLEAR_DIST
