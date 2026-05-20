@@ -13,7 +13,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import time
+
+# --device pre-parse: must run before `import jax` so JAX_PLATFORMS takes effect.
+# Handles both `--device VALUE` and `--device=VALUE` forms; argparse below re-validates.
+for _i, _a in enumerate(sys.argv):
+    _v = None
+    if _a == "--device" and _i + 1 < len(sys.argv):
+        _v = sys.argv[_i + 1]
+    elif _a.startswith("--device="):
+        _v = _a.split("=", 1)[1]
+    if _v in ("cpu", "gpu"):
+        os.environ["JAX_PLATFORMS"] = "cpu" if _v == "cpu" else "cuda"
+        break
 
 import jax
 import jax.numpy as jnp
@@ -178,6 +192,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sb3-timesteps", type=int, default=4096,
         help="Timesteps per SB3 measurement (default: 4096).",
+    )
+    parser.add_argument(
+        "--device", type=str, default="default",
+        choices=["cpu", "gpu", "default"],
+        help=(
+            "Force JAX onto a specific device. cpu=JAX_PLATFORMS=cpu, "
+            "gpu=JAX_PLATFORMS=cuda, default=let JAX pick (env var honored)."
+        ),
     )
     args = parser.parse_args()
     main(args.steps, args.seed, args.sb3, args.sb3_timesteps)
