@@ -17,6 +17,8 @@ and inside Docker containers.
 from __future__ import annotations
 
 import math
+import time
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -74,6 +76,13 @@ class VSSRenderer:
         self._surface: Optional[pygame.Surface] = None
         self._screen: Optional[pygame.Surface] = None
         self._clock: Optional[pygame.time.Clock] = None
+
+        # Wall-clock FPS estimate (human mode only). Rolling average over the
+        # last `_FPS_WINDOW` frame deltas — long enough to be stable, short
+        # enough to react when the rate changes.
+        self._fps_window: deque[float] = deque(maxlen=30)
+        self._last_render_t: Optional[float] = None
+        self._fps_font: Optional[pygame.font.Font] = None
 
     # ------------------------------------------------------------------
     # Coordinate helpers
@@ -231,6 +240,33 @@ class VSSRenderer:
         )
         surf.blit(text, (self._win_w // 2 - text.get_width() // 2, 8))
 
+    def _update_fps_sample(self) -> None:
+        """Record a wall-clock delta from the previous render call."""
+        now = time.perf_counter()
+        if self._last_render_t is not None:
+            dt = now - self._last_render_t
+            if dt > 0:
+                self._fps_window.append(dt)
+        self._last_render_t = now
+
+    def _draw_fps(self, surf: pygame.Surface) -> None:
+        """Draw a wall-clock FPS readout in the top-left corner."""
+        if not self._fps_window:
+            return
+        avg_dt = sum(self._fps_window) / len(self._fps_window)
+        fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
+
+        if self._fps_font is None:
+            try:
+                self._fps_font = pygame.font.SysFont("monospace", 16, bold=True)
+            except Exception:
+                return
+
+        text = self._fps_font.render(
+            f"{fps:5.1f} fps", True, config.COLOR_FIELD_LINES,
+        )
+        surf.blit(text, (8, 8))
+
     # ------------------------------------------------------------------
     # Public render method
     # ------------------------------------------------------------------
@@ -272,6 +308,8 @@ class VSSRenderer:
         self._draw_score(surf, int(score[0]), int(score[1]))
 
         if self.render_mode == "human":
+            self._update_fps_sample()
+            self._draw_fps(surf)
             self._screen.blit(surf, (0, 0))
             pygame.display.flip()
             pygame.event.pump()  # required on macOS to keep the window alive
