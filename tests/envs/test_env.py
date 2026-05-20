@@ -208,7 +208,7 @@ class TestGymCompliance:
     def test_env_checker(self):
         e = VSSEnv(render_mode=None)
         # check_env raises AssertionError on compliance failures
-        check_env(e, warn=True, skip_render_check=True)
+        check_env(e, skip_render_check=True)
         e.close()
 
 

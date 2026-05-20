@@ -65,11 +65,15 @@ class VSSBaseEnv(gym.Env):
         self._step_count = 0
         self._renderer = None
 
-        # Observation space: 46-dimensional continuous [-inf, inf]
+        # Observation space: 46-dimensional continuous. All components are
+        # normalised in `_get_obs`; their worst-case magnitudes (including
+        # collision spikes and ball-in-goal-pocket overshoot) sit well under
+        # 2.0. Bound at ±5.0 for a generous safety margin while still being
+        # finite (Gymnasium wrappers like NormalizeObservation require it).
         obs_dim = 4 + config.N_TEAMS * config.N_ROBOTS * 7
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
+            low=-5.0,
+            high=5.0,
             shape=(obs_dim,),
             dtype=np.float32,
         )
