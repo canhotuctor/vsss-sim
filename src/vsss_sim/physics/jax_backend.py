@@ -229,3 +229,115 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
 
     new_ball = jnp.stack([bx, by, bvx, bvy])
     return state._replace(ball=new_ball), goal
+
+
+# ---------------------------------------------------------------------------
+# Ball–robot collisions (circle vs OBB) — fori_loop over the 6 robots
+# ---------------------------------------------------------------------------
+
+_N_ROBOTS_TOTAL = config.N_TEAMS * config.N_ROBOTS
+
+
+def _ball_obb_penetration(
+    ball_pos: jnp.ndarray, rob_pos: jnp.ndarray, theta: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return (world-space normal, penetration) for a ball vs square OBB."""
+    half = jnp.float32(config.ROBOT_SIZE / 2.0)
+    r_ball = jnp.float32(config.BALL_RADIUS)
+    cos_t = jnp.cos(theta)
+    sin_t = jnp.sin(theta)
+
+    dx = ball_pos[0] - rob_pos[0]
+    dy = ball_pos[1] - rob_pos[1]
+    local_x = cos_t * dx + sin_t * dy
+    local_y = -sin_t * dx + cos_t * dy
+
+    clamp_x = jnp.clip(local_x, -half, half)
+    clamp_y = jnp.clip(local_y, -half, half)
+    diff_x = local_x - clamp_x
+    diff_y = local_y - clamp_y
+    dist = jnp.sqrt(diff_x * diff_x + diff_y * diff_y)
+
+    # Outside-face case
+    safe_dist = jnp.where(dist < 1e-9, 1.0, dist)
+    lnx_out = diff_x / safe_dist
+    lny_out = diff_y / safe_dist
+    pen_out = r_ball - dist
+
+    # Ball-centre-inside case: push out along shortest face.
+    pen_x_in = half - jnp.abs(local_x)
+    pen_y_in = half - jnp.abs(local_y)
+    use_x = pen_x_in <= pen_y_in
+    lnx_in = jnp.where(use_x, jnp.sign(local_x), 0.0)
+    lny_in = jnp.where(use_x, 0.0, jnp.sign(local_y))
+    pen_in = jnp.where(use_x, pen_x_in, pen_y_in) + r_ball
+
+    inside = dist < 1e-9
+    lnx = jnp.where(inside, lnx_in, lnx_out)
+    lny = jnp.where(inside, lny_in, lny_out)
+    penetration = jnp.where(inside, pen_in, pen_out)
+
+    # Rotate normal back to world frame.
+    nx = cos_t * lnx - sin_t * lny
+    ny = sin_t * lnx + cos_t * lny
+    return jnp.stack([nx, ny]), penetration
+
+
+def _resolve_ball_robot_pair(
+    ball: jnp.ndarray,   # (4,)
+    robot: jnp.ndarray,  # (6,)
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Resolve one ball-robot collision; returns updated (ball, robot)."""
+    ball_pos = ball[0:2]
+    ball_vel = ball[2:4]
+    rob_pos = robot[0:2]
+    rob_vel = robot[3:5]
+    theta = robot[2]
+
+    normal, penetration = _ball_obb_penetration(ball_pos, rob_pos, theta)
+    collide = penetration > 0.0
+
+    m_b = jnp.float32(config.BALL_MASS)
+    m_r = jnp.float32(config.ROBOT_MASS)
+    total_m = m_b + m_r
+    e = jnp.float32(config.BALL_ROBOT_RESTITUTION)
+
+    # Positional correction (only when colliding).
+    bp_corr = ball_pos + normal * penetration * (m_r / total_m)
+    rp_corr = rob_pos - normal * penetration * (m_b / total_m)
+
+    rel_vel = ball_vel - rob_vel
+    vel_along = jnp.dot(rel_vel, normal)
+    do_impulse = collide & (vel_along < 0)
+
+    j = -(1.0 + e) * vel_along / (1.0 / m_b + 1.0 / m_r)
+    impulse = j * normal
+
+    bv_new = jnp.where(do_impulse, ball_vel + impulse / m_b, ball_vel)
+    rv_new = jnp.where(do_impulse, rob_vel - impulse / m_r, rob_vel)
+
+    bp_new = jnp.where(collide, bp_corr, ball_pos)
+    rp_new = jnp.where(collide, rp_corr, rob_pos)
+
+    new_ball = jnp.concatenate([bp_new, bv_new])
+    new_robot = robot.at[0:2].set(rp_new).at[3:5].set(rv_new)
+    return new_ball, new_robot
+
+
+def _ball_robot_collisions(state: SimState) -> SimState:
+    """Resolve elastic collisions between the ball and the 6 robots (sequential)."""
+    robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
+
+    def body(i, carry):
+        ball, robots_flat = carry
+        new_ball, new_robot = _resolve_ball_robot_pair(ball, robots_flat[i])
+        robots_flat = robots_flat.at[i].set(new_robot)
+        return new_ball, robots_flat
+
+    new_ball, new_robots_flat = jax.lax.fori_loop(
+        0, _N_ROBOTS_TOTAL, body, (state.ball, robots_flat)
+    )
+    return state._replace(
+        ball=new_ball,
+        robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6),
+    )

@@ -179,3 +179,27 @@ class TestBallWallCollisions:
         s2, goal = jb._ball_wall_collisions(s)
         assert int(goal) == 0
         assert float(s2.ball[2]) < 0
+
+
+class TestBallRobotCollisions:
+    def test_ball_pushed_away(self):
+        s = jb.empty_state()
+        overlap = 0.001
+        dist = config.BALL_RADIUS + config.ROBOT_RADIUS - overlap
+        s = s._replace(
+            ball=jnp.array([dist, 0.0, -1.0, 0.0], dtype=jnp.float32),
+            robots=s.robots.at[0, 0, 0:2].set(jnp.array([0.0, 0.0])),
+        )
+        s2 = jb._ball_robot_collisions(s)
+        # Ball ends up at/past collision distance (no longer penetrating).
+        assert float(s2.ball[0]) >= config.BALL_RADIUS + config.ROBOT_RADIUS - 1e-4
+
+    def test_no_collision_when_separated(self):
+        s = jb.empty_state()
+        s = s._replace(
+            ball=jnp.array([0.5, 0.0, 0.0, 0.0], dtype=jnp.float32),
+            robots=s.robots.at[0, 0, 0:2].set(jnp.array([-0.5, 0.0])),
+        )
+        s2 = jb._ball_robot_collisions(s)
+        assert jnp.allclose(s2.ball, s.ball)
+        assert jnp.allclose(s2.robots, s.robots)
