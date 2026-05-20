@@ -47,7 +47,7 @@ vsss-sim/
 │   ├── __init__.py        # registers VSSS-v0
 │   ├── config.py          # IEEE VSSS constants
 │   ├── agents/            # stationary.py, random.py (pluggable opponents)
-│   ├── envs/              # base.py, vsss_3v3.py (VSSEnv, backend-switchable)
+│   ├── envs/              # base.py, vsss_3v3.py (VSSEnv), vsss_vec.py (VSSVecEnv)
 │   ├── physics/           # numpy_backend.py + jax_backend.py (resolver in __init__.py)
 │   └── rendering/         # pygame.py
 ├── tests/
@@ -64,7 +64,7 @@ vsss-sim/
 └── requirements.txt
 ```
 
-Last known test state: 117/117 passing (numpy + jax backends).
+Last known test state: 137/137 passing (numpy + jax backends + VSSVecEnv).
 
 ## Environment setup
 
@@ -77,12 +77,28 @@ pip install -e ".[dev,render]"     # includes pytest, ruff, pygame
 pytest                              # run tests
 python scripts/smoke.py --render    # visual smoke test (numpy)
 python scripts/smoke.py --backend jax   # smoke test on the JAX backend
+python scripts/bench_backends.py    # numpy vs JAX vs VSSVecEnv throughput
 python scripts/train.py             # MLflow-tracked training
 ```
 
 The active physics backend can also be set via the `VSSS_PHYSICS_BACKEND`
 environment variable (`numpy` or `jax`); the `backend=` kwarg on `VSSEnv` /
 `gym.make("VSSS-v0", backend=...)` overrides the env var.
+
+For batched training-throughput envs:
+
+```python
+import gymnasium as gym
+import vsss_sim  # noqa: F401 — registers VSSS-v0
+
+envs = gym.make_vec(
+    "VSSS-v0", num_envs=256, vectorization_mode="vector_entry_point",
+)
+obs, info = envs.reset(seed=0)            # obs: (256, 46) float32
+obs, rew, term, trunc, info = envs.step(envs.action_space.sample())
+```
+
+Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256, ...)`.
 
 `pyproject.toml` uses ruff (`line-length=100`), pytest configured for `tests/`.
 
@@ -96,12 +112,13 @@ environment variable (`numpy` or `jax`); the `backend=` kwarg on `VSSEnv` /
 6. Robot model switched from circle to **box** — OBB collision + square render with direction indicator (commit `eadc33b`).
 7. MLflow callback changed to log **per-episode** metrics instead of per-step (commit `40fc902`).
 8. **Switchable physics backends**: `physics/__init__.py` resolver picks between `numpy_backend.py` and `jax_backend.py`. JAX backend is a pure-functional mirror — `SimState` as a `NamedTuple` PyTree, `step()` is `jax.jit`-compiled with `lax.fori_loop` substeps and `vmap`-ready shapes. Parity tested vs the NumPy backend within `atol=1e-3` for positions.
+9. **Batched `VSSVecEnv`** (Gymnasium `VectorEnv`): runs `num_envs` matches in parallel via `jit(vmap(jb.step))` over a single batched `SimState`. Registered as the `vector_entry_point` for `VSSS-v0` so `gym.make_vec("VSSS-v0", num_envs=N, vectorization_mode="vector_entry_point")` returns one. `NEXT_STEP` autoreset on truncation; goals trigger in-episode kickoffs (no step-counter reset). Bench at batch=256 on Mac M4 Pro CPU: ~111k env-steps/sec via wrapper, ~303k via raw `jax.vmap` — gap is the Gymnasium boundary overhead.
 
 ## Open threads / next directions
 
-- **Batched JAX env (`VSSVecEnv`)** — PR 2 of the JAX work. Will expose a Gymnasium `VectorEnv` that holds `num_envs` states, batches `jax.vmap(step)`, and ports the opponent policies to operate on batched observations. The single-env `VSSEnv(backend='jax')` is already vmap-ready; the wrapper is mostly env-layer plumbing.
+- **SB3 ↔ VSSVecEnv adapter** — SB3 2.8 doesn't natively consume `gym.vector.VectorEnv`. A small adapter class (~50 lines) that exposes SB3's `VecEnv` interface around `VSSVecEnv` would let `scripts/train.py` benefit from batched physics with PPO. Tracked as next PR.
+- **JAX-native RL libraries** — `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only). These would skip the Gymnasium boundary entirely and recover the gap between VSSVecEnv (~111k fps batch=256 on Mac CPU) and raw vmap ceiling (~303k fps). Biggest win on GPU.
 - **Pymunk backend** mentioned as a possible alternative once user evaluates it. Isaac Gym / PhysX explicitly deferred.
-- **JAX-native RL libraries** — user asked for the SB3 analog in JAX; question was open at end of last session. Candidates: `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only).
 - Adversarial opponents are stationary today — could be upgraded once training is stable.
 
 ## Conventions
