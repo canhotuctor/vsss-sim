@@ -282,6 +282,16 @@ class VSSRenderer:
         )
         surf.blit(text, (8, self._win_h - font.get_linesize() - 8))
 
+    def _draw_episode(self, surf: pygame.Surface, episode: int) -> None:
+        """Draw the episode counter just above the step counter."""
+        font = self._hud_font_or_none()
+        if font is None:
+            return
+        text = font.render(
+            f"episode {episode:d}", True, config.COLOR_FIELD_LINES,
+        )
+        surf.blit(text, (8, self._win_h - 2 * font.get_linesize() - 8))
+
     # ------------------------------------------------------------------
     # Public render method
     # ------------------------------------------------------------------
@@ -292,6 +302,7 @@ class VSSRenderer:
         robots: np.ndarray,
         score: np.ndarray,
         step: Optional[int] = None,
+        episode: Optional[int] = None,
     ) -> Optional[np.ndarray]:
         """
         Render one frame.
@@ -301,8 +312,10 @@ class VSSRenderer:
         ball : (4,) [x, y, vx, vy]
         robots : (N_TEAMS, N_ROBOTS, 6)
         score : (2,) int  [blue_goals, yellow_goals]
-        step : optional control-step counter; when given, drawn under the FPS
-            readout in human mode.
+        step : optional control-step counter; when given, drawn in the bottom
+            left in human mode.
+        episode : optional episode counter; when given, drawn just above the
+            step counter in human mode.
 
         Returns
         -------
@@ -330,6 +343,8 @@ class VSSRenderer:
             self._draw_fps(surf)
             if step is not None:
                 self._draw_step(surf, int(step))
+            if episode is not None:
+                self._draw_episode(surf, int(episode))
             self._screen.blit(surf, (0, 0))
             pygame.display.flip()
             pygame.event.pump()  # required on macOS to keep the window alive

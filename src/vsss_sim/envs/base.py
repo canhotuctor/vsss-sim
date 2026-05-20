@@ -63,6 +63,7 @@ class VSSBaseEnv(gym.Env):
         self._backend_name = self._backend.__name__.rsplit(".", 1)[-1]
         self._state = self._initial_state()
         self._step_count = 0
+        self._episode_count = 0
         self._renderer = None
 
         # Observation space: 46-dimensional continuous. All components are

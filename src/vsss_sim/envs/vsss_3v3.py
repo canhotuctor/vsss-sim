@@ -125,6 +125,7 @@ class VSSEnv(VSSBaseEnv):
 
         self._reset_state()
         self._step_count = 0
+        self._episode_count += 1
 
         return self._get_obs(), self._get_info()
 
@@ -183,6 +184,7 @@ class VSSEnv(VSSBaseEnv):
             np.asarray(self._state.robots),
             np.asarray(self._state.score),
             step=self._step_count,
+            episode=self._episode_count,
         )
 
     def close(self) -> None:
