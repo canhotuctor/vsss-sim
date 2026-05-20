@@ -72,3 +72,40 @@ class TestDiffDrive:
         theta = jnp.zeros((config.N_TEAMS, config.N_ROBOTS))
         vx, vy, omega = jb._diff_drive(v_l, v_r, theta)
         assert vx.shape == (config.N_TEAMS, config.N_ROBOTS)
+
+
+class TestResetKickoff:
+    def test_ball_at_centre(self):
+        s = jb.reset_kickoff(jax.random.PRNGKey(0))
+        assert float(s.ball[0]) == pytest.approx(0.0)
+        assert float(s.ball[1]) == pytest.approx(0.0)
+        assert jnp.all(s.ball[2:4] == 0.0)
+
+    def test_blue_on_left_yellow_on_right(self):
+        s = jb.reset_kickoff(jax.random.PRNGKey(0))
+        assert jnp.all(s.robots[config.TEAM_BLUE, :, 0] < 0)
+        assert jnp.all(s.robots[config.TEAM_YELLOW, :, 0] > 0)
+
+    def test_robots_within_field(self):
+        s = jb.reset_kickoff(jax.random.PRNGKey(42))
+        half_l = config.FIELD_LENGTH / 2.0
+        half_w = config.FIELD_WIDTH / 2.0
+        assert jnp.all(jnp.abs(s.robots[:, :, 0]) <= half_l)
+        assert jnp.all(jnp.abs(s.robots[:, :, 1]) <= half_w)
+
+    def test_score_and_velocities_zero(self):
+        s = jb.reset_kickoff(jax.random.PRNGKey(0))
+        assert jnp.all(s.score == 0)
+        assert jnp.all(s.robots[:, :, 3:6] == 0)
+
+    def test_different_keys_give_different_states(self):
+        s0 = jb.reset_kickoff(jax.random.PRNGKey(0))
+        s1 = jb.reset_kickoff(jax.random.PRNGKey(1))
+        assert not jnp.allclose(s0.robots[:, :, 0:2], s1.robots[:, :, 0:2])
+
+    def test_deterministic_for_same_key(self):
+        key = jax.random.PRNGKey(7)
+        s0 = jb.reset_kickoff(key)
+        s1 = jb.reset_kickoff(key)
+        assert jnp.allclose(s0.robots, s1.robots)
+        assert jnp.allclose(s0.ball, s1.ball)

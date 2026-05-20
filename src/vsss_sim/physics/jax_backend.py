@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -78,3 +79,48 @@ def _diff_drive(
     vx = v * jnp.cos(theta)
     vy = v * jnp.sin(theta)
     return vx, vy, omega
+
+
+# ---------------------------------------------------------------------------
+# Initialisation
+# ---------------------------------------------------------------------------
+
+_BLUE_STARTS = jnp.array(
+    [[-0.55, 0.0], [-0.30, 0.30], [-0.30, -0.30]], dtype=jnp.float32
+)
+_YELLOW_STARTS = jnp.array(
+    [[0.55, 0.0], [0.30, -0.30], [0.30, 0.30]], dtype=jnp.float32
+)
+
+
+def reset_kickoff(key: jnp.ndarray) -> SimState:
+    """Place robots and ball for a standard kickoff (functional)."""
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0 - config.ROBOT_RADIUS)
+    clear = jnp.float32(config.KICKOFF_CLEAR_DIST)
+
+    key_b, key_y = jax.random.split(key)
+    blue_jitter = jax.random.uniform(key_b, (3, 2), minval=-0.05, maxval=0.05)
+    yellow_jitter = jax.random.uniform(key_y, (3, 2), minval=-0.05, maxval=0.05)
+
+    blue = _BLUE_STARTS + blue_jitter
+    blue = blue.at[:, 0].set(jnp.clip(blue[:, 0], -half_l, -clear))
+    blue = blue.at[:, 1].set(jnp.clip(blue[:, 1], -half_l, half_l))
+
+    yellow = _YELLOW_STARTS + yellow_jitter
+    yellow = yellow.at[:, 0].set(jnp.clip(yellow[:, 0], clear, half_l))
+    yellow = yellow.at[:, 1].set(jnp.clip(yellow[:, 1], -half_l, half_l))
+
+    robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 6), dtype=jnp.float32)
+    robots = robots.at[config.TEAM_BLUE, :, 0:2].set(blue)
+    robots = robots.at[config.TEAM_YELLOW, :, 0:2].set(yellow)
+
+    # Face toward the ball at origin.
+    theta = jnp.arctan2(-robots[:, :, 1], -robots[:, :, 0])
+    robots = robots.at[:, :, 2].set(theta)
+
+    return SimState(
+        ball=jnp.zeros(4, dtype=jnp.float32),
+        robots=robots,
+        score=jnp.zeros(2, dtype=jnp.int32),
+        t=jnp.zeros((), dtype=jnp.float32),
+    )
