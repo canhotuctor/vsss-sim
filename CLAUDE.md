@@ -64,7 +64,7 @@ vsss-sim/
 └── requirements.txt
 ```
 
-Last known test state: 137/137 passing (numpy + jax backends + VSSVecEnv).
+Last known test state: 147/147 passing (numpy + jax backends + VSSVecEnv + SB3 adapter).
 
 ## Environment setup
 
@@ -100,6 +100,20 @@ obs, rew, term, trunc, info = envs.step(envs.action_space.sample())
 
 Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256, ...)`.
 
+For SB3 (PPO etc.) with batched physics, use the adapter:
+
+```python
+from stable_baselines3 import PPO
+from vsss_sim.envs import VSSVecEnv
+from vsss_sim.sb3_adapter import VSSVecEnvToSB3
+
+env = VSSVecEnvToSB3(VSSVecEnv(num_envs=256, opponent_policy="stationary"))
+model = PPO("MlpPolicy", env, n_steps=128, verbose=1)
+model.learn(total_timesteps=1_000_000)
+```
+
+Or via `scripts/smoke.py --num-envs 256 --timesteps 50000`.
+
 `pyproject.toml` uses ruff (`line-length=100`), pytest configured for `tests/`.
 
 ## What's been built (chronological)
@@ -113,11 +127,12 @@ Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256
 7. MLflow callback changed to log **per-episode** metrics instead of per-step (commit `40fc902`).
 8. **Switchable physics backends**: `physics/__init__.py` resolver picks between `numpy_backend.py` and `jax_backend.py`. JAX backend is a pure-functional mirror — `SimState` as a `NamedTuple` PyTree, `step()` is `jax.jit`-compiled with `lax.fori_loop` substeps and `vmap`-ready shapes. Parity tested vs the NumPy backend within `atol=1e-3` for positions.
 9. **Batched `VSSVecEnv`** (Gymnasium `VectorEnv`): runs `num_envs` matches in parallel via `jit(vmap(jb.step))` over a single batched `SimState`. Registered as the `vector_entry_point` for `VSSS-v0` so `gym.make_vec("VSSS-v0", num_envs=N, vectorization_mode="vector_entry_point")` returns one. `NEXT_STEP` autoreset on truncation; goals trigger in-episode kickoffs (no step-counter reset). Bench at batch=256 on Mac M4 Pro CPU: ~111k env-steps/sec via wrapper, ~303k via raw `jax.vmap` — gap is the Gymnasium boundary overhead.
+10. **SB3 ↔ VSSVecEnv adapter** (`src/vsss_sim/sb3_adapter.py::VSSVecEnvToSB3`): translates between SB3's `VecEnv` interface and `VSSVecEnv`'s Gymnasium `VectorEnv`. Bridges (a) `reset()` returning only obs, (b) `step → (obs, rewards, dones, list[dict])` with `dones = term|trunc`, (c) eager auto-reset with `terminal_observation` and `episode={"r","l","t"}` per SB3 convention. `scripts/smoke.py` gained `--num-envs N` that routes through the adapter. End-to-end SB3 PPO throughput on Mac M4 Pro CPU: 600 fps (num_envs=1) → 47,500 fps (num_envs=256) — **~80× wall-clock training speedup.**
 
 ## Open threads / next directions
 
-- **SB3 ↔ VSSVecEnv adapter** — SB3 2.8 doesn't natively consume `gym.vector.VectorEnv`. A small adapter class (~50 lines) that exposes SB3's `VecEnv` interface around `VSSVecEnv` would let `scripts/train.py` benefit from batched physics with PPO. Tracked as next PR.
-- **JAX-native RL libraries** — `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only). These would skip the Gymnasium boundary entirely and recover the gap between VSSVecEnv (~111k fps batch=256 on Mac CPU) and raw vmap ceiling (~303k fps). Biggest win on GPU.
+- **CUDA on Ubuntu RTX 3060** — `pip install -U "jax[cuda12]"`, then verify `VSSVecEnv` runs on the GPU. Code is already ready; mostly setup/verification work. Expected boost: 1M+ env-steps/sec at batch=256 for raw physics; SB3 ceiling depends on policy size.
+- **JAX-native RL libraries** — `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only). These would skip the Gymnasium + SB3 boundary entirely and recover the gap between VSSVecEnv (~111k fps batch=256 on Mac CPU) and raw vmap ceiling (~303k fps). Biggest win on GPU.
 - **Pymunk backend** mentioned as a possible alternative once user evaluates it. Isaac Gym / PhysX explicitly deferred.
 - Adversarial opponents are stationary today — could be upgraded once training is stable.
 

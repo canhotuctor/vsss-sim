@@ -87,6 +87,20 @@ obs, rew, term, trunc, info = envs.step(envs.action_space.sample())
 
 Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256)`.
 
+### Training with SB3 PPO + batched env (~80× wall-clock speedup at `num_envs=256`)
+
+```python
+from stable_baselines3 import PPO
+from vsss_sim.envs import VSSVecEnv
+from vsss_sim.sb3_adapter import VSSVecEnvToSB3
+
+env = VSSVecEnvToSB3(VSSVecEnv(num_envs=256, opponent_policy="stationary"))
+model = PPO("MlpPolicy", env, n_steps=128, verbose=1)
+model.learn(total_timesteps=1_000_000)
+```
+
+Or via the smoke script: `python scripts/smoke.py --num-envs 256 --timesteps 50000`.
+
 ---
 
 ## Environment details
@@ -156,6 +170,8 @@ is a `NamedTuple` PyTree, `step()` is `jax.jit`-compiled with
 
 ### Throughput (Apple M4 Pro CPU, 12 cores)
 
+Raw physics throughput:
+
 | Setup | Throughput | Speedup vs NumPy single-env |
 |---|---|---|
 | NumPy, raw physics single-env | ~3,500 fps | 1× |
@@ -163,6 +179,15 @@ is a `NamedTuple` PyTree, `step()` is `jax.jit`-compiled with
 | JAX `jax.vmap`, batch=256, raw physics | ~300,000 fps | ~88× (CPU ceiling) |
 | `VSSVecEnv` (Gymnasium wrapper), batch=256 | ~120,000 fps | ~34× |
 | `VSSVecEnv`, batch=1024 | ~155,000 fps | ~44× |
+
+End-to-end SB3 PPO training (PyTorch policy + JAX physics, via the adapter):
+
+| `num_envs` | fps | Speedup vs `num_envs=1` |
+|---|---|---|
+| 1 | ~600 | 1× |
+| 8 | ~4,400 | 7× |
+| 64 | ~23,800 | 40× |
+| 256 | ~47,500 | **80×** |
 
 Reproduce with `python scripts/bench_backends.py`. The gap between raw vmap
 and `VSSVecEnv` is the Gymnasium numpy↔JAX boundary cost (per-step Python
@@ -173,8 +198,8 @@ negligible.
 
 ## Scripts
 
-- `scripts/smoke.py` — SB3 PPO smoke (single env). Flags: `--backend numpy|jax`, `--render`, `--fps`, `--timesteps`.
-- `scripts/bench_backends.py` — throughput benchmark across all backends and batch sizes.
+- `scripts/smoke.py` — SB3 PPO smoke. Flags: `--backend numpy|jax` (single-env), `--num-envs N` (batched via SB3 adapter, requires JAX), `--render`, `--fps`, `--timesteps`.
+- `scripts/bench_backends.py` — throughput benchmark across NumPy, JAX, raw `jax.vmap`, `VSSVecEnv`. Add `--sb3` for end-to-end SB3 PPO numbers.
 - `scripts/train.py` — MLflow-tracked PPO training run.
 
 ---
@@ -182,8 +207,8 @@ negligible.
 ## Running tests
 
 ```bash
-pip install -e ".[dev]"
-pytest                          # 137/137 expected
+pip install -e ".[dev,jax]"
+pytest                          # 147/147 expected
 ```
 
 ---
@@ -203,8 +228,9 @@ src/vsss_sim/
 │   ├── __init__.py        Backend resolver (get_backend)
 │   ├── numpy_backend.py   Reference CPU backend (mutable SimState)
 │   └── jax_backend.py     JAX backend (functional, jittable, vmap-ready)
-└── rendering/pygame.py
-tests/                     137 tests across agents, envs, physics
+├── rendering/pygame.py
+└── sb3_adapter.py         VSSVecEnvToSB3 — SB3 VecEnv around VSSVecEnv
+tests/                     147 tests across agents, envs, physics
 scripts/                   smoke.py, train.py, bench_backends.py
 docs/superpowers/plans/    Implementation plans for major features
 pyproject.toml
@@ -214,9 +240,8 @@ pyproject.toml
 
 ## Roadmap
 
-- **SB3 ↔ VSSVecEnv adapter** — let `scripts/train.py` consume batched physics with PPO (unlocks the ~30× wall-clock training speedup on Mac CPU).
-- **CUDA on Ubuntu RTX 3060** — `pip install -U "jax[cuda12]"` and verify; expected 1M+ env-steps/sec at batch=256.
-- **JAX-native RL** — integration with `purejaxrl` / `Stoix` to remove the Gymnasium boundary entirely.
+- **CUDA on Ubuntu RTX 3060** — `pip install -U "jax[cuda12]"` and verify; expected 1M+ env-steps/sec at batch=256 for raw physics.
+- **JAX-native RL** — integration with `purejaxrl` / `Stoix` to remove the Gymnasium + SB3 boundary entirely.
 - **Pymunk backend** — possible third backend for sanity-checking the hand-rolled physics.
 
 ---
