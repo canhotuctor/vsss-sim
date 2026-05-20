@@ -14,7 +14,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .. import config
-from ..physics import SimState
+from .. import physics as _physics_pkg
 
 # ---------------------------------------------------------------------------
 # Normalisation constants
@@ -33,6 +33,12 @@ class VSSBaseEnv(gym.Env):
     Base environment: spaces, state container, and observation builder.
 
     Subclasses implement ``reset``, ``step``, ``render``, and ``close``.
+
+    Parameters
+    ----------
+    backend : str, optional
+        Physics backend name (``"numpy"`` or ``"jax"``). Defaults to the
+        ``VSSS_PHYSICS_BACKEND`` environment variable, then ``"numpy"``.
     """
 
     metadata: dict[str, Any] = {
@@ -45,6 +51,7 @@ class VSSBaseEnv(gym.Env):
         render_mode: Optional[str] = None,
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         render_fps: Optional[float] = None,
+        backend: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -52,7 +59,9 @@ class VSSBaseEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self._render_fps = render_fps
         self._rng = np.random.default_rng()
-        self._state = SimState()
+        self._backend = _physics_pkg.get_backend(backend)
+        self._backend_name = self._backend.__name__.rsplit(".", 1)[-1]
+        self._state = self._initial_state()
         self._step_count = 0
         self._renderer = None
 
@@ -74,25 +83,37 @@ class VSSBaseEnv(gym.Env):
         )
 
     # ------------------------------------------------------------------
+    # Backend-agnostic state helpers
+    # ------------------------------------------------------------------
+
+    def _initial_state(self):
+        """Create a zero state appropriate for the active backend."""
+        if self._backend_name == "jax_backend":
+            return self._backend.empty_state()
+        return self._backend.SimState()
+
+    # ------------------------------------------------------------------
     # Observation builder
     # ------------------------------------------------------------------
 
     def _get_obs(self) -> np.ndarray:
         """Return a normalised flat observation vector."""
         s = self._state
+        ball = np.asarray(s.ball)
+        robots = np.asarray(s.robots)
         obs = np.empty(4 + config.N_TEAMS * config.N_ROBOTS * 7, dtype=np.float32)
 
         # Ball
-        obs[0] = s.ball[0] / _NORM_POS_X
-        obs[1] = s.ball[1] / _NORM_POS_Y
-        obs[2] = s.ball[2] / _NORM_VEL
-        obs[3] = s.ball[3] / _NORM_VEL
+        obs[0] = ball[0] / _NORM_POS_X
+        obs[1] = ball[1] / _NORM_POS_Y
+        obs[2] = ball[2] / _NORM_VEL
+        obs[3] = ball[3] / _NORM_VEL
 
         # Robots (both teams, blue first)
         idx = 4
         for team in range(config.N_TEAMS):
             for r in range(config.N_ROBOTS):
-                x, y, theta, vx, vy, omega = s.robots[team, r]
+                x, y, theta, vx, vy, omega = robots[team, r]
                 obs[idx + 0] = x / _NORM_POS_X
                 obs[idx + 1] = y / _NORM_POS_Y
                 obs[idx + 2] = float(np.sin(theta))
@@ -105,8 +126,9 @@ class VSSBaseEnv(gym.Env):
         return obs
 
     def _get_info(self) -> dict[str, Any]:
+        score = np.asarray(self._state.score)
         return {
-            "score_blue": int(self._state.score[config.TEAM_BLUE]),
-            "score_yellow": int(self._state.score[config.TEAM_YELLOW]),
-            "sim_time": float(self._state.t),
+            "score_blue": int(score[config.TEAM_BLUE]),
+            "score_yellow": int(score[config.TEAM_YELLOW]),
+            "sim_time": float(np.asarray(self._state.t)),
         }

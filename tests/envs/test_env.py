@@ -210,3 +210,50 @@ class TestGymCompliance:
         # check_env raises AssertionError on compliance failures
         check_env(e, warn=True, skip_render_check=True)
         e.close()
+
+
+# ---------------------------------------------------------------------------
+# Backend parametrisation (numpy + jax)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("backend", ["numpy", "jax"])
+class TestBackendParity:
+    def test_make_with_backend_kwarg(self, backend):
+        e = gym.make("VSSS-v0", backend=backend)
+        obs, _ = e.reset(seed=0)
+        assert obs.shape == (4 + config.N_TEAMS * config.N_ROBOTS * 7,)
+        e.close()
+
+    def test_step_runs(self, backend):
+        e = VSSEnv(backend=backend, render_mode=None)
+        e.reset(seed=0)
+        for _ in range(5):
+            obs, reward, terminated, truncated, info = e.step(
+                e.action_space.sample()
+            )
+            assert obs.shape == e.observation_space.shape
+            assert np.all(np.isfinite(obs))
+        e.close()
+
+    def test_reset_deterministic_with_seed(self, backend):
+        e = VSSEnv(backend=backend, render_mode=None)
+        obs1, _ = e.reset(seed=7)
+        obs2, _ = e.reset(seed=7)
+        assert np.allclose(obs1, obs2)
+        e.close()
+
+    def test_random_opponent(self, backend):
+        e = VSSEnv(backend=backend, opponent_policy="random")
+        e.reset(seed=0)
+        for _ in range(5):
+            e.step(e.action_space.sample())
+        e.close()
+
+    def test_callable_opponent(self, backend):
+        def policy(obs):
+            return np.ones((config.N_ROBOTS, 2), dtype=np.float32) * 0.3
+        e = VSSEnv(backend=backend, opponent_policy=policy)
+        e.reset(seed=0)
+        for _ in range(5):
+            e.step(e.action_space.sample())
+        e.close()
