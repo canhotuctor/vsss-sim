@@ -25,9 +25,11 @@ from .. import config
 
 try:
     import pygame
+    from pygame import gfxdraw  # anti-aliased primitives
     _PYGAME_AVAILABLE = True
 except ImportError:
     _PYGAME_AVAILABLE = False
+    gfxdraw = None  # type: ignore[assignment]
 
 
 def _require_pygame() -> None:
@@ -126,10 +128,10 @@ class VSSRenderer:
             2,
         )
 
-        # Centre circle
+        # Centre circle (AA)
         cx, cy = self._to_px(0.0, 0.0)
         r_px = self._m_to_px(config.CENTER_RADIUS)
-        pygame.draw.circle(surf, config.COLOR_FIELD_LINES, (cx, cy), r_px, 2)
+        gfxdraw.aacircle(surf, cx, cy, r_px, config.COLOR_FIELD_LINES)
 
         # Goals
         goal_px_h = self._m_to_px(config.GOAL_WIDTH)
@@ -191,19 +193,26 @@ class VSSRenderer:
             if team == config.TEAM_BLUE
             else config.COLOR_ROBOT_YELLOW
         )
-        pygame.draw.polygon(surf, color, corners_px)
-        pygame.draw.polygon(surf, config.COLOR_ROBOT_OUTLINE, corners_px, 2)
+        # Filled body with AA edge — gfxdraw.filled_polygon has a hard edge, so
+        # overlay aapolygon (1 px AA) in the same colour to smooth it, then a
+        # second aapolygon in the outline colour for the visible border.
+        gfxdraw.filled_polygon(surf, corners_px, color)
+        gfxdraw.aapolygon(surf, corners_px, color)
+        gfxdraw.aapolygon(surf, corners_px, config.COLOR_ROBOT_OUTLINE)
 
-        # Direction indicator from centre to front face midpoint
+        # Direction indicator from centre to front face midpoint (AA line)
         cx, cy = self._to_px(x, y)
         tip = self._to_px(x + cos_t * half * 0.85, y + sin_t * half * 0.85)
-        pygame.draw.line(surf, config.COLOR_ROBOT_OUTLINE, (cx, cy), tip, 2)
+        pygame.draw.aaline(surf, config.COLOR_ROBOT_OUTLINE, (cx, cy), tip)
 
     def _draw_ball(self, surf: pygame.Surface, x: float, y: float) -> None:
         cx, cy = self._to_px(x, y)
         r_px = max(config.MIN_BALL_RENDER_RADIUS, self._m_to_px(config.BALL_RADIUS))
-        pygame.draw.circle(surf, config.COLOR_BALL, (cx, cy), r_px)
-        pygame.draw.circle(surf, config.COLOR_BALL_OUTLINE, (cx, cy), r_px, 1)
+        # filled_circle + aacircle in the fill colour gives an AA filled disc;
+        # a second aacircle in the outline colour adds the visible border.
+        gfxdraw.filled_circle(surf, cx, cy, r_px, config.COLOR_BALL)
+        gfxdraw.aacircle(surf, cx, cy, r_px, config.COLOR_BALL)
+        gfxdraw.aacircle(surf, cx, cy, r_px, config.COLOR_BALL_OUTLINE)
 
     def _draw_score(
         self,
