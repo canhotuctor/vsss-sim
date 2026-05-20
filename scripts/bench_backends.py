@@ -100,7 +100,37 @@ def _bench_vssvecenv(steps: int, batch: int, seed: int) -> tuple[float, float]:
     return steps / elapsed, (steps * batch) / elapsed
 
 
-def main(steps: int, seed: int) -> None:
+def _bench_sb3_ppo(num_envs: int, total_timesteps: int, seed: int) -> float:
+    """End-to-end SB3 PPO training fps with the VSSVecEnv → SB3 adapter.
+
+    Includes everything: PyTorch policy forward, JAX physics, numpy↔jax
+    conversion, rollout buffer, gradient updates. This is what the user
+    actually experiences during training.
+    """
+    from stable_baselines3 import PPO
+
+    from vsss_sim.envs import VSSVecEnv
+    from vsss_sim.sb3_adapter import VSSVecEnvToSB3
+
+    env = VSSVecEnvToSB3(VSSVecEnv(num_envs=num_envs, opponent_policy="stationary"))
+    # Use a uniform rollout size across all num_envs so we measure the same
+    # amount of work each time. 32 × num_envs ≈ one rollout per env per measure.
+    n_steps = 32
+    model = PPO("MlpPolicy", env, n_steps=n_steps, batch_size=min(64 * num_envs, 4096),
+                seed=seed, verbose=0)
+    # Warm-up: one short learn to JIT/trace through the policy + env.
+    model.learn(total_timesteps=num_envs * n_steps)
+
+    start_steps = model.num_timesteps
+    t0 = time.perf_counter()
+    model.learn(total_timesteps=total_timesteps, reset_num_timesteps=False)
+    elapsed = time.perf_counter() - t0
+    actual_steps = model.num_timesteps - start_steps
+    env.close()
+    return actual_steps / elapsed
+
+
+def main(steps: int, seed: int, sb3: bool, sb3_timesteps: int) -> None:
     print(f"JAX devices: {jax.devices()}   default backend: {jax.default_backend()}")
     print(f"Steps per measurement: {steps}\n")
 
@@ -123,11 +153,31 @@ def main(steps: int, seed: int) -> None:
         per_env, total = _bench_vssvecenv(steps, batch, seed)
         print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}  {total / np_fps:>9.1f}x")
 
+    if sb3:
+        print("\n== End-to-end SB3 PPO training fps ==")
+        print(f"  (includes PyTorch policy, JAX physics, conversions, rollout, gradient)")
+        baseline_fps = None
+        print(f"  {'num_envs':>9}  {'fps':>10}  {'vs num_envs=1':>14}")
+        for num_envs in (1, 8, 64, 256):
+            fps = _bench_sb3_ppo(num_envs, sb3_timesteps, seed)
+            if baseline_fps is None:
+                baseline_fps = fps
+            speedup = fps / baseline_fps
+            print(f"  {num_envs:>9}  {fps:>10,.0f}  {speedup:>13.1f}x")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark physics backends.")
     parser.add_argument("--steps", type=int, default=2000,
-                        help="Steps per measurement (default: 2000).")
+                        help="Raw-physics steps per measurement (default: 2000).")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--sb3", action="store_true",
+        help="Also run end-to-end SB3 PPO throughput bench (slower; adds ~30-60s).",
+    )
+    parser.add_argument(
+        "--sb3-timesteps", type=int, default=4096,
+        help="Timesteps per SB3 measurement (default: 4096).",
+    )
     args = parser.parse_args()
-    main(args.steps, args.seed)
+    main(args.steps, args.seed, args.sb3, args.sb3_timesteps)
