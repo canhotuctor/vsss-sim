@@ -124,3 +124,45 @@ def reset_kickoff(key: jnp.ndarray) -> SimState:
         score=jnp.zeros(2, dtype=jnp.int32),
         t=jnp.zeros((), dtype=jnp.float32),
     )
+
+
+# ---------------------------------------------------------------------------
+# Robot–wall collisions (vectorised)
+# ---------------------------------------------------------------------------
+
+def _robot_wall_collisions(state: SimState) -> SimState:
+    """Clamp robots (OBB) inside field boundaries; zero outward velocity."""
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
+    half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
+    half = jnp.float32(config.ROBOT_SIZE / 2.0)
+
+    theta = state.robots[:, :, 2]
+    extent = half * (jnp.abs(jnp.cos(theta)) + jnp.abs(jnp.sin(theta)))
+
+    lim_x = half_l - extent
+    lim_y = half_w - extent
+
+    x = state.robots[:, :, 0]
+    y = state.robots[:, :, 1]
+    vx = state.robots[:, :, 3]
+    vy = state.robots[:, :, 4]
+
+    exceeded_neg_x = x < -lim_x
+    exceeded_pos_x = x > lim_x
+    exceeded_neg_y = y < -lim_y
+    exceeded_pos_y = y > lim_y
+
+    new_x = jnp.clip(x, -lim_x, lim_x)
+    new_y = jnp.clip(y, -lim_y, lim_y)
+
+    new_vx = jnp.where(exceeded_neg_x & (vx < 0), 0.0, vx)
+    new_vx = jnp.where(exceeded_pos_x & (new_vx > 0), 0.0, new_vx)
+    new_vy = jnp.where(exceeded_neg_y & (vy < 0), 0.0, vy)
+    new_vy = jnp.where(exceeded_pos_y & (new_vy > 0), 0.0, new_vy)
+
+    robots = state.robots
+    robots = robots.at[:, :, 0].set(new_x)
+    robots = robots.at[:, :, 1].set(new_y)
+    robots = robots.at[:, :, 3].set(new_vx)
+    robots = robots.at[:, :, 4].set(new_vy)
+    return state._replace(robots=robots)

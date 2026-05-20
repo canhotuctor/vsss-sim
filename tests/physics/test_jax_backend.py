@@ -109,3 +109,22 @@ class TestResetKickoff:
         s1 = jb.reset_kickoff(key)
         assert jnp.allclose(s0.robots, s1.robots)
         assert jnp.allclose(s0.ball, s1.ball)
+
+
+class TestRobotWallCollisions:
+    def test_clamped_inside_field(self):
+        s = jb.empty_state()
+        s = s._replace(robots=s.robots.at[:, :, 0].set(config.FIELD_LENGTH))
+        s = s._replace(robots=s.robots.at[:, :, 1].set(config.FIELD_WIDTH))
+        s = jb._robot_wall_collisions(s)
+        half_l = config.FIELD_LENGTH / 2.0
+        half_w = config.FIELD_WIDTH / 2.0
+        assert jnp.all(s.robots[:, :, 0] <= half_l + 1e-5)
+        assert jnp.all(s.robots[:, :, 1] <= half_w + 1e-5)
+
+    def test_velocity_zeroed_at_wall(self):
+        s = jb.empty_state()
+        s = s._replace(robots=s.robots.at[0, 0, 0].set(config.FIELD_LENGTH))
+        s = s._replace(robots=s.robots.at[0, 0, 3].set(1.0))  # moving further out
+        s = jb._robot_wall_collisions(s)
+        assert float(s.robots[0, 0, 3]) == pytest.approx(0.0)
