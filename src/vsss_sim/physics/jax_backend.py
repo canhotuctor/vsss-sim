@@ -58,3 +58,23 @@ def to_numpy(state: SimState) -> NumpySimState:
         score=np.asarray(state.score, dtype=np.int32),
         t=float(state.t),
     )
+
+
+# ---------------------------------------------------------------------------
+# Differential-drive kinematics (vectorised over robots)
+# ---------------------------------------------------------------------------
+
+def _diff_drive(
+    v_left: jnp.ndarray,
+    v_right: jnp.ndarray,
+    theta: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Convert wheel speeds to body velocities.
+
+    Returns ``(vx, vy, omega)`` shaped like the inputs.
+    """
+    v = 0.5 * (v_left + v_right)
+    omega = (v_right - v_left) / config.ROBOT_WHEELBASE
+    vx = v * jnp.cos(theta)
+    vy = v * jnp.sin(theta)
+    return vx, vy, omega

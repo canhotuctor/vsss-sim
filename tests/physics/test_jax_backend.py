@@ -50,3 +50,25 @@ class TestSimState:
         assert np.allclose(np_s2.robots, np_s.robots, atol=1e-5)
         assert np.all(np_s2.score == np_s.score)
         assert np_s2.t == pytest.approx(np_s.t, abs=1e-5)
+
+
+class TestDiffDrive:
+    def test_straight_forward(self):
+        vx, vy, omega = jb._diff_drive(jnp.array([1.0]), jnp.array([1.0]), jnp.array([0.0]))
+        assert float(vx[0]) == pytest.approx(1.0)
+        assert float(vy[0]) == pytest.approx(0.0, abs=1e-6)
+        assert float(omega[0]) == pytest.approx(0.0, abs=1e-6)
+
+    def test_rotate_in_place(self):
+        v = 0.5
+        vx, vy, omega = jb._diff_drive(jnp.array([-v]), jnp.array([v]), jnp.array([0.0]))
+        assert float(vx[0]) == pytest.approx(0.0, abs=1e-6)
+        assert float(vy[0]) == pytest.approx(0.0, abs=1e-6)
+        assert float(omega[0]) == pytest.approx(2 * v / config.ROBOT_WHEELBASE, rel=1e-4)
+
+    def test_vectorised_shape(self):
+        v_l = jnp.ones((config.N_TEAMS, config.N_ROBOTS))
+        v_r = jnp.ones((config.N_TEAMS, config.N_ROBOTS))
+        theta = jnp.zeros((config.N_TEAMS, config.N_ROBOTS))
+        vx, vy, omega = jb._diff_drive(v_l, v_r, theta)
+        assert vx.shape == (config.N_TEAMS, config.N_ROBOTS)
