@@ -277,8 +277,10 @@ class VSSRenderer:
             return
         # Sim time = step * DT — handy alongside the integer count.
         sim_t = step * config.DT
+        # Extra spaces after "step" and "episode" align the two numeric
+        # columns vertically (see _draw_episode below).
         text = font.render(
-            f"step {step:>5d}  ({sim_t:5.2f}s)", True, config.COLOR_FIELD_LINES,
+            f"step  {step:>5d}  ({sim_t:5.2f}s)", True, config.COLOR_FIELD_LINES,
         )
         surf.blit(text, (8, self._win_h - font.get_linesize() - 8))
 
@@ -288,7 +290,7 @@ class VSSRenderer:
         if font is None:
             return
         text = font.render(
-            f"episode {episode:d}", True, config.COLOR_FIELD_LINES,
+            f"episode   {episode:d}", True, config.COLOR_FIELD_LINES,
         )
         surf.blit(text, (8, self._win_h - 2 * font.get_linesize() - 8))
 
