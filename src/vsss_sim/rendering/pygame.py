@@ -82,7 +82,7 @@ class VSSRenderer:
         # enough to react when the rate changes.
         self._fps_window: deque[float] = deque(maxlen=30)
         self._last_render_t: Optional[float] = None
-        self._fps_font: Optional[pygame.font.Font] = None
+        self._hud_font: Optional[pygame.font.Font] = None
 
     # ------------------------------------------------------------------
     # Coordinate helpers
@@ -249,6 +249,14 @@ class VSSRenderer:
                 self._fps_window.append(dt)
         self._last_render_t = now
 
+    def _hud_font_or_none(self) -> Optional["pygame.font.Font"]:
+        if self._hud_font is None:
+            try:
+                self._hud_font = pygame.font.SysFont("monospace", 16, bold=True)
+            except Exception:
+                return None
+        return self._hud_font
+
     def _draw_fps(self, surf: pygame.Surface) -> None:
         """Draw a wall-clock FPS readout in the top-left corner."""
         if not self._fps_window:
@@ -256,16 +264,23 @@ class VSSRenderer:
         avg_dt = sum(self._fps_window) / len(self._fps_window)
         fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
 
-        if self._fps_font is None:
-            try:
-                self._fps_font = pygame.font.SysFont("monospace", 16, bold=True)
-            except Exception:
-                return
-
-        text = self._fps_font.render(
-            f"{fps:5.1f} fps", True, config.COLOR_FIELD_LINES,
-        )
+        font = self._hud_font_or_none()
+        if font is None:
+            return
+        text = font.render(f"{fps:5.1f} fps", True, config.COLOR_FIELD_LINES)
         surf.blit(text, (8, 8))
+
+    def _draw_step(self, surf: pygame.Surface, step: int) -> None:
+        """Draw the current control-step count just below the FPS readout."""
+        font = self._hud_font_or_none()
+        if font is None:
+            return
+        # Sim time = step * DT — handy alongside the integer count.
+        sim_t = step * config.DT
+        text = font.render(
+            f"step {step:>5d}  ({sim_t:5.2f}s)", True, config.COLOR_FIELD_LINES,
+        )
+        surf.blit(text, (8, 8 + font.get_linesize()))
 
     # ------------------------------------------------------------------
     # Public render method
@@ -276,6 +291,7 @@ class VSSRenderer:
         ball: np.ndarray,
         robots: np.ndarray,
         score: np.ndarray,
+        step: Optional[int] = None,
     ) -> Optional[np.ndarray]:
         """
         Render one frame.
@@ -285,6 +301,8 @@ class VSSRenderer:
         ball : (4,) [x, y, vx, vy]
         robots : (N_TEAMS, N_ROBOTS, 6)
         score : (2,) int  [blue_goals, yellow_goals]
+        step : optional control-step counter; when given, drawn under the FPS
+            readout in human mode.
 
         Returns
         -------
@@ -310,6 +328,8 @@ class VSSRenderer:
         if self.render_mode == "human":
             self._update_fps_sample()
             self._draw_fps(surf)
+            if step is not None:
+                self._draw_step(surf, int(step))
             self._screen.blit(surf, (0, 0))
             pygame.display.flip()
             pygame.event.pump()  # required on macOS to keep the window alive

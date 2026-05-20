@@ -182,6 +182,7 @@ class VSSEnv(VSSBaseEnv):
             np.asarray(self._state.ball),
             np.asarray(self._state.robots),
             np.asarray(self._state.score),
+            step=self._step_count,
         )
 
     def close(self) -> None:
