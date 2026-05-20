@@ -166,3 +166,66 @@ def _robot_wall_collisions(state: SimState) -> SimState:
     robots = robots.at[:, :, 3].set(new_vx)
     robots = robots.at[:, :, 4].set(new_vy)
     return state._replace(robots=robots)
+
+
+# ---------------------------------------------------------------------------
+# Ball–wall collisions and goal detection
+# ---------------------------------------------------------------------------
+
+def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
+    """Reflect ball off field walls and detect goals.
+
+    Returns
+    -------
+    new_state : SimState
+    goal : int32 scalar (+1 blue, -1 yellow, 0 none).
+    """
+    r = jnp.float32(config.BALL_RADIUS)
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
+    half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
+    half_goal = jnp.float32(config.GOAL_WIDTH / 2.0)
+    goal_depth = jnp.float32(config.GOAL_DEPTH)
+    e_wall = jnp.float32(config.BALL_WALL_RESTITUTION)
+
+    bx, by, bvx, bvy = state.ball[0], state.ball[1], state.ball[2], state.ball[3]
+
+    # --- y walls (top / bottom of field) ---
+    hit_bot = by - r < -half_w
+    hit_top = by + r > half_w
+    by = jnp.where(hit_bot, -half_w + r, by)
+    by = jnp.where(hit_top, half_w - r, by)
+    bvy = jnp.where(hit_bot, jnp.abs(bvy) * e_wall, bvy)
+    bvy = jnp.where(hit_top, -jnp.abs(bvy) * e_wall, bvy)
+
+    # --- x walls / goals (use post-y-clamp by for goal-y check) ---
+    in_goal_y = jnp.abs(by) <= half_goal
+    hit_left = bx - r < -half_l
+    hit_right = bx + r > half_l
+
+    left_goal = hit_left & in_goal_y    # yellow scores (-1)
+    right_goal = hit_right & in_goal_y  # blue scores (+1)
+
+    # Left side: clamp to back-of-net if goal, else to wall.
+    bx = jnp.where(
+        left_goal,
+        -half_l - goal_depth + r,
+        jnp.where(hit_left, -half_l + r, bx),
+    )
+    bvx = jnp.where(hit_left, jnp.abs(bvx) * e_wall, bvx)
+
+    # Right side: same treatment.
+    bx = jnp.where(
+        right_goal,
+        half_l + goal_depth - r,
+        jnp.where(hit_right, half_l - r, bx),
+    )
+    bvx = jnp.where(hit_right, -jnp.abs(bvx) * e_wall, bvx)
+
+    goal = jnp.where(
+        right_goal,
+        jnp.int32(1),
+        jnp.where(left_goal, jnp.int32(-1), jnp.int32(0)),
+    )
+
+    new_ball = jnp.stack([bx, by, bvx, bvy])
+    return state._replace(ball=new_ball), goal

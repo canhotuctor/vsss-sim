@@ -128,3 +128,54 @@ class TestRobotWallCollisions:
         s = s._replace(robots=s.robots.at[0, 0, 3].set(1.0))  # moving further out
         s = jb._robot_wall_collisions(s)
         assert float(s.robots[0, 0, 3]) == pytest.approx(0.0)
+
+
+class TestBallWallCollisions:
+    def test_bounce_top_wall(self):
+        s = jb.empty_state()
+        s = s._replace(ball=jnp.array(
+            [0.0, config.FIELD_WIDTH / 2.0 + config.BALL_RADIUS, 0.0, 1.0],
+            dtype=jnp.float32,
+        ))
+        s2, goal = jb._ball_wall_collisions(s)
+        assert int(goal) == 0
+        assert float(s2.ball[1]) <= config.FIELD_WIDTH / 2.0
+        assert float(s2.ball[3]) < 0
+
+    def test_bounce_bottom_wall(self):
+        s = jb.empty_state()
+        s = s._replace(ball=jnp.array(
+            [0.0, -(config.FIELD_WIDTH / 2.0 + config.BALL_RADIUS), 0.0, -1.0],
+            dtype=jnp.float32,
+        ))
+        s2, goal = jb._ball_wall_collisions(s)
+        assert int(goal) == 0
+        assert float(s2.ball[3]) > 0
+
+    def test_blue_scores_right_goal(self):
+        s = jb.empty_state()
+        s = s._replace(ball=jnp.array(
+            [config.FIELD_LENGTH / 2.0 + 0.01, 0.0, 0.1, 0.0],
+            dtype=jnp.float32,
+        ))
+        _, goal = jb._ball_wall_collisions(s)
+        assert int(goal) == 1
+
+    def test_yellow_scores_left_goal(self):
+        s = jb.empty_state()
+        s = s._replace(ball=jnp.array(
+            [-(config.FIELD_LENGTH / 2.0 + 0.01), 0.0, -0.1, 0.0],
+            dtype=jnp.float32,
+        ))
+        _, goal = jb._ball_wall_collisions(s)
+        assert int(goal) == -1
+
+    def test_no_goal_outside_posts(self):
+        s = jb.empty_state()
+        s = s._replace(ball=jnp.array(
+            [config.FIELD_LENGTH / 2.0 + 0.01, config.GOAL_WIDTH, 1.0, 0.0],
+            dtype=jnp.float32,
+        ))
+        s2, goal = jb._ball_wall_collisions(s)
+        assert int(goal) == 0
+        assert float(s2.ball[2]) < 0
