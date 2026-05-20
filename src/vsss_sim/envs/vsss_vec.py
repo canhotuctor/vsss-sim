@@ -71,6 +71,16 @@ def _build_obs_batched(state) -> jnp.ndarray:
     return jnp.concatenate([obs_ball, obs_robots], axis=-1).astype(jnp.float32)
 
 
+def _export_obs(state) -> np.ndarray:
+    """JAX → numpy obs at the wrapper boundary.
+
+    Forces a **writable** copy. ``np.asarray`` on a JAX-on-CPU array returns
+    a read-only view, which makes downstream ``torch.as_tensor`` warn about
+    undefined behaviour. The copy is cheap (~num_envs × 46 × 4 bytes).
+    """
+    return np.array(_build_obs_batched(state), dtype=np.float32, copy=True)
+
+
 # ---------------------------------------------------------------------------
 # VSSVecEnv
 # ---------------------------------------------------------------------------
@@ -192,13 +202,13 @@ class VSSVecEnv(VectorEnv):
             # Cancel any pending NEXT_STEP auto-reset for these envs — they
             # were just reset eagerly.
             self._needs_reset[mask] = False
-        return np.asarray(_build_obs_batched(self._state))
+        return _export_obs(self._state)
 
     def current_obs(self) -> np.ndarray:
         """Return the current batched observation without stepping."""
         if self._state is None:
             raise RuntimeError("call reset() before current_obs()")
-        return np.asarray(_build_obs_batched(self._state))
+        return _export_obs(self._state)
 
     def _opponent_actions(self, obs_np: np.ndarray) -> np.ndarray:
         """Build a (num_envs, N_ROBOTS, 2) opponent action array."""
@@ -234,7 +244,7 @@ class VSSVecEnv(VectorEnv):
         self._step_count[:] = 0
         self._needs_reset[:] = False
 
-        obs = np.asarray(_build_obs_batched(self._state))
+        obs = _export_obs(self._state)
         info: dict[str, Any] = {}
         return obs, info
 
@@ -279,7 +289,7 @@ class VSSVecEnv(VectorEnv):
         # Mark envs to auto-reset on the *next* step (NEXT_STEP autoreset semantics)
         self._needs_reset = truncations.copy()
 
-        obs = np.asarray(_build_obs_batched(self._state))
+        obs = _export_obs(self._state)
         info: dict[str, Any] = {"goal": goals}
         return obs, rewards, terminations, truncations, info
 
