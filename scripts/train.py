@@ -41,28 +41,46 @@ PARAMS = {
 }
 
 
-class _MLflowCallback(BaseCallback):
-    """Log per-episode reward/length to MLflow as each episode finishes."""
+class _EpisodeDumpCallback(BaseCallback):
+    """Log per-episode reward/length to MLflow and dump SB3's training table
+    once every ``dump_every_episodes`` finished episodes.
 
-    def __init__(self):
+    With ``num_envs > 1`` the natural default is ``dump_every_episodes = n_envs``
+    so each dump summarises one "batch" of parallel episodes. SB3's own
+    per-iteration auto-dump should be disabled (``PPO(..., verbose=0)``) to
+    avoid duplicate tables.
+    """
+
+    def __init__(self, dump_every_episodes: int = 1):
         super().__init__()
+        self._dump_every = max(1, int(dump_every_episodes))
         self._episode = 0
+        self._since_last_dump = 0
+        self._dumps = 0
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
-            if "episode" in info:
-                self._episode += 1
-                mlflow.log_metrics(
-                    {
-                        "ep_reward": info["episode"]["r"],
-                        "ep_length": info["episode"]["l"],
-                    },
-                    step=self._episode,
-                )
+            if "episode" not in info:
+                continue
+            self._episode += 1
+            self._since_last_dump += 1
+            ep = info["episode"]
+            mlflow.log_metrics(
+                {"ep_reward": ep["r"], "ep_length": ep["l"]},
+                step=self._episode,
+            )
+            self.logger.record("rollout/episode", self._episode)
+            self.logger.record("rollout/ep_reward_last", float(ep["r"]))
+            self.logger.record("rollout/ep_length_last", int(ep["l"]))
+
+            if self._since_last_dump >= self._dump_every:
+                self._dumps += 1
+                self.model.dump_logs(iteration=self._dumps)
+                self._since_last_dump = 0
         return True
 
 
-def main(seed: int, run_name: str) -> None:
+def main(seed: int, run_name: str, save_path: Path | None) -> None:
     mlflow.set_experiment("vsss-train")
 
     with mlflow.start_run(run_name=run_name):
@@ -99,18 +117,27 @@ def main(seed: int, run_name: str) -> None:
             gamma=PARAMS["gamma"],
             ent_coef=PARAMS["ent_coef"],
             seed=seed,
-            verbose=1,
+            verbose=1,  # keeps stdout logger configured; log_interval=None disables auto-dump
         )
 
         model.learn(
             total_timesteps=PARAMS["total_timesteps"],
-            callback=[_MLflowCallback(), eval_callback],
+            log_interval=None,  # callback drives dumps per-episode-batch
+            callback=[
+                _EpisodeDumpCallback(dump_every_episodes=PARAMS["n_envs"]),
+                eval_callback,
+            ],
         )
 
         with tempfile.TemporaryDirectory() as tmp:
             model_path = Path(tmp) / "policy.zip"
             model.save(str(model_path))
             mlflow.log_artifact(str(model_path), artifact_path="model")
+
+        if save_path is not None:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            model.save(str(save_path))
+            print(f"saved policy: {save_path}")
 
         env.close()
         eval_env.close()
@@ -122,5 +149,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VSSS training run")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-name", type=str, default="ppo-stationary")
+    parser.add_argument(
+        "--save-path",
+        type=Path,
+        default=None,
+        help="Also save policy.zip to this path on disk (parent dirs auto-created). "
+             "Independent of the MLflow artifact, which is always written.",
+    )
     args = parser.parse_args()
-    main(args.seed, args.run_name)
+    main(args.seed, args.run_name, args.save_path)
