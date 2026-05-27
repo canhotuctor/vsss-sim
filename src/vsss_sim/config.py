@@ -59,9 +59,9 @@ ROBOT_MAX_WHEEL_SPEED: float = ROBOT_MAX_MOTOR_SPEED * ROBOT_WHEEL_RADIUS  # ≈
 
 # Maximum wheel-speed change rate (m/s²). Wheel commands are slewed toward the
 # target each physics sub-step at this rate, modelling motor torque limits and
-# producing smoother (less jerky) trajectories. 2 g ≈ 19.62 m/s² is a typical
-# bound for VSSS-class robots; 0 → max takes ~66 ms (~4 control steps).
-ROBOT_WHEEL_ACCEL_LIMIT: float = 2.0 * 9.81  # m/s² (≈ 2 g)
+# producing smoother (less jerky) trajectories. 1 g ≈ 9.81 m/s² is a typical
+# bound for VSSS-class robots; 0 → max takes ~133 ms (~8 control steps).
+ROBOT_WHEEL_ACCEL_LIMIT: float = 1.0 * 9.81  # m/s² (≈ 1 g)
 
 # ---------------------------------------------------------------------------
 # Simulation
@@ -71,6 +71,14 @@ DT: float = 1.0 / FPS       # timestep (s)
 
 MAX_EPISODE_STEPS: int = 1200  # 20 s at 60 Hz
 KICKOFF_CLEAR_DIST: float = 0.20  # minimum robot distance from centre at kickoff
+
+# ---------------------------------------------------------------------------
+# Reward shaping
+# ---------------------------------------------------------------------------
+# Small dense reward per step proportional to the ball's forward displacement
+# (Δx for the blue team; blue attacks +x). Telescopes to coef * (x_end - x_start)
+# over an episode, so per-episode shaping is bounded by coef * FIELD_LENGTH.
+BALL_FORWARD_REWARD_COEF: float = 0.30
 
 # ---------------------------------------------------------------------------
 # Normalisation headroom factor for velocity observations (ensures values

@@ -106,6 +106,22 @@ class TestStep:
         assert np.all(trunc_history[2])
         e.close()
 
+    def test_ball_forward_shaping_reward(self):
+        """Ball-forward shaping: +x movement → positive reward; -x → negative."""
+        import jax.numpy as jnp
+        e = VSSVecEnv(num_envs=2, opponent_policy="stationary")
+        e.reset(seed=0)
+        # env 0: ball with vx > 0; env 1: ball with vx < 0.
+        new_ball = jnp.asarray(
+            [[0.0, 0.0, 0.5, 0.0], [0.0, 0.0, -0.5, 0.0]], dtype=jnp.float32
+        )
+        e._state = e._state._replace(ball=new_ball)
+        _, rewards, _, _, info = e.step(np.zeros((2, 6), dtype=np.float32))
+        assert np.all(info["goal"] == 0)
+        assert rewards[0] > 0.0
+        assert rewards[1] < 0.0
+        e.close()
+
 
 # ---------------------------------------------------------------------------
 # Opponent policies

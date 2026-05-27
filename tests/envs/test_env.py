@@ -111,11 +111,38 @@ class TestStep:
         _, reward, *_ = env.step(env.action_space.sample())
         assert isinstance(reward, float)
 
-    def test_step_reward_goal_values(self, env):
-        """Reward should be ±1.0 on goal or 0.0 otherwise."""
+    def test_step_reward_no_goal_in_shaping_band(self, env):
+        """With no goal, reward is the small ball-forward-progress shaping term,
+        bounded by coef * FIELD_LENGTH in magnitude."""
         env.reset(seed=0)
-        _, reward, *_ = env.step(np.zeros(config.N_ROBOTS * 2))
-        assert reward in (-1.0, 0.0, 1.0)
+        _, reward, _, _, info = env.step(np.zeros(config.N_ROBOTS * 2))
+        assert info["goal"] == 0
+        bound = config.BALL_FORWARD_REWARD_COEF * config.FIELD_LENGTH
+        assert abs(reward) <= bound + 1e-6
+
+    def test_step_reward_ball_forward_shaping(self):
+        """Moving the ball in +x (toward yellow goal) gives positive shaping;
+        -x gives negative shaping. No goal in either case."""
+        e = VSSEnv(render_mode=None)
+        e.reset(seed=0)
+        # Park ball mid-field with a clear +x velocity; one step → +Δx.
+        e._state.ball[0] = 0.0
+        e._state.ball[1] = 0.0
+        e._state.ball[2] = 0.5  # vx > 0
+        e._state.ball[3] = 0.0
+        _, reward_fwd, _, _, info_fwd = e.step(np.zeros(config.N_ROBOTS * 2))
+        assert info_fwd["goal"] == 0
+        assert reward_fwd > 0.0
+
+        e.reset(seed=0)
+        e._state.ball[0] = 0.0
+        e._state.ball[1] = 0.0
+        e._state.ball[2] = -0.5  # vx < 0
+        e._state.ball[3] = 0.0
+        _, reward_back, _, _, info_back = e.step(np.zeros(config.N_ROBOTS * 2))
+        assert info_back["goal"] == 0
+        assert reward_back < 0.0
+        e.close()
 
     def test_truncation_at_max_steps(self):
         e = VSSEnv(max_episode_steps=5)
@@ -152,7 +179,9 @@ class TestStep:
         obs, reward, terminated, truncated, info = e.step(
             np.zeros(config.N_ROBOTS * 2)
         )
-        assert reward == 1.0
+        # +1 goal reward plus a small shaping contribution from Δx in the step.
+        bound = config.BALL_FORWARD_REWARD_COEF * config.FIELD_LENGTH
+        assert 1.0 - bound - 1e-6 <= reward <= 1.0 + bound + 1e-6
         assert info["goal"] == 1
         e.close()
 

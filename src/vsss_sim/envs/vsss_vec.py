@@ -266,7 +266,9 @@ class VSSVecEnv(VectorEnv):
         all_actions_j = jnp.asarray(all_actions)
 
         # --- 3) One JIT'd vmap'd physics step ---
+        ball_x_pre = np.asarray(self._state.ball[:, 0], dtype=np.float32)
         self._state, info_phys = self._batched_step(self._state, all_actions_j)
+        ball_x_post = np.asarray(self._state.ball[:, 0], dtype=np.float32)
         goals = np.asarray(info_phys["goal"], dtype=np.int32)  # (B,)
 
         # --- 4) Score bookkeeping + in-episode kickoff on goal ---
@@ -282,7 +284,10 @@ class VSSVecEnv(VectorEnv):
 
         # --- 5) Step counter + truncation ---
         self._step_count += 1
-        rewards = goals.astype(np.float32)
+        rewards = (
+            goals.astype(np.float32)
+            + np.float32(config.BALL_FORWARD_REWARD_COEF) * (ball_x_post - ball_x_pre)
+        )
         terminations = np.zeros(self.num_envs, dtype=bool)
         truncations = self._step_count >= self.max_episode_steps
 

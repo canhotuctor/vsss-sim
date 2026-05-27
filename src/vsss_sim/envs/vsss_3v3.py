@@ -145,7 +145,9 @@ class VSSEnv(VSSBaseEnv):
         yellow_actions = self._opponent_policy(obs_current).reshape(config.N_ROBOTS, 2)
         all_actions = np.stack([blue_actions, yellow_actions], axis=0)
 
+        ball_x_pre = float(np.asarray(self._state.ball)[0])
         goal = self._step_physics(all_actions)
+        ball_x_post = float(np.asarray(self._state.ball)[0])
         self._step_count += 1
 
         if goal == 1:
@@ -153,8 +155,8 @@ class VSSEnv(VSSBaseEnv):
         elif goal == -1:
             self._bump_score(config.TEAM_YELLOW)
 
-        # Reward: simple sparse ±1 on goal, 0 otherwise
-        reward = float(goal)
+        # Reward: sparse ±1 on goal + small dense ball-forward-progress shaping
+        reward = float(goal) + config.BALL_FORWARD_REWARD_COEF * (ball_x_post - ball_x_pre)
 
         terminated = False  # VSSS has no terminal state mid-match
         truncated = self._step_count >= self.max_episode_steps
