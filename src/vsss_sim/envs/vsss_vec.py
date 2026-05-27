@@ -33,6 +33,7 @@ from gymnasium import spaces
 from gymnasium.vector import VectorEnv
 
 from .. import config
+from ..config import InitMode
 from .. import physics as _physics_pkg
 
 
@@ -99,6 +100,7 @@ class VSSVecEnv(VectorEnv):
         opponent_policy: str | Callable = "stationary",
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         backend: str = "jax",
+        init_mode: InitMode | str = InitMode.KICKOFF,
     ) -> None:
         super().__init__()
 
@@ -120,6 +122,7 @@ class VSSVecEnv(VectorEnv):
         self.max_episode_steps = max_episode_steps
         self._backend = _physics_pkg.get_backend(backend_lc)
         self._opponent_policy_spec: str | Callable = opponent_policy
+        self._init_mode = InitMode(init_mode)
 
         # Spaces
         obs_dim = 4 + config.N_TEAMS * config.N_ROBOTS * 7
@@ -137,7 +140,12 @@ class VSSVecEnv(VectorEnv):
         )
 
         # JIT-compiled batched primitives
-        self._batched_reset = jax.jit(jax.vmap(self._backend.reset_kickoff))
+        _reset_fn = (
+            self._backend.reset_kickoff
+            if self._init_mode == InitMode.KICKOFF
+            else self._backend.reset_random
+        )
+        self._batched_reset = jax.jit(jax.vmap(_reset_fn))
         self._batched_step = jax.jit(jax.vmap(self._backend.step))
 
         # Per-env Python-side bookkeeping (kept on host)

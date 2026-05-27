@@ -529,3 +529,50 @@ def reset_kickoff(
             dx = -state.robots[team, r, 0]
             dy = -state.robots[team, r, 1]
             state.robots[team, r, 2] = math.atan2(dy, dx)
+
+
+def reset_random(
+    state: SimState,
+    rng: Optional[np.random.Generator] = None,
+) -> None:
+    """Place robots and ball at uniformly random positions.
+
+    - Ball: random within the inner 80 % of the field.
+    - Blue robots: random in the left half (x < 0), random headings.
+    - Yellow robots: random in the right half (x > 0), random headings.
+    - A margin of one ROBOT_SIZE keeps robots away from walls and centre line.
+    - Velocities and wheel speeds zeroed; score preserved.
+
+    No overlap-rejection is performed — any initial interpenetration resolves
+    naturally during the first few physics sub-steps.
+    """
+    rng = _default_rng(rng)
+    state.ball[:] = 0.0
+    state.robots[:] = 0.0
+    state.wheel_speeds[:] = 0.0
+
+    half_l = config.FIELD_LENGTH / 2.0
+    half_w = config.FIELD_WIDTH / 2.0
+    margin = config.ROBOT_SIZE  # keep clear of walls and centre line
+
+    # Ball: random inside 80 % of the field, away from goals
+    state.ball[0] = rng.uniform(-(half_l - margin) * 0.8, (half_l - margin) * 0.8)
+    state.ball[1] = rng.uniform(-(half_w - margin) * 0.8, (half_w - margin) * 0.8)
+
+    # Blue: left half  (x in [-half_l+margin, -margin])
+    state.robots[config.TEAM_BLUE, :, 0] = rng.uniform(
+        -half_l + margin, -margin, size=config.N_ROBOTS
+    )
+    state.robots[config.TEAM_BLUE, :, 1] = rng.uniform(
+        -half_w + margin, half_w - margin, size=config.N_ROBOTS
+    )
+    state.robots[config.TEAM_BLUE, :, 2] = rng.uniform(-math.pi, math.pi, size=config.N_ROBOTS)
+
+    # Yellow: right half  (x in [margin, half_l-margin])
+    state.robots[config.TEAM_YELLOW, :, 0] = rng.uniform(
+        margin, half_l - margin, size=config.N_ROBOTS
+    )
+    state.robots[config.TEAM_YELLOW, :, 1] = rng.uniform(
+        -half_w + margin, half_w - margin, size=config.N_ROBOTS
+    )
+    state.robots[config.TEAM_YELLOW, :, 2] = rng.uniform(-math.pi, math.pi, size=config.N_ROBOTS)

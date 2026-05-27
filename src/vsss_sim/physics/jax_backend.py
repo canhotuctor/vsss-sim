@@ -135,6 +135,54 @@ def reset_kickoff(key: jnp.ndarray) -> SimState:
 
 
 # ---------------------------------------------------------------------------
+def reset_random(key: jnp.ndarray) -> SimState:
+    """Place robots and ball at uniformly random positions (functional, vmap-ready).
+
+    - Ball: random within the inner 80 % of the field.
+    - Blue robots: random in the left half (x < 0), random headings.
+    - Yellow robots: random in the right half (x > 0), random headings.
+    - A margin of one ROBOT_SIZE keeps robots away from walls and centre line.
+    - No overlap-rejection; any initial interpenetration resolves in the first
+      few physics sub-steps.
+    """
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
+    half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
+    margin = jnp.float32(config.ROBOT_SIZE)
+
+    key_ball, key_bx, key_by, key_bt, key_yx, key_yy, key_yt = jax.random.split(key, 7)
+
+    # Ball: inner 80 % of the field
+    ball_x = jax.random.uniform(key_ball, (), minval=-(half_l - margin) * 0.8, maxval=(half_l - margin) * 0.8)
+    ball_y = jax.random.uniform(key_ball, (), minval=-(half_w - margin) * 0.8, maxval=(half_w - margin) * 0.8)
+    ball = jnp.array([ball_x, ball_y, 0.0, 0.0], dtype=jnp.float32)
+
+    # Blue: left half  x ∈ [-half_l+margin, -margin]
+    blue_x = jax.random.uniform(key_bx, (config.N_ROBOTS,), minval=-half_l + margin, maxval=-margin)
+    blue_y = jax.random.uniform(key_by, (config.N_ROBOTS,), minval=-half_w + margin, maxval=half_w - margin)
+    blue_t = jax.random.uniform(key_bt, (config.N_ROBOTS,), minval=-jnp.pi, maxval=jnp.pi)
+
+    # Yellow: right half  x ∈ [margin, half_l-margin]
+    yellow_x = jax.random.uniform(key_yx, (config.N_ROBOTS,), minval=margin, maxval=half_l - margin)
+    yellow_y = jax.random.uniform(key_yy, (config.N_ROBOTS,), minval=-half_w + margin, maxval=half_w - margin)
+    yellow_t = jax.random.uniform(key_yt, (config.N_ROBOTS,), minval=-jnp.pi, maxval=jnp.pi)
+
+    robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 6), dtype=jnp.float32)
+    robots = robots.at[config.TEAM_BLUE, :, 0].set(blue_x)
+    robots = robots.at[config.TEAM_BLUE, :, 1].set(blue_y)
+    robots = robots.at[config.TEAM_BLUE, :, 2].set(blue_t)
+    robots = robots.at[config.TEAM_YELLOW, :, 0].set(yellow_x)
+    robots = robots.at[config.TEAM_YELLOW, :, 1].set(yellow_y)
+    robots = robots.at[config.TEAM_YELLOW, :, 2].set(yellow_t)
+
+    return SimState(
+        ball=ball,
+        robots=robots,
+        score=jnp.zeros(2, dtype=jnp.int32),
+        t=jnp.zeros((), dtype=jnp.float32),
+        wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
+    )
+
+
 # Robot–wall collisions (vectorised)
 # ---------------------------------------------------------------------------
 

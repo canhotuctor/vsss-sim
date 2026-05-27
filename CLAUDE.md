@@ -64,7 +64,7 @@ vsss-sim/
 └── requirements.txt
 ```
 
-Last known test state: 147/147 passing (numpy + jax backends + VSSVecEnv + SB3 adapter).
+Last known test state: 173/173 passing (numpy + jax backends + VSSVecEnv + SB3 adapter + random init).
 
 ## Environment setup
 
@@ -133,10 +133,24 @@ Or via `scripts/smoke.py --num-envs 256 --timesteps 50000`.
     - Rollout collection alone: **~60×** (from JAX batched physics).
     - Full PPO cycle (rollout + gradient update): **~4-8×** end-to-end — Amdahl: PyTorch CPU gradient updates become the new bottleneck (~25 s per 131k-sample rollout). The 60× rollout speedup applies to ~70% of the wall-clock, the rest is gradient. GPU (PR 4) and JAX-native RL (PR 5) are the paths to recover the remaining gap. `scripts/bench_backends.py --sb3` reports the cumulative fps; `n_steps=32` config gets close to the rollout ceiling.
 
+11. **CUDA support on Ubuntu RTX 3060** — JAX 0.6.2 + `jax[cuda12]`, driver 580. GPU verified: 909k env-steps/sec at batch=1024 (raw physics ceiling). `scripts/check_gpu.py` for diagnostics; `--device gpu|cpu` flag on `bench_backends.py`; conditional CUDA test suite in `tests/physics/test_cuda.py`.
+
+12. **`InitMode` — pluggable placement strategy** (`src/vsss_sim/config.py::InitMode`): `KICKOFF` (standard formation + jitter, default) and `RANDOM` (uniform random positions in each team's half, random headings, ball random in inner 80% of field). Both backends implement `reset_random`; the JAX version is `vmap`-ready. `VSSEnv` and `VSSVecEnv` accept `init_mode=` kwarg (string or enum). Infrastructure is designed for a future `SELECTOR` mode (learned/heuristic placement model).
+
+    ```python
+    # Random init — single env
+    env = gym.make("VSSS-v0", init_mode="random")
+
+    # Random init — batched
+    envs = VSSVecEnv(num_envs=256, init_mode="random")
+    ```
+
 ## Open threads / next directions
 
-- **CUDA on Ubuntu RTX 3060** — `pip install -U "jax[cuda12]"`, then verify `VSSVecEnv` runs on the GPU. Code is already ready; mostly setup/verification work. Expected boost: 1M+ env-steps/sec at batch=256 for raw physics; SB3 ceiling depends on policy size.
-- **JAX-native RL libraries** — `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only). These would skip the Gymnasium + SB3 boundary entirely and recover the gap between VSSVecEnv (~111k fps batch=256 on Mac CPU) and raw vmap ceiling (~303k fps). Biggest win on GPU.
+- **CUDA on Ubuntu RTX 3060** ✓ — verified 2026-05-27; 909k fps at batch=1024.
+- **JAX-native RL libraries** — `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only). These would skip the Gymnasium + SB3 boundary entirely and recover the gap between VSSVecEnv (~92k fps batch=1024 on GPU) and raw vmap ceiling (~909k fps). Biggest win on GPU.
+- **Simulator efficiency optimizations (PR 6, optional)** — profile and reduce the VSSVecEnv↔numpy boundary overhead. Candidates: batch obs construction in JAX before copy, fused autoreset, fewer Python calls per step.
+- **Selector init mode** — learned/heuristic model that outputs robot placement distributions; extend `InitMode` and wire a callable into `_batched_reset`.
 - **Pymunk backend** mentioned as a possible alternative once user evaluates it. Isaac Gym / PhysX explicitly deferred.
 - Adversarial opponents are stationary today — could be upgraded once training is stable.
 
