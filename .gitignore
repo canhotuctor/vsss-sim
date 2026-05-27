@@ -33,3 +33,4 @@ mlflow.db
 
 # macOS
 .DS_Store
+mlruns/
