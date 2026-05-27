@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 
+import jax
 import mlflow
 import vsss_sim  # noqa: F401 – registers "VSSS-v0"
 from stable_baselines3 import PPO
@@ -95,6 +96,7 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
 
 def main(seed: int, render: bool, fps: float | None, timesteps: int,
          backend: str | None, num_envs: int) -> None:
+    print(f"JAX devices: {jax.devices()}   default backend: {jax.default_backend()}")
     mlflow.set_experiment("vsss-smoke")
 
     with mlflow.start_run(run_name=f"smoke-seed{seed}-n{num_envs}"):
