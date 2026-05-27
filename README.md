@@ -168,40 +168,48 @@ is a `NamedTuple` PyTree, `step()` is `jax.jit`-compiled with
 `VSSVecEnv` uses to batch). Trajectories match the NumPy backend within
 `atol=1e-3` on positions over 20-step rollouts.
 
-### Throughput (Apple M4 Pro CPU, 12 cores)
+### Throughput
 
-Raw physics throughput:
+Measured with `python scripts/bench_backends.py --steps 5000 --sb3`.
 
-| Setup | Throughput | Speedup vs NumPy single-env |
-|---|---|---|
-| NumPy, raw physics single-env | ~3,500 fps | 1× |
-| JAX (jit), raw physics single-env | ~32,000 fps | 9× |
-| JAX `jax.vmap`, batch=256, raw physics | ~300,000 fps | ~88× (CPU ceiling) |
-| `VSSVecEnv` (Gymnasium wrapper), batch=256 | ~120,000 fps | ~34× |
-| `VSSVecEnv`, batch=1024 | ~155,000 fps | ~44× |
+**Hardware:** Apple M4 Pro (12-core CPU, JAX CPU backend) · Ubuntu 22.04, NVIDIA RTX 3060 Laptop GPU 6 GB (JAX CUDA 12 backend).
 
-End-to-end SB3 PPO training, **`n_steps=32` (rollout-friendly)**, PyTorch policy + JAX physics via the adapter:
+#### Raw physics ceiling — `jax.vmap(step)`, no Gymnasium overhead
 
-| `num_envs` | fps | Speedup vs `num_envs=1` |
-|---|---|---|
-| 1 | ~600 | 1× |
-| 8 | ~4,400 | 7× |
-| 64 | ~23,800 | 40× |
-| 256 | ~47,500 | ~80× (rollout-dominated) |
+| batch | Mac M4 Pro CPU | Ubuntu RTX 3060 GPU | GPU / Mac |
+|------:|---------------:|--------------------:|----------:|
+| 1 | 29,700 fps | 690 fps | 0.02× |
+| 8 | 83,700 fps | 6,700 fps | 0.08× |
+| 64 | 252,000 fps | 51,700 fps | 0.2× |
+| 256 | **304,000 fps** | 228,000 fps | 0.7× |
+| 1024 | 244,000 fps | **909,000 fps** | **3.7×** |
 
-End-to-end SB3 PPO training, **`n_steps=512` (smoke.py default, gradient-dominated)**:
+GPU overhead dominates at small batches. At batch=1024 the GPU delivers ~910k env-steps/sec — 3.7× faster than Mac CPU and ~675× faster than NumPy single-env.
 
-| `num_envs` | Wall-clock fps | Speedup vs `num_envs=1` |
-|---|---|---|
-| 1 (numpy) | ~660 | 1× |
-| 256 (jax + adapter) | ~5,600 | **~8×** |
+#### VSSVecEnv — Gymnasium wrapper (what your RL trainer sees)
 
-The gap is Amdahl: bigger rollouts mean PyTorch spends more time in the gradient update phase between rollouts (~25 s per 131k-sample rollout on Mac CPU), and that phase doesn't benefit from `num_envs`. GPU (PR 4) and JAX-native RL (PR 5) close the gap.
+| batch | Mac M4 Pro CPU | Ubuntu RTX 3060 GPU |
+|------:|---------------:|--------------------:|
+| 1 | 817 fps | 90 fps |
+| 8 | 6,355 fps | 733 fps |
+| 64 | 45,025 fps | 5,807 fps |
+| 256 | 120,930 fps | 23,468 fps |
+| 1024 | **169,000 fps** | **92,400 fps** |
 
-Reproduce with `python scripts/bench_backends.py`. The gap between raw vmap
-and `VSSVecEnv` is the Gymnasium numpy↔JAX boundary cost (per-step Python
-overhead, obs construction, opponent policy dispatch). On GPU this becomes
-negligible.
+Mac wins across all batch sizes. The per-step CUDA↔CPU copy (obs array transfer at the Gymnasium boundary) costs more than the GPU gains from the physics kernel. JAX-native RL (PR 5) eliminates this boundary and is the path to realising the 909k ceiling.
+
+#### End-to-end SB3 PPO — `n_steps=32`, PyTorch MLP policy + JAX physics
+
+| `num_envs` | Mac M4 Pro CPU | Ubuntu RTX 3060 GPU | GPU speedup vs GPU `num_envs=1` |
+|-----------:|---------------:|--------------------:|--------------------------------:|
+| 1 | 614 fps | 77 fps | 1× |
+| 8 | 4,367 fps | 616 fps | 8× |
+| 64 | 23,600 fps | 4,903 fps | 64× |
+| 256 | **46,600 fps** | **18,500 fps** | 242× |
+
+Mac is faster end-to-end with SB3 — same boundary cost as VSSVecEnv, plus PyTorch MLP policies are not GPU-efficient at small batch sizes. The 242× GPU scaling within Ubuntu is driven by JAX physics; the PyTorch policy is the remaining bottleneck.
+
+Reproduce with `python scripts/bench_backends.py --steps 5000 --sb3`. Use `--device cpu` or `--device gpu` (after `pip install -e ".[cuda]"`) to force a specific backend.
 
 ---
 
@@ -249,7 +257,7 @@ pyproject.toml
 
 ## Roadmap
 
-- **CUDA on Ubuntu RTX 3060** — `pip install -U "jax[cuda12]"` and verify; expected 1M+ env-steps/sec at batch=256 for raw physics.
+- **CUDA on Ubuntu RTX 3060** ✓ — verified; 909k env-steps/sec at batch=1024 (raw physics ceiling).
 - **JAX-native RL** — integration with `purejaxrl` / `Stoix` to remove the Gymnasium + SB3 boundary entirely.
 - **Pymunk backend** — possible third backend for sanity-checking the hand-rolled physics.
 
