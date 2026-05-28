@@ -538,7 +538,7 @@ def reset_random(
     """Place robots and ball at uniformly random positions anywhere on the field.
 
     All robots (both teams) sample from the full field; no half-restriction.
-    - Ball: random within the inner 80 % of the field.
+    - Ball: random anywhere within field bounds (margin from walls).
     - All robots: random x/y within field bounds (margin from walls), random headings.
     - Velocities and wheel speeds zeroed; score preserved.
 
@@ -554,9 +554,9 @@ def reset_random(
     half_w = config.FIELD_WIDTH / 2.0
     margin = config.ROBOT_SIZE
 
-    # Ball: random inside 80 % of the field
-    state.ball[0] = rng.uniform(-(half_l - margin) * 0.8, (half_l - margin) * 0.8)
-    state.ball[1] = rng.uniform(-(half_w - margin) * 0.8, (half_w - margin) * 0.8)
+    # Ball: full field (same margin from walls as robots)
+    state.ball[0] = rng.uniform(-half_l + margin, half_l - margin)
+    state.ball[1] = rng.uniform(-half_w + margin, half_w - margin)
 
     # All robots: full field
     state.robots[:, :, 0] = rng.uniform(-half_l + margin, half_l - margin, size=(config.N_TEAMS, config.N_ROBOTS))
