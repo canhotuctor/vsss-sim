@@ -47,21 +47,25 @@ PARAMS = {
 
 
 class _EpisodeDumpCallback(BaseCallback):
-    """Log per-episode reward/length to MLflow and dump SB3's training table
-    once every ``dump_every_episodes`` finished episodes.
+    """Log episode metrics to MLflow and dump SB3's training table.
 
-    With ``num_envs > 1`` the natural default is ``dump_every_episodes = n_envs``
-    so each dump summarises one "batch" of parallel episodes. SB3's own
-    per-iteration auto-dump should be disabled (``PPO(..., verbose=0)``) to
-    avoid duplicate tables.
+    Single-env mode (dump_every_episodes=1): logs each episode individually.
+
+    Batched mode (dump_every_episodes=num_envs): accumulates all episodes that
+    finish within a batch, then logs mean reward, last-batch reward mean, mean
+    length, and max length for that batch.
     """
 
     def __init__(self, dump_every_episodes: int = 1):
         super().__init__()
         self._dump_every = max(1, int(dump_every_episodes))
+        self._batched = dump_every_episodes > 1
         self._episode = 0
         self._since_last_dump = 0
         self._dumps = 0
+        # Accumulators for the current batch (batched mode only)
+        self._batch_rewards: list[float] = []
+        self._batch_lengths: list[int] = []
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
@@ -70,18 +74,52 @@ class _EpisodeDumpCallback(BaseCallback):
             self._episode += 1
             self._since_last_dump += 1
             ep = info["episode"]
-            mlflow.log_metrics(
-                {"ep_reward": ep["r"], "ep_length": ep["l"]},
-                step=self._episode,
-            )
-            self.logger.record("rollout/episode", self._episode)
-            self.logger.record("rollout/ep_reward_last", float(ep["r"]))
-            self.logger.record("rollout/ep_length_last", int(ep["l"]))
 
-            if self._since_last_dump >= self._dump_every:
-                self._dumps += 1
-                self.model.dump_logs(iteration=self._dumps)
-                self._since_last_dump = 0
+            if self._batched:
+                self._batch_rewards.append(float(ep["r"]))
+                self._batch_lengths.append(int(ep["l"]))
+
+                if self._since_last_dump >= self._dump_every:
+                    rewards = self._batch_rewards
+                    lengths = self._batch_lengths
+                    mean_r = sum(rewards) / len(rewards)
+                    last_r = rewards[-1]
+                    mean_l = sum(lengths) / len(lengths)
+                    max_l = max(lengths)
+
+                    mlflow.log_metrics(
+                        {
+                            "ep_reward_mean": mean_r,
+                            "ep_reward_last_batch": last_r,
+                            "ep_length_mean": mean_l,
+                            "ep_length_max": max_l,
+                        },
+                        step=self._episode,
+                    )
+                    self.logger.record("rollout/episode", self._episode)
+                    self.logger.record("rollout/ep_reward_mean", mean_r)
+                    self.logger.record("rollout/ep_reward_last_batch", last_r)
+                    self.logger.record("rollout/ep_length_mean", mean_l)
+                    self.logger.record("rollout/ep_length_max", max_l)
+
+                    self._dumps += 1
+                    self.model.dump_logs(iteration=self._dumps)
+                    self._since_last_dump = 0
+                    self._batch_rewards = []
+                    self._batch_lengths = []
+            else:
+                mlflow.log_metrics(
+                    {"ep_reward": float(ep["r"]), "ep_length": int(ep["l"])},
+                    step=self._episode,
+                )
+                self.logger.record("rollout/episode", self._episode)
+                self.logger.record("rollout/ep_reward_last", float(ep["r"]))
+                self.logger.record("rollout/ep_length_last", int(ep["l"]))
+
+                if self._since_last_dump >= self._dump_every:
+                    self._dumps += 1
+                    self.model.dump_logs(iteration=self._dumps)
+                    self._since_last_dump = 0
         return True
 
 
