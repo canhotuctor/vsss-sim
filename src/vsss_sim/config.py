@@ -11,6 +11,19 @@ References
 
 from __future__ import annotations
 
+from enum import Enum
+
+
+class InitMode(str, Enum):
+    """Robot and ball placement strategy used at episode/kickoff reset.
+
+    KICKOFF : standard formation with small jitter (default).
+    RANDOM  : uniformly random positions in each team's half; random headings.
+              Future: SELECTOR — a learned/heuristic model outputs placements.
+    """
+    KICKOFF = "kickoff"
+    RANDOM = "random"
+
 # ---------------------------------------------------------------------------
 # Field (all dimensions in metres)
 # ---------------------------------------------------------------------------

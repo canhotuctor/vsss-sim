@@ -23,6 +23,7 @@ import numpy as np
 import vsss_sim  # noqa: F401 — registers "VSSS-v0"
 from stable_baselines3 import PPO
 from vsss_sim import config
+from vsss_sim.config import InitMode
 
 
 def main(
@@ -34,6 +35,7 @@ def main(
     seed: int,
     deterministic: bool,
     max_episode_steps: int | None,
+    init_mode: str | None,
 ) -> None:
     if not model_path.exists():
         raise FileNotFoundError(f"model artifact not found: {model_path}")
@@ -50,11 +52,14 @@ def main(
         env_kwargs["backend"] = backend
     if max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = max_episode_steps
+    if init_mode is not None:
+        env_kwargs["init_mode"] = init_mode
 
     env = gym.make("VSSS-v0", **env_kwargs)
     print(
         f"running {episodes} episode(s) — opponent={opponent}, "
-        f"backend={backend or 'default'}, deterministic={deterministic}"
+        f"backend={backend or 'default'}, init={init_mode or 'kickoff'}, "
+        f"deterministic={deterministic}"
     )
 
     try:
@@ -144,6 +149,15 @@ if __name__ == "__main__":
              f"Defaults to config.MAX_EPISODE_STEPS ({config.MAX_EPISODE_STEPS} = "
              f"{config.MAX_EPISODE_STEPS / config.FPS:.0f} s).",
     )
+    parser.add_argument(
+        "--init-mode",
+        type=str,
+        default=None,
+        choices=[m.value for m in InitMode],
+        help="Robot/ball placement strategy at episode reset. "
+             "'kickoff' (default) uses the standard formation; "
+             "'random' places robots uniformly in their respective halves.",
+    )
     args = parser.parse_args()
 
     fps = None if args.fps == 0 else args.fps
@@ -156,4 +170,5 @@ if __name__ == "__main__":
         seed=args.seed,
         deterministic=not args.stochastic,
         max_episode_steps=args.max_episode_steps,
+        init_mode=args.init_mode,
     )

@@ -135,6 +135,45 @@ def reset_kickoff(key: jnp.ndarray) -> SimState:
 
 
 # ---------------------------------------------------------------------------
+def reset_random(key: jnp.ndarray) -> SimState:
+    """Place robots and ball at uniformly random positions anywhere on the field.
+
+    All robots (both teams) sample from the full field; no half-restriction.
+    - Ball: random within the inner 80 % of the field.
+    - All robots: random x/y within field bounds (margin from walls), random headings.
+    - No overlap-rejection; any initial interpenetration resolves in the first
+      few physics sub-steps.
+    """
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
+    half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
+    margin = jnp.float32(config.ROBOT_SIZE)
+
+    key_ball, key_x, key_y, key_t = jax.random.split(key, 4)
+
+    # Ball: inner 80 % of the field
+    ball_x = jax.random.uniform(key_ball, (), minval=-(half_l - margin) * 0.8, maxval=(half_l - margin) * 0.8)
+    ball_y = jax.random.uniform(key_ball, (), minval=-(half_w - margin) * 0.8, maxval=(half_w - margin) * 0.8)
+    ball = jnp.array([ball_x, ball_y, 0.0, 0.0], dtype=jnp.float32)
+
+    # All robots: full field
+    all_x = jax.random.uniform(key_x, (config.N_TEAMS, config.N_ROBOTS), minval=-half_l + margin, maxval=half_l - margin)
+    all_y = jax.random.uniform(key_y, (config.N_TEAMS, config.N_ROBOTS), minval=-half_w + margin, maxval=half_w - margin)
+    all_t = jax.random.uniform(key_t, (config.N_TEAMS, config.N_ROBOTS), minval=-jnp.pi, maxval=jnp.pi)
+
+    robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 6), dtype=jnp.float32)
+    robots = robots.at[:, :, 0].set(all_x)
+    robots = robots.at[:, :, 1].set(all_y)
+    robots = robots.at[:, :, 2].set(all_t)
+
+    return SimState(
+        ball=ball,
+        robots=robots,
+        score=jnp.zeros(2, dtype=jnp.int32),
+        t=jnp.zeros((), dtype=jnp.float32),
+        wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
+    )
+
+
 # Robot–wall collisions (vectorised)
 # ---------------------------------------------------------------------------
 

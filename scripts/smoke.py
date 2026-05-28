@@ -33,6 +33,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 
+from vsss_sim.config import InitMode
 from vsss_sim.envs import VSSVecEnv
 from vsss_sim.sb3_adapter import VSSVecEnvToSB3
 
@@ -86,7 +87,8 @@ class _EpisodeDumpCallback(BaseCallback):
 
 def _build_env(num_envs: int, seed: int, backend: str | None,
                render: bool, fps: float | None,
-               max_episode_steps: int | None):
+               max_episode_steps: int | None,
+               init_mode: str | None = None):
     """Pick the right env based on `num_envs`."""
     if num_envs > 1:
         if render:
@@ -98,6 +100,8 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
         kwargs = {"num_envs": num_envs, "opponent_policy": PARAMS["opponent"]}
         if max_episode_steps is not None:
             kwargs["max_episode_steps"] = max_episode_steps
+        if init_mode is not None:
+            kwargs["init_mode"] = init_mode
         return VSSVecEnvToSB3(VSSVecEnv(**kwargs))
 
     # Single-env path
@@ -109,6 +113,8 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
         env_kwargs["render_fps"] = fps
     if max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = max_episode_steps
+    if init_mode is not None:
+        env_kwargs["init_mode"] = init_mode
     return make_vec_env(
         "VSSS-v0",
         n_envs=1,
@@ -120,7 +126,8 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
 def main(seed: int, render: bool, fps: float | None, timesteps: int,
          backend: str | None, num_envs: int,
          save_path: Path | None,
-         max_episode_steps: int | None) -> None:
+         max_episode_steps: int | None,
+         init_mode: str | None) -> None:
     print(f"JAX devices: {jax.devices()}   default backend: {jax.default_backend()}")
     mlflow.set_experiment("vsss-smoke")
 
@@ -129,9 +136,10 @@ def main(seed: int, render: bool, fps: float | None, timesteps: int,
             **PARAMS, "seed": seed, "total_timesteps": timesteps,
             "backend": backend or "default", "n_envs": num_envs,
             "max_episode_steps": max_episode_steps or "default",
+            "init_mode": init_mode or "kickoff",
         })
 
-        env = _build_env(num_envs, seed, backend, render, fps, max_episode_steps)
+        env = _build_env(num_envs, seed, backend, render, fps, max_episode_steps, init_mode)
 
         model = PPO(
             PARAMS["policy"],
@@ -192,6 +200,15 @@ if __name__ == "__main__":
         help="Episode length cap in steps (e.g. 300 = 5 s at 60 Hz). "
              f"Defaults to config.MAX_EPISODE_STEPS (currently 1200 = 20 s).",
     )
+    parser.add_argument(
+        "--init-mode",
+        type=str,
+        default=None,
+        choices=[m.value for m in InitMode],
+        help="Robot/ball placement strategy at episode reset. "
+             "'kickoff' (default) uses the standard formation; "
+             "'random' places robots uniformly in their respective halves.",
+    )
     args = parser.parse_args()
     main(args.seed, args.render, args.fps, args.timesteps, args.backend, args.num_envs,
-         args.save_path, args.max_episode_steps)
+         args.save_path, args.max_episode_steps, args.init_mode)

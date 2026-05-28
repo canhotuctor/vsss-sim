@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional, SupportsFloat
 import numpy as np
 
 from .. import config
+from ..config import InitMode
 from ..agents import random_policy, stationary_policy
 from .base import VSSBaseEnv
 
@@ -44,6 +45,12 @@ class VSSEnv(VSSBaseEnv):
         Episode length in simulation steps (default: ``config.MAX_EPISODE_STEPS``).
     backend : ``"numpy"`` | ``"jax"`` | ``None``
         Physics backend. ``None`` defers to ``VSSS_PHYSICS_BACKEND``, then ``"numpy"``.
+    init_mode : ``InitMode`` | ``"kickoff"`` | ``"random"``
+        Placement strategy used at every episode reset and in-episode kickoff.
+        ``"kickoff"`` (default) uses the standard formation with small jitter.
+        ``"random"`` places robots uniformly in their respective halves with
+        random headings. Future modes (e.g. a learned selector) can be added
+        by extending :class:`~vsss_sim.config.InitMode`.
     """
 
     def __init__(
@@ -53,6 +60,7 @@ class VSSEnv(VSSBaseEnv):
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         render_fps: Optional[float] = None,
         backend: Optional[str] = None,
+        init_mode: InitMode | str = InitMode.KICKOFF,
     ) -> None:
         super().__init__(
             render_mode=render_mode,
@@ -60,6 +68,8 @@ class VSSEnv(VSSBaseEnv):
             render_fps=render_fps,
             backend=backend,
         )
+
+        self._init_mode = InitMode(init_mode)
 
         if callable(opponent_policy):
             self._opponent_policy: Callable = opponent_policy
@@ -81,14 +91,17 @@ class VSSEnv(VSSBaseEnv):
         return self._backend_name == "jax_backend"
 
     def _reset_state(self) -> None:
-        """Replace ``self._state`` with a kickoff configuration."""
+        """Replace ``self._state`` using the configured init_mode."""
+        reset_fn_name = (
+            "reset_kickoff" if self._init_mode == InitMode.KICKOFF else "reset_random"
+        )
         if self._is_jax():
             import jax
             key = jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
-            self._state = self._backend.reset_kickoff(key)
+            self._state = getattr(self._backend, reset_fn_name)(key)
         else:
             self._state = self._backend.SimState()
-            self._backend.reset_kickoff(self._state, rng=self._rng)
+            getattr(self._backend, reset_fn_name)(self._state, rng=self._rng)
 
     def _step_physics(self, all_actions: np.ndarray) -> int:
         """Advance the physics by one control step. Returns the goal event."""
