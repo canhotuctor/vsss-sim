@@ -91,7 +91,7 @@ KICKOFF_CLEAR_DIST: float = 0.20  # minimum robot distance from centre at kickof
 # Small dense reward per step proportional to the ball's forward displacement
 # (Δx for the blue team; blue attacks +x). Telescopes to coef * (x_end - x_start)
 # over an episode, so per-episode shaping is bounded by coef * FIELD_LENGTH.
-BALL_FORWARD_REWARD_COEF: float = 0.30
+BALL_FORWARD_REWARD_COEF: float = 0.10
 
 # ---------------------------------------------------------------------------
 # Normalisation headroom factor for velocity observations (ensures values
