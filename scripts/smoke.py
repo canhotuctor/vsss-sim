@@ -82,7 +82,7 @@ class _EpisodeDumpCallback(BaseCallback):
 
         if rewards:
             mean_r = sum(rewards) / len(rewards)
-            last_r = rewards[-1]
+            last_r = min(rewards)
             mean_l = sum(lengths) / len(lengths)
             max_l = max(lengths)
 
@@ -90,7 +90,7 @@ class _EpisodeDumpCallback(BaseCallback):
                 {
                     "generation": self._iteration,
                     "ep_reward/mean": mean_r,
-                    "ep_reward/last": last_r,
+                    "ep_reward/min": last_r,
                     "ep_length/mean": mean_l,
                     "ep_length/max": max_l,
                     "episodes": self._episode,
@@ -101,7 +101,7 @@ class _EpisodeDumpCallback(BaseCallback):
             self.logger.record("rollout/iteration", self._iteration)
             self.logger.record("rollout/episode", self._episode)
             self.logger.record("rollout/ep_reward_mean", mean_r)
-            self.logger.record("rollout/ep_reward_last", last_r)
+            self.logger.record("rollout/ep_reward_min", last_r)
             self.logger.record("rollout/ep_length_mean", mean_l)
             self.logger.record("rollout/ep_length_max", max_l)
             self.model.dump_logs(iteration=self._iteration)
