@@ -93,6 +93,7 @@ class _EpisodeDumpCallback(BaseCallback):
 
             mlflow.log_metrics(
                 {
+                    "generation": self._iteration,
                     "ep_reward/mean": mean_r,
                     "ep_reward/last": last_r,
                     "ep_length/mean": mean_l,
