@@ -24,8 +24,6 @@ Requires
 from __future__ import annotations
 
 import argparse
-import copy
-import threading
 from pathlib import Path
 
 import jax
@@ -55,9 +53,7 @@ class _EpisodeDumpCallback(BaseCallback):
     flushes mean reward, last-episode reward, mean length, and max length to
     MLflow and SB3's logger in _on_rollout_end — one data point per iteration.
 
-    When ``save_every_gen=True``, snapshots the policy via deepcopy after each
-    generation and serializes it to ``save_path`` in a background thread so the
-    main training loop is not blocked by disk I/O.
+    When ``save_every_gen=True``, saves the policy to ``save_path`` after each generation.
     """
 
     def __init__(self, save_path: Path | None = None, save_every_gen: bool = False):
@@ -68,7 +64,6 @@ class _EpisodeDumpCallback(BaseCallback):
         self._rollout_lengths: list[int] = []
         self._save_path = save_path
         self._save_every_gen = save_every_gen and save_path is not None
-        self._save_thread: threading.Thread | None = None
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
@@ -115,22 +110,7 @@ class _EpisodeDumpCallback(BaseCallback):
         self._rollout_lengths = []
 
         if self._save_every_gen:
-            # Block only if the previous save is still writing (shouldn't happen
-            # in practice — disk I/O finishes well before the next generation ends).
-            if self._save_thread is not None and self._save_thread.is_alive():
-                self._save_thread.join()
-            # deepcopy snapshots all tensors independently before handing off,
-            # so the gradient update that follows cannot race with serialization.
-            snapshot = copy.deepcopy(self.model)
-            path = str(self._save_path)
-            self._save_thread = threading.Thread(
-                target=snapshot.save, args=(path,), daemon=True
-            )
-            self._save_thread.start()
-
-    def _on_training_end(self) -> None:
-        if self._save_thread is not None:
-            self._save_thread.join()
+            self.model.save(str(self._save_path))
 
 
 def _build_env(num_envs: int, seed: int, backend: str | None,
