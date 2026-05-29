@@ -67,8 +67,13 @@ class TestNumpyResetRandom:
     def test_ball_within_field(self):
         for seed in range(10):
             s = self._reset(seed)
-            assert abs(s.ball[0]) < _HALF_L
-            assert abs(s.ball[1]) < _HALF_W
+            assert abs(s.ball[0]) <= _HALF_L - _MARGIN
+            assert abs(s.ball[1]) <= _HALF_W - _MARGIN
+
+    def test_ball_x_y_uncorrelated(self):
+        # With the key bug fixed, x and y should not be equal across seeds
+        balls = np.array([self._reset(s).ball[:2] for s in range(20)])
+        assert not np.allclose(balls[:, 0], balls[:, 1])
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +134,14 @@ class TestJaxResetRandom:
     def test_ball_within_field(self):
         for seed in range(10):
             s = self._reset(seed)
-            assert float(jnp.abs(s.ball[0])) < _HALF_L
-            assert float(jnp.abs(s.ball[1])) < _HALF_W
+            assert float(jnp.abs(s.ball[0])) <= _HALF_L - _MARGIN
+            assert float(jnp.abs(s.ball[1])) <= _HALF_W - _MARGIN
+
+    def test_ball_x_y_uncorrelated(self):
+        # With the key bug fixed, x and y must not be equal across seeds
+        keys = jax.random.split(jax.random.PRNGKey(0), 20)
+        balls = jnp.stack([jb.reset_random(k).ball[:2] for k in keys])
+        assert not jnp.allclose(balls[:, 0], balls[:, 1])
 
 
 # ---------------------------------------------------------------------------

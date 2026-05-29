@@ -139,7 +139,7 @@ def reset_random(key: jnp.ndarray) -> SimState:
     """Place robots and ball at uniformly random positions anywhere on the field.
 
     All robots (both teams) sample from the full field; no half-restriction.
-    - Ball: random within the inner 80 % of the field.
+    - Ball: random anywhere within field bounds (margin from walls).
     - All robots: random x/y within field bounds (margin from walls), random headings.
     - No overlap-rejection; any initial interpenetration resolves in the first
       few physics sub-steps.
@@ -148,11 +148,11 @@ def reset_random(key: jnp.ndarray) -> SimState:
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     margin = jnp.float32(config.ROBOT_SIZE)
 
-    key_ball, key_x, key_y, key_t = jax.random.split(key, 4)
+    key_bx, key_by, key_x, key_y, key_t = jax.random.split(key, 5)
 
-    # Ball: inner 80 % of the field
-    ball_x = jax.random.uniform(key_ball, (), minval=-(half_l - margin) * 0.8, maxval=(half_l - margin) * 0.8)
-    ball_y = jax.random.uniform(key_ball, (), minval=-(half_w - margin) * 0.8, maxval=(half_w - margin) * 0.8)
+    # Ball: full field (same margin from walls as robots)
+    ball_x = jax.random.uniform(key_bx, (), minval=-half_l + margin, maxval=half_l - margin)
+    ball_y = jax.random.uniform(key_by, (), minval=-half_w + margin, maxval=half_w - margin)
     ball = jnp.array([ball_x, ball_y, 0.0, 0.0], dtype=jnp.float32)
 
     # All robots: full field
@@ -372,18 +372,47 @@ def _resolve_ball_robot_pair(
 
 
 def _ball_robot_collisions(state: SimState) -> SimState:
-    """Resolve elastic collisions between the ball and the 6 robots (sequential)."""
+    """Resolve elastic collisions between the ball and all 6 robots in parallel.
+
+    All penetrations are computed simultaneously via vmap, then corrections are
+    summed. Slightly less accurate than sequential resolution but equivalent
+    throughput-wise on GPU and correct enough for RL over 4 sub-steps.
+    """
     robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
+    m_b = jnp.float32(config.BALL_MASS)
+    m_r = jnp.float32(config.ROBOT_MASS)
+    e = jnp.float32(config.BALL_ROBOT_RESTITUTION)
+    total_m = m_b + m_r
 
-    def body(i, carry):
-        ball, robots_flat = carry
-        new_ball, new_robot = _resolve_ball_robot_pair(ball, robots_flat[i])
-        robots_flat = robots_flat.at[i].set(new_robot)
-        return new_ball, robots_flat
+    normals, penetrations = jax.vmap(_ball_obb_penetration, in_axes=(None, 0, 0))(
+        state.ball[0:2], robots_flat[:, 0:2], robots_flat[:, 2]
+    )  # normals: (6, 2), penetrations: (6,)
 
-    new_ball, new_robots_flat = jax.lax.fori_loop(
-        0, _N_ROBOTS_TOTAL, body, (state.ball, robots_flat)
-    )
+    collide = penetrations > 0.0  # (6,)
+
+    # Ball position: sum push-out from all colliding robots
+    ball_pos_delta = (normals * penetrations[:, None] * (m_r / total_m))
+    ball_pos_delta = jnp.where(collide[:, None], ball_pos_delta, 0.0)
+    ball_pos_new = state.ball[0:2] + ball_pos_delta.sum(axis=0)
+
+    # Robot positions: each gets its own push-back
+    rob_pos_delta = (-normals * penetrations[:, None] * (m_b / total_m))
+    rob_pos_new = robots_flat[:, 0:2] + jnp.where(collide[:, None], rob_pos_delta, 0.0)
+
+    # Velocity impulses
+    ball_vel = state.ball[2:4]
+    rob_vel = robots_flat[:, 3:5]
+    rel_vel = ball_vel[None, :] - rob_vel                      # (6, 2)
+    vel_along = jnp.sum(rel_vel * normals, axis=-1)             # (6,)
+    do_impulse = collide & (vel_along < 0)
+    j = -(1.0 + e) * vel_along / (1.0 / m_b + 1.0 / m_r)      # (6,)
+    impulses = j[:, None] * normals                             # (6, 2)
+
+    ball_vel_new = ball_vel + jnp.where(do_impulse[:, None], impulses / m_b, 0.0).sum(axis=0)
+    rob_vel_new = rob_vel + jnp.where(do_impulse[:, None], -impulses / m_r, 0.0)
+
+    new_robots_flat = robots_flat.at[:, 0:2].set(rob_pos_new).at[:, 3:5].set(rob_vel_new)
+    new_ball = jnp.concatenate([ball_pos_new, ball_vel_new])
     return state._replace(
         ball=new_ball,
         robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6),
@@ -476,15 +505,46 @@ def _resolve_robot_pair(
 
 
 def _robot_robot_collisions(state: SimState) -> SimState:
-    """Resolve inelastic collisions between robots (OBB vs OBB)."""
+    """Resolve inelastic collisions between all 15 robot pairs in parallel.
+
+    All SAT tests are batched via vmap; corrections are scatter-added back so
+    each robot accumulates its share from every overlapping pair simultaneously.
+    """
     robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
+    e = jnp.float32(config.ROBOT_WALL_RESTITUTION)
 
-    def body(k, robots_flat):
-        i = _PAIR_I[k]
-        j = _PAIR_J[k]
-        return _resolve_robot_pair(robots_flat, i, j)
+    pos_a = robots_flat[_PAIR_I, 0:2]    # (15, 2)
+    theta_a = robots_flat[_PAIR_I, 2]    # (15,)
+    pos_b = robots_flat[_PAIR_J, 0:2]    # (15, 2)
+    theta_b = robots_flat[_PAIR_J, 2]    # (15,)
+    vel_a = robots_flat[_PAIR_I, 3:5]    # (15, 2)
+    vel_b = robots_flat[_PAIR_J, 3:5]    # (15, 2)
 
-    new_robots_flat = jax.lax.fori_loop(0, _N_PAIRS, body, robots_flat)
+    overlapping, normals, overlaps = jax.vmap(_sat_square_overlap)(
+        pos_a, theta_a, pos_b, theta_b
+    )  # (15,), (15, 2), (15,)
+
+    # Position corrections
+    sep = normals * overlaps[:, None] * 0.5
+    pos_delta_a = jnp.where(overlapping[:, None],  sep, 0.0)
+    pos_delta_b = jnp.where(overlapping[:, None], -sep, 0.0)
+
+    # Velocity impulses
+    rel_vel = vel_a - vel_b
+    vel_along = jnp.sum(rel_vel * normals, axis=-1)
+    do_impulse = overlapping & (vel_along < 0)
+    j_imp = jnp.where(do_impulse, -(1.0 + e) * vel_along * 0.5, 0.0)
+    impulse = j_imp[:, None] * normals
+    vel_delta_a = jnp.where(do_impulse[:, None],  impulse, 0.0)
+    vel_delta_b = jnp.where(do_impulse[:, None], -impulse, 0.0)
+
+    # Scatter-add all corrections back onto each robot
+    new_pos = robots_flat[:, 0:2]
+    new_vel = robots_flat[:, 3:5]
+    new_pos = new_pos.at[_PAIR_I].add(pos_delta_a).at[_PAIR_J].add(pos_delta_b)
+    new_vel = new_vel.at[_PAIR_I].add(vel_delta_a).at[_PAIR_J].add(vel_delta_b)
+
+    new_robots_flat = robots_flat.at[:, 0:2].set(new_pos).at[:, 3:5].set(new_vel)
     return state._replace(
         robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6)
     )
