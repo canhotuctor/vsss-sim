@@ -218,8 +218,13 @@ class VSSVecEnv(VectorEnv):
             raise RuntimeError("call reset() before current_obs()")
         return _export_obs(self._state)
 
-    def _opponent_actions(self, obs_np: np.ndarray) -> np.ndarray:
-        """Build a (num_envs, N_ROBOTS, 2) opponent action array."""
+    def _opponent_actions(self) -> np.ndarray:
+        """Build a (num_envs, N_ROBOTS, 2) opponent action array.
+
+        Built-in policies (stationary, random) do not observe the state, so no
+        obs is built for them. The callable path builds obs lazily only when a
+        user-supplied policy actually needs it.
+        """
         if self._opponent_policy_spec == "stationary":
             return np.zeros((self.num_envs, config.N_ROBOTS, 2), dtype=np.float32)
         if self._opponent_policy_spec == "random":
@@ -227,6 +232,7 @@ class VSSVecEnv(VectorEnv):
                 -1.0, 1.0, size=(self.num_envs, config.N_ROBOTS, 2),
             ).astype(np.float32)
         # callable: per-env Python loop (slow path, documented)
+        obs_np = _export_obs(self._state)
         out = np.empty((self.num_envs, config.N_ROBOTS, 2), dtype=np.float32)
         for i in range(self.num_envs):
             out[i] = np.asarray(
@@ -268,8 +274,7 @@ class VSSVecEnv(VectorEnv):
         blue = np.asarray(actions, dtype=np.float32).reshape(
             self.num_envs, config.N_ROBOTS, 2,
         )
-        obs_now = np.asarray(_build_obs_batched(self._state))
-        yellow = self._opponent_actions(obs_now)
+        yellow = self._opponent_actions()
         all_actions = np.stack([blue, yellow], axis=1).astype(np.float32)  # (B, 2, 3, 2)
         all_actions_j = jnp.asarray(all_actions)
 

@@ -50,8 +50,11 @@ class _EpisodeDumpCallback(BaseCallback):
     """Log episode metrics to MLflow once per PPO iteration (generation).
 
     Accumulates all episodes that finish during a rollout in _on_step, then
-    flushes mean reward, last-episode reward, mean length, and max length to
-    MLflow and SB3's logger in _on_rollout_end — one data point per iteration.
+    flushes metrics to MLflow in _on_rollout_end and to the console in the
+    *following* _on_rollout_start (which fires after the gradient update).
+    This ensures the SB3 ``time/fps`` metric printed to stdout covers a full
+    rollout + gradient-update cycle, not rollout-only — the latter inflates
+    the first-iteration fps when batch sizes are large.
 
     When ``save_every_gen=True``, saves the policy to ``save_path`` after each generation.
     """
@@ -64,6 +67,14 @@ class _EpisodeDumpCallback(BaseCallback):
         self._rollout_lengths: list[int] = []
         self._save_path = save_path
         self._save_every_gen = save_every_gen and save_path is not None
+        self._pending_console_dump = False  # defer dump until after train()
+
+    def _on_rollout_start(self) -> None:
+        # Fires right after the *previous* self.train() call — flush pending
+        # logger records so fps denominator includes the gradient update.
+        if self._pending_console_dump:
+            self.model.dump_logs(iteration=self._iteration)
+            self._pending_console_dump = False
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
@@ -86,6 +97,7 @@ class _EpisodeDumpCallback(BaseCallback):
             mean_l = sum(lengths) / len(lengths)
             max_l = max(lengths)
 
+            # MLflow: log immediately (not affected by the dump timing).
             mlflow.log_metrics(
                 {
                     "generation": self._iteration,
@@ -98,19 +110,27 @@ class _EpisodeDumpCallback(BaseCallback):
                 },
                 step=self._iteration,
             )
+            # SB3 logger: accumulate — will be flushed in _on_rollout_start of
+            # the next gen (after train()) or in _on_training_end for the last gen.
             self.logger.record("rollout/iteration", self._iteration)
             self.logger.record("rollout/episode", self._episode)
             self.logger.record("rollout/ep_reward_mean", mean_r)
             self.logger.record("rollout/ep_reward_min", last_r)
             self.logger.record("rollout/ep_length_mean", mean_l)
             self.logger.record("rollout/ep_length_max", max_l)
-            self.model.dump_logs(iteration=self._iteration)
+            self._pending_console_dump = True
 
         self._rollout_rewards = []
         self._rollout_lengths = []
 
         if self._save_every_gen:
             self.model.save(str(self._save_path))
+
+    def _on_training_end(self) -> None:
+        # Flush metrics for the final generation (no subsequent _on_rollout_start).
+        if self._pending_console_dump:
+            self.model.dump_logs(iteration=self._iteration)
+            self._pending_console_dump = False
 
 
 def _build_env(num_envs: int, seed: int, backend: str | None,
