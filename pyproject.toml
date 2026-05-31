@@ -26,6 +26,12 @@ render = ["pygame>=2.4"]
 gpu    = ["torch>=2.0"]
 jax    = ["jax>=0.4"]
 cuda   = ["jax[cuda12]>=0.4"]
+stoix  = [
+    "jumanji>=1.0",
+    "optax>=0.2",
+    "flax>=0.10",
+    "chex>=0.1.85",
+]
 dev    = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.4"]
 
 [project.urls]
