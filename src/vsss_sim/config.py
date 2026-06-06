@@ -51,16 +51,16 @@ TEAM_YELLOW: int = 1         # yellow team index
 # ---------------------------------------------------------------------------
 BALL_RADIUS: float = 0.02135  # golf ball: 42.67 mm diameter → 21.35 mm radius
 BALL_MASS: float = 0.046      # kg  (~45.9 g golf ball)
-BALL_FRICTION: float = 0.15   # rolling-friction coefficient (μ_r)
-BALL_WALL_RESTITUTION: float = 0.70
-BALL_ROBOT_RESTITUTION: float = 0.70
+BALL_FRICTION: float = 0.05   # rolling-friction coefficient (μ_r)
+BALL_WALL_RESTITUTION: float = 0.80
+BALL_ROBOT_RESTITUTION: float = 0.80
 
 # ---------------------------------------------------------------------------
 # Robot
 # ---------------------------------------------------------------------------
 ROBOT_SIZE: float = 0.075                # max 7.5 cm × 7.5 cm footprint
 ROBOT_RADIUS: float = ROBOT_SIZE / 2.0   # collision radius (≈ bounding circle)
-ROBOT_MASS: float = 0.18                 # kg
+ROBOT_MASS: float = 0.312                 # kg
 ROBOT_INERTIA: float = 8.4375e-05        # kg·m² (solid square: m*(L²+W²)/12)
 ROBOT_WALL_RESTITUTION: float = 0.20
 
@@ -79,10 +79,11 @@ ROBOT_WHEEL_ACCEL_LIMIT: float = 1.0 * 9.81  # m/s² (≈ 1 g)
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
-FPS: float = 60.0           # simulation frequency (Hz)
-DT: float = 1.0 / FPS       # timestep (s)
+FPS: float = 15.0           # control loop frequency in-game (Hz)   
+DT: float = 1.0 / FPS       # control loop timestep in-game (s)
+SUB_STEPS: int = 4          # number of physics sub-steps per control loop step
 
-MAX_EPISODE_STEPS: int = 1200  # 20 s at 60 Hz
+MAX_EPISODE_STEPS: int = 300  # 20 s at 15 Hz (config.FPS control steps)
 KICKOFF_CLEAR_DIST: float = 0.20  # minimum robot distance from centre at kickoff
 
 # ---------------------------------------------------------------------------

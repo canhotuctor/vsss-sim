@@ -393,7 +393,7 @@ def step(
     state: SimState,
     actions: np.ndarray,
     dt: float = config.DT,
-    sub_steps: int = 4,
+    sub_steps: int = config.SUB_STEPS,
 ) -> dict:
     """
     Advance the simulation by one control timestep.

@@ -22,8 +22,8 @@ engine (NumPy or JAX) designed for GPU-accelerated batched training.
 | **Differential-drive** | Correct 2-D kinematics, OBB collisions, rolling friction |
 | **Switchable physics backends** | `numpy_backend.py` (CPU, default) or `jax_backend.py` (CPU/GPU/Metal) |
 | **Native batched Vector env** | `VSSVecEnv` runs N parallel matches in one `jit(vmap(step))` call |
-| **Pluggable opponents** | `"stationary"`, `"random"`, or any callable policy |
-| **Pygame renderer** | `"human"` window or headless `"rgb_array"` frame output |
+| **Pluggable opponents + init** | Opponents: `"stationary"`, `"random"`, or callable; reset: `init_mode="kickoff"` (default) or `"random"` |
+| **Pygame renderer** | OBB robot shapes, FPS overlay — `"human"` or `"rgb_array"` |
 | **Cross-platform** | macOS (Apple Silicon) · Ubuntu 22.04 with CUDA-capable GPU |
 
 ---
@@ -125,11 +125,16 @@ Normalised wheel speeds for the **blue** (controlled) team.
 
 ### Reward
 
+Sparse goal signal plus a small dense shaping term (see `BALL_FORWARD_REWARD_COEF` in `config.py`):
+
 | Event | Reward |
 |---|---|
 | Blue scores | `+1.0` |
 | Yellow scores | `−1.0` |
+| Ball advances toward yellow goal | `+0.10 × Δx_ball` per step |
 | Otherwise | `0.0` |
+
+The shaping term telescopes to at most ~0.15 per episode — well below a single goal — so scoring stays the primary incentive.
 
 Goals trigger an in-episode kickoff; episodes truncate at `MAX_EPISODE_STEPS`
 (default 1200 ≈ 20 s of sim at 60 Hz).
@@ -215,9 +220,11 @@ Reproduce with `python scripts/bench_backends.py --steps 5000 --sb3`. Use `--dev
 
 ## Scripts
 
-- `scripts/smoke.py` — SB3 PPO smoke. Flags: `--backend numpy|jax` (single-env), `--num-envs N` (batched via SB3 adapter, requires JAX), `--render`, `--fps`, `--timesteps`.
-- `scripts/bench_backends.py` — throughput benchmark across NumPy, JAX, raw `jax.vmap`, `VSSVecEnv`. Add `--sb3` for end-to-end SB3 PPO numbers.
-- `scripts/train.py` — MLflow-tracked PPO training run.
+- `scripts/smoke.py` — SB3 PPO smoke with MLflow logging. Flags: `--backend`, `--num-envs`, `--init-mode`, `--generations`, `--forever`, `--n-steps`, `--max-episode-steps`, `--render`, `--timesteps`.
+- `scripts/train.py` — full MLflow-tracked PPO run (`mlflow.db` + `mlruns/`).
+- `scripts/visualize.py` — render-only inspection (`--init-mode`, `--fps`).
+- `scripts/bench_backends.py` — throughput across NumPy, JAX, raw `jax.vmap`, `VSSVecEnv`; `--sb3` for end-to-end PPO; `--device cpu|gpu`.
+- `scripts/check_gpu.py` — JAX device diagnostics.
 
 ---
 
@@ -225,7 +232,7 @@ Reproduce with `python scripts/bench_backends.py --steps 5000 --sb3`. Use `--dev
 
 ```bash
 pip install -e ".[dev,jax]"
-pytest                          # 147/147 expected
+pytest                          # 174 passed, 4 skipped (CUDA, no GPU)
 ```
 
 ---
@@ -235,7 +242,7 @@ pytest                          # 147/147 expected
 ```
 src/vsss_sim/
 ├── __init__.py            Gymnasium registration (VSSS-v0 single + vector entry points)
-├── config.py              IEEE VSSS constants
+├── config.py              IEEE VSSS constants, InitMode, reward coefs
 ├── agents/                stationary.py, random.py (pluggable opponents)
 ├── envs/
 │   ├── base.py            VSSBaseEnv (spaces, observation builder)
@@ -247,8 +254,8 @@ src/vsss_sim/
 │   └── jax_backend.py     JAX backend (functional, jittable, vmap-ready)
 ├── rendering/pygame.py
 └── sb3_adapter.py         VSSVecEnvToSB3 — SB3 VecEnv around VSSVecEnv
-tests/                     147 tests across agents, envs, physics
-scripts/                   smoke.py, train.py, bench_backends.py
+tests/                     174 tests across agents, envs, physics, config
+scripts/                   smoke, train, visualize, bench_backends, check_gpu
 docs/superpowers/plans/    Implementation plans for major features
 pyproject.toml
 ```
@@ -258,8 +265,9 @@ pyproject.toml
 ## Roadmap
 
 - **CUDA on Ubuntu RTX 3060** ✓ — verified; 909k env-steps/sec at batch=1024 (raw physics ceiling).
-- **JAX-native RL** — integration with `purejaxrl` / `Stoix` to remove the Gymnasium + SB3 boundary entirely.
-- **Pymunk backend** — possible third backend for sanity-checking the hand-rolled physics.
+- **JAX-native RL (Stoix)** — design spec in `docs/superpowers/specs/`; wrap `jax_backend` as a Jumanji env to close the ~10× Gymnasium boundary gap vs raw `vmap`.
+- **Selector InitMode** — learned/heuristic placement (`InitMode.SELECTOR`); reset infrastructure is in place.
+- **Pymunk backend** — optional third backend for sanity-checking the hand-rolled physics.
 
 ---
 

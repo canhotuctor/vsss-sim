@@ -376,7 +376,8 @@ def _ball_robot_collisions(state: SimState) -> SimState:
 
     All penetrations are computed simultaneously via vmap, then corrections are
     summed. Slightly less accurate than sequential resolution but equivalent
-    throughput-wise on GPU and correct enough for RL over 4 sub-steps.
+    throughput-wise on GPU and correct enough for RL over config.SUB_STEPS sub-steps.
+    (config.SUB_STEPS is 4 by default, but may be greater for higher accuracy.)
     """
     robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
     m_b = jnp.float32(config.BALL_MASS)
@@ -606,7 +607,7 @@ def step(
     state: SimState,
     actions: jnp.ndarray,
     dt: float = config.DT,
-    sub_steps: int = 4,
+    sub_steps: int = config.SUB_STEPS,
 ) -> tuple[SimState, dict]:
     """Advance the simulation by one control timestep (functional + jitted).
 

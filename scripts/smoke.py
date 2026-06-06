@@ -218,6 +218,7 @@ def main(seed: int, render: bool, fps: float | None,
             n_steps=n_steps,
             seed=seed,
             verbose=1,
+            device="cpu",
         )
 
         try:
