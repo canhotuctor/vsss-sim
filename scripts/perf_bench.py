@@ -171,7 +171,62 @@ def bench_vssvecenv(steps: int, batch_sizes: list[int]) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# 3. End-to-end SB3 PPO — per-generation timing
+# 3. PPO policy inference — pure forward pass (what runs during rollout)
+# --------------------------------------------------------------------------- #
+
+def bench_ppo_inference(steps: int, batch_sizes: list[int]) -> list[dict]:
+    """Measure pure PyTorch forward pass of the PPO MlpPolicy.
+
+    This is the neural-network-only cost during rollout collection:
+        with torch.no_grad():
+            actions, values, log_probs = policy(obs_tensor)
+    No env step, no JAX — just the MLP inference on CPU.
+    """
+    import numpy as np
+    import torch
+    from stable_baselines3 import PPO
+
+    from vsss_sim.envs import VSSVecEnv
+    from vsss_sim.sb3_adapter import VSSVecEnvToSB3
+
+    obs_dim = 4 + 2 * 3 * 7  # 46
+
+    # Build a throwaway env just to get a correctly-shaped policy.
+    env = VSSVecEnvToSB3(VSSVecEnv(num_envs=1, opponent_policy="stationary"))
+    model = PPO("MlpPolicy", env, seed=0, verbose=0)
+    policy = model.policy
+    policy.set_training_mode(False)
+    env.close()
+
+    rows = []
+    for batch in batch_sizes:
+        obs_np = np.random.uniform(-1.0, 1.0, size=(batch, obs_dim)).astype(np.float32)
+        obs_t = torch.as_tensor(obs_np, device=model.device)
+
+        # Warm-up: let PyTorch trace through the graph.
+        with torch.no_grad():
+            for _ in range(50):
+                policy(obs_t)
+
+        times_ns: list[int] = []
+        for _ in range(steps):
+            t0 = _now_ns()
+            with torch.no_grad():
+                policy(obs_t)
+            times_ns.append(_now_ns() - t0)
+
+        st = _stats(times_ns)
+        rows.append({
+            "batch": batch,
+            "total_fps": batch / (st["median_us"] / 1e6),
+            **st,
+        })
+
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# 4. End-to-end SB3 PPO — per-generation timing
 # --------------------------------------------------------------------------- #
 
 def bench_sb3_generations(num_envs: int, n_steps: int, n_gens: int,
@@ -315,7 +370,36 @@ def main(steps: int, gens: int, batches: list[int]) -> None:
     # ---------------------------------------------------------------------- #
     # 3. End-to-end SB3 PPO
     # ---------------------------------------------------------------------- #
-    _header("3. End-to-End SB3 PPO — Per-Generation Timing")
+    # ---------------------------------------------------------------------- #
+    # 3. PPO inference speed
+    # ---------------------------------------------------------------------- #
+    _header("3. PPO Policy Inference — Pure Forward Pass (rollout cost)")
+    print("  (mean±std computed on trimmed sample, top 5% excluded)")
+    print(f"  {'batch':>7}  {'min':>9}  {'mean±std(t)':>22}  "
+          f"{'median':>9}  {'p95':>9}  {'total_fps':>12}")
+    infer_rows = bench_ppo_inference(steps, batches)
+    for r in infer_rows:
+        print(
+            f"  {r['batch']:>7}  "
+            f"{r['min_us']:>7.1f}μs  "
+            f"{r['mean_us']:>8.1f}±{r['std_us']:<7.1f}μs  "
+            f"{r['median_us']:>7.1f}μs  "
+            f"{r['p95_us']:>7.1f}μs  "
+            f"{r['total_fps']:>12,.0f}"
+        )
+
+    _sub("Inference vs physics: policy / vmap ratio (>1 = policy is the bottleneck)")
+    print(f"  {'batch':>7}  {'policy_fps':>12}  {'vmap_fps':>12}  {'ratio':>8}")
+    for ri, rv in zip(infer_rows, vmap_rows):
+        ratio = ri["total_fps"] / rv["total_fps"]
+        bottleneck = " <-- policy bottleneck" if ratio < 1.0 else " <-- physics bottleneck"
+        print(f"  {ri['batch']:>7}  {ri['total_fps']:>12,.0f}  {rv['total_fps']:>12,.0f}  "
+              f"{ratio:>7.3f}x{bottleneck}")
+
+    # ---------------------------------------------------------------------- #
+    # 4. End-to-End SB3 PPO — Per-Generation Timing
+    # ---------------------------------------------------------------------- #
+    _header("4. End-to-End SB3 PPO — Per-Generation Timing")
     ppo_batch_sizes = [64, 256, 1024, 4096]
     sb3_configs = [(1, 4096), (8, 512), (32, 512), (64, 256), (128, 256), (256, 128)]
     all_sb3: list[dict] = []
@@ -363,6 +447,17 @@ def main(steps: int, gens: int, batches: list[int]) -> None:
               f"{best_vec['total_fps']:>12,.0f} fps")
         gap = best_vmap["total_fps"] / best_vec["total_fps"]
         print(f"  Wrapper penalty                   : {gap:.2f}x")
+    if infer_rows:
+        best_inf = max(infer_rows, key=lambda x: x["total_fps"])
+        print(f"  Policy inference peak (batch={best_inf['batch']}) : "
+              f"{best_inf['total_fps']:>12,.0f} fps")
+        # cross-over: first batch where inference is slower than VSSVecEnv
+        if vec_rows:
+            for ri, rv in zip(infer_rows, vec_rows):
+                if ri["total_fps"] < rv["total_fps"]:
+                    print(f"  Inference bottleneck starts at batch={ri['batch']} "
+                          f"({ri['total_fps']:,.0f} < {rv['total_fps']:,.0f} fps)")
+                    break
     if all_sb3:
         best_sb3 = max(all_sb3, key=lambda x: x["overall_fps"])
         print(f"  SB3 PPO peak (envs={best_sb3['num_envs']}, steps={best_sb3['n_steps']}) : "
