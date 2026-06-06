@@ -119,22 +119,32 @@ class VSSRenderer:
     def _draw_field(self, surf: pygame.Surface) -> None:
         surf.fill(config.COLOR_BACKGROUND)
 
-        # Green grass
-        field_rect = pygame.Rect(
-            self.margin, self.margin, self._field_px_w, self._field_px_h
-        )
-        pygame.draw.rect(surf, config.COLOR_FIELD, field_rect)
+        # Green grass — drawn as an octagon to reflect the corner chamfers.
+        hl = config.FIELD_LENGTH / 2.0
+        hw = config.FIELD_WIDTH / 2.0
+        c = config.FIELD_CHAMFER
+        # Eight vertices of the chamfered field in world coords (clockwise from top-left):
+        corners_world = [
+            (-hl + c,  hw),
+            ( hl - c,  hw),
+            ( hl,      hw - c),
+            ( hl,     -hw + c),
+            ( hl - c, -hw),
+            (-hl + c, -hw),
+            (-hl,     -hw + c),
+            (-hl,      hw - c),
+        ]
+        field_poly = [self._to_px(x, y) for x, y in corners_world]
+        gfxdraw.filled_polygon(surf, field_poly, config.COLOR_FIELD)
+        gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD)
+        gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD_LINES)
 
-        # Border
-        pygame.draw.rect(surf, config.COLOR_FIELD_LINES, field_rect, 2)
-
-        # Centre line
+        # Centre line (AA)
         mid_x = self.margin + self._field_px_w // 2
-        pygame.draw.line(
+        pygame.draw.aaline(
             surf, config.COLOR_FIELD_LINES,
             (mid_x, self.margin),
             (mid_x, self.margin + self._field_px_h),
-            2,
         )
 
         # Centre circle (AA)
@@ -349,7 +359,11 @@ class VSSRenderer:
                 self._draw_episode(surf, int(episode))
             self._screen.blit(surf, (0, 0))
             pygame.display.flip()
-            pygame.event.pump()  # required on macOS to keep the window alive
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise SystemExit(0)
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    raise SystemExit(0)
             if self._clock is not None:
                 self._clock.tick(self._fps)
             return None

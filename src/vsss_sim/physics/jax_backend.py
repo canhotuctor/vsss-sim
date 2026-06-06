@@ -216,6 +216,110 @@ def _robot_wall_collisions(state: SimState) -> SimState:
 
 
 # ---------------------------------------------------------------------------
+# Chamfer collisions — shared geometry helpers
+# ---------------------------------------------------------------------------
+
+# 45° chamfer sign combinations for the 4 corners: (sx, sy).
+# The chamfer half-plane for corner (sx, sy) is: sx*x + sy*y ≤ chamfer_diag.
+_CHAMFER_SX = (1., -1.,  1., -1.)
+_CHAMFER_SY = (1.,  1., -1., -1.)
+_INV_SQRT2 = float(0.5 ** 0.5)
+
+
+def _ball_chamfer_collisions(state: SimState) -> SimState:
+    """Reflect ball off the four 45° corner chamfers.
+
+    Each chamfer is a half-plane  sx·x + sy·y ≤ D − r·√2  where
+    D = half_l + half_w − chamfer and (sx,sy) ∈ {±1}².
+    """
+    r = jnp.float32(config.BALL_RADIUS)
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
+    half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
+    c = jnp.float32(config.FIELD_CHAMFER)
+    e = jnp.float32(config.BALL_WALL_RESTITUTION)
+    inv_sqrt2 = jnp.float32(_INV_SQRT2)
+
+    chamfer_diag = half_l + half_w - c
+    # Limit in the "sum space" (sx·bx + sy·by must stay below this).
+    limit = chamfer_diag - r * jnp.float32(2.0 ** 0.5)
+
+    bx, by, bvx, bvy = state.ball[0], state.ball[1], state.ball[2], state.ball[3]
+
+    for sx, sy in zip(_CHAMFER_SX, _CHAMFER_SY):
+        sx_f = jnp.float32(sx)
+        sy_f = jnp.float32(sy)
+
+        pen = sx_f * bx + sy_f * by - limit
+        hit = pen > 0.0
+
+        # Push ball back along the chamfer normal n = (-sx, -sy)/√2.
+        # Displacement = (pen/√2) · n = pen · (-sx, -sy) / 2.
+        bx = jnp.where(hit, bx - sx_f * pen * 0.5, bx)
+        by = jnp.where(hit, by - sy_f * pen * 0.5, by)
+
+        # Reflect velocity: new_v = v − (1+e)·v_n·n
+        # v_n = dot(v, n) = (−sx·vx − sy·vy) / √2  (negative = moving into corner)
+        v_n = (-sx_f * bvx - sy_f * bvy) * inv_sqrt2
+        do_reflect = hit & (v_n < 0.0)
+        bvx = jnp.where(do_reflect, bvx + (1.0 + e) * v_n * sx_f * inv_sqrt2, bvx)
+        bvy = jnp.where(do_reflect, bvy + (1.0 + e) * v_n * sy_f * inv_sqrt2, bvy)
+
+    return state._replace(ball=jnp.stack([bx, by, bvx, bvy]))
+
+
+def _robot_chamfer_collisions(state: SimState) -> SimState:
+    """Clamp robots (OBB) inside the four 45° corner chamfers; zero outward velocity.
+
+    For each chamfer half-plane sx·x + sy·y ≤ D, the effective limit for the
+    robot centre is D − support(OBB, (sx,sy)/√2), where
+      support = half · (|sx·cos θ + sy·sin θ| + |sy·cos θ − sx·sin θ|).
+    """
+    half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
+    half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
+    half = jnp.float32(config.ROBOT_SIZE / 2.0)
+    c = jnp.float32(config.FIELD_CHAMFER)
+    inv_sqrt2 = jnp.float32(_INV_SQRT2)
+
+    chamfer_diag = half_l + half_w - c
+
+    rx = state.robots[:, :, 0]
+    ry = state.robots[:, :, 1]
+    theta = state.robots[:, :, 2]
+    vx = state.robots[:, :, 3]
+    vy = state.robots[:, :, 4]
+
+    cos_t = jnp.cos(theta)
+    sin_t = jnp.sin(theta)
+
+    for sx, sy in zip(_CHAMFER_SX, _CHAMFER_SY):
+        sx_f = jnp.float32(sx)
+        sy_f = jnp.float32(sy)
+
+        # OBB support in direction (sx, sy)/√2 — expressed in "sum space" (×√2).
+        support_sum = half * (
+            jnp.abs(sx_f * cos_t + sy_f * sin_t)
+            + jnp.abs(sy_f * cos_t - sx_f * sin_t)
+        )
+        limit = chamfer_diag - support_sum
+
+        pen = sx_f * rx + sy_f * ry - limit
+        hit = pen > 0.0
+
+        rx = jnp.where(hit, rx - sx_f * pen * 0.5, rx)
+        ry = jnp.where(hit, ry - sy_f * pen * 0.5, ry)
+
+        # Zero the velocity component pointing into the corner.
+        v_out = (sx_f * vx + sy_f * vy) * inv_sqrt2
+        do_zero = hit & (v_out > 0.0)
+        vx = jnp.where(do_zero, vx - v_out * sx_f * inv_sqrt2, vx)
+        vy = jnp.where(do_zero, vy - v_out * sy_f * inv_sqrt2, vy)
+
+    robots = state.robots.at[:, :, 0].set(rx).at[:, :, 1].set(ry)
+    robots = robots.at[:, :, 3].set(vx).at[:, :, 4].set(vy)
+    return state._replace(robots=robots)
+
+
+# ---------------------------------------------------------------------------
 # Ball–wall collisions and goal detection
 # ---------------------------------------------------------------------------
 
@@ -596,7 +700,9 @@ def _substep(
 
     # Collisions.
     state = _robot_wall_collisions(state)
+    state = _robot_chamfer_collisions(state)
     state, goal = _ball_wall_collisions(state)
+    state = _ball_chamfer_collisions(state)
     state = _ball_robot_collisions(state)
     state = _robot_robot_collisions(state)
     return state, goal

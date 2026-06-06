@@ -34,6 +34,9 @@ FIELD_WIDTH: float = 1.30    # y-axis extent (130 cm)
 GOAL_WIDTH: float = 0.40     # 40 cm opening
 GOAL_DEPTH: float = 0.10     # 10 cm deep behind end-line
 
+# Corner chamfers (cut at 45° with this leg length on each edge)
+FIELD_CHAMFER: float = 0.07  # 7 cm
+
 # Center circle radius (used for kickoff clearance)
 CENTER_RADIUS: float = 0.10  # 10 cm
 
