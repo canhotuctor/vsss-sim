@@ -139,7 +139,7 @@ class VSSRenderer:
         gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD)
         gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD_LINES)
 
-        # Centre line (AA)
+        # Centre line
         mid_x = self.margin + self._field_px_w // 2
         pygame.draw.aaline(
             surf, config.COLOR_FIELD_LINES,
@@ -147,7 +147,7 @@ class VSSRenderer:
             (mid_x, self.margin + self._field_px_h),
         )
 
-        # Centre circle (AA)
+        # Centre circle
         cx, cy = self._to_px(0.0, 0.0)
         r_px = self._m_to_px(config.CENTER_RADIUS)
         gfxdraw.aacircle(surf, cx, cy, r_px, config.COLOR_FIELD_LINES)
@@ -185,6 +185,26 @@ class VSSRenderer:
             pygame.Rect(gx_right, gy_top, goal_px_d, goal_px_h),
             2,
         )
+
+        # Goal areas — 3 inner sides each (end-line is shared with the field border).
+        ga_half_y = config.GOAL_AREA_LENGTH_Y / 2.0
+        ga_x = config.GOAL_AREA_LENGTH_X
+        hl = config.FIELD_LENGTH / 2.0
+
+        for side_x, sign in ((-hl, 1), (hl, -1)):
+            inner_x = side_x + sign * ga_x
+            for wx, wy in (
+                # inner vertical line
+                ((inner_x, -ga_half_y), (inner_x, ga_half_y)),
+                # top horizontal
+                ((side_x, ga_half_y), (inner_x, ga_half_y)),
+                # bottom horizontal
+                ((side_x, -ga_half_y), (inner_x, -ga_half_y)),
+            ):
+                pygame.draw.aaline(
+                    surf, config.COLOR_FIELD_LINES,
+                    self._to_px(*wx), self._to_px(*wy),
+                )
 
     def _draw_robot(
         self,

@@ -113,6 +113,38 @@ class VSSEnv(VSSBaseEnv):
         info_phys = self._backend.step(self._state, all_actions)
         return int(info_phys["goal"])
 
+    def _step_physics_substeps(self, all_actions: np.ndarray) -> int:
+        """Run each physics sub-step individually, rendering after each one.
+
+        Used only in ``render_mode="human"`` so the window shows smooth
+        intermediate motion rather than one jump per control step.
+        """
+        sub_dt = config.DT / config.SUB_STEPS
+        goal = 0
+
+        if self._is_jax():
+            import jax.numpy as jnp
+            j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
+            for _ in range(config.SUB_STEPS):
+                self._state, info_phys = self._backend.step(
+                    self._state, j_actions, dt=sub_dt, sub_steps=1
+                )
+                g = int(info_phys["goal"])
+                if goal == 0:
+                    goal = g
+                self.render()
+        else:
+            for _ in range(config.SUB_STEPS):
+                info_phys = self._backend.step(
+                    self._state, all_actions, dt=sub_dt, sub_steps=1
+                )
+                g = int(info_phys["goal"])
+                if goal == 0:
+                    goal = g
+                self.render()
+
+        return goal
+
     def _bump_score(self, team_idx: int) -> None:
         """Increment the score of one team (backend-agnostic)."""
         if self._is_jax():
@@ -121,6 +153,29 @@ class VSSEnv(VSSBaseEnv):
             )
         else:
             self._state.score[team_idx] += 1
+
+    def _crowding_penalty(self) -> float:
+        """Return a negative reward when 2+ allied robots crowd a goal area.
+
+        Both goal areas are checked.
+        """
+        blue_pos = np.asarray(self._state.robots)[config.TEAM_BLUE, :, 0:2]
+        half_l = config.FIELD_LENGTH / 2.0
+        ga_half_y = config.GOAL_AREA_LENGTH_Y / 2.0
+        ga_x = config.GOAL_AREA_LENGTH_X
+
+        penalty = 0.0
+        for x_min, x_max in (
+            (-half_l, -half_l + ga_x),   # allied (blue) goal area
+            ( half_l - ga_x,  half_l),   # opponent (yellow) goal area
+        ):
+            in_area = (
+                (blue_pos[:, 0] >= x_min) & (blue_pos[:, 0] <= x_max)
+                & (np.abs(blue_pos[:, 1]) <= ga_half_y)
+            )
+            if int(np.sum(in_area)) >= 2:
+                penalty += config.GOAL_AREA_CROWDING_PENALTY
+        return penalty
 
     # ------------------------------------------------------------------
     # Gymnasium interface
@@ -159,7 +214,10 @@ class VSSEnv(VSSBaseEnv):
         all_actions = np.stack([blue_actions, yellow_actions], axis=0)
 
         ball_x_pre = float(np.asarray(self._state.ball)[0])
-        goal = self._step_physics(all_actions)
+        if self.render_mode == "human":
+            goal = self._step_physics_substeps(all_actions)
+        else:
+            goal = self._step_physics(all_actions)
         ball_x_post = float(np.asarray(self._state.ball)[0])
         self._step_count += 1
 
@@ -169,7 +227,12 @@ class VSSEnv(VSSBaseEnv):
             self._bump_score(config.TEAM_YELLOW)
 
         # Reward: sparse ±1 on goal + small dense ball-forward-progress shaping
-        reward = float(goal) + config.BALL_FORWARD_REWARD_COEF * (ball_x_post - ball_x_pre)
+        # + penalty for packing 2+ allied robots into any goal area
+        reward = (
+            float(goal)
+            + config.BALL_FORWARD_REWARD_COEF * (ball_x_post - ball_x_pre)
+            + self._crowding_penalty()
+        )
 
         terminated = False  # VSSS has no terminal state mid-match
         truncated = self._step_count >= self.max_episode_steps
@@ -181,7 +244,7 @@ class VSSEnv(VSSBaseEnv):
         if goal != 0:
             self._reset_state()
 
-        if self.render_mode == "human":
+        if self.render_mode == "rgb_array":
             self.render()
 
         return obs, reward, terminated, truncated, info
@@ -192,7 +255,15 @@ class VSSEnv(VSSBaseEnv):
 
         if self._renderer is None:
             from ..rendering import VSSRenderer
-            self._renderer = VSSRenderer(render_mode=self.render_mode, fps=self._render_fps)
+            # In human mode, render() is called SUB_STEPS times per control
+            # step, so the clock rate must be scaled up so that the wall-clock
+            # rate of *control steps* (not sub-steps) matches render_fps.
+            clock_fps = (
+                self._render_fps * config.SUB_STEPS
+                if self.render_mode == "human" and self._render_fps is not None
+                else self._render_fps
+            )
+            self._renderer = VSSRenderer(render_mode=self.render_mode, fps=clock_fps)
 
         return self._renderer.render(
             np.asarray(self._state.ball),

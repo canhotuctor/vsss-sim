@@ -241,6 +241,31 @@ class VSSVecEnv(VectorEnv):
             ).reshape(config.N_ROBOTS, 2)
         return out
 
+    def _crowding_penalties(self) -> np.ndarray:
+        """Return per-env crowding penalty array, shape ``(num_envs,)``.
+
+        Mirrors ``VSSEnv._crowding_penalty``: −GOAL_AREA_CROWDING_PENALTY for
+        each goal area where 2+ allied robots are present simultaneously.
+        """
+        blue_pos = np.asarray(
+            self._state.robots[:, config.TEAM_BLUE, :, 0:2]
+        )  # (B, N_ROBOTS, 2)
+        half_l = config.FIELD_LENGTH / 2.0
+        ga_half_y = config.GOAL_AREA_LENGTH_Y / 2.0
+        ga_x = config.GOAL_AREA_LENGTH_X
+
+        penalties = np.zeros(self.num_envs, dtype=np.float32)
+        for x_min, x_max in (
+            (-half_l, -half_l + ga_x),   # allied goal area
+            ( half_l - ga_x,  half_l),   # opponent goal area
+        ):
+            in_area = (
+                (blue_pos[:, :, 0] >= x_min) & (blue_pos[:, :, 0] <= x_max)
+                & (np.abs(blue_pos[:, :, 1]) <= ga_half_y)
+            )  # (B, N_ROBOTS) bool
+            penalties += (in_area.sum(axis=1) >= 2) * np.float32(config.GOAL_AREA_CROWDING_PENALTY)
+        return penalties
+
     # ------------------------------------------------------------------
     # Gymnasium VectorEnv interface
     # ------------------------------------------------------------------
@@ -300,6 +325,7 @@ class VSSVecEnv(VectorEnv):
         rewards = (
             goals.astype(np.float32)
             + np.float32(config.BALL_FORWARD_REWARD_COEF) * (ball_x_post - ball_x_pre)
+            + self._crowding_penalties()
         )
         terminations = np.zeros(self.num_envs, dtype=bool)
         truncations = self._step_count >= self.max_episode_steps

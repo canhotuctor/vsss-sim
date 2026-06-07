@@ -34,11 +34,15 @@ FIELD_WIDTH: float = 1.30    # y-axis extent (130 cm)
 GOAL_WIDTH: float = 0.40     # 40 cm opening
 GOAL_DEPTH: float = 0.10     # 10 cm deep behind end-line
 
+# Goal area
+GOAL_AREA_LENGTH_X: float = 0.15   # 15 cm
+GOAL_AREA_LENGTH_Y: float = 0.70    # 70 cm
+
 # Corner chamfers (cut at 45° with this leg length on each edge)
 FIELD_CHAMFER: float = 0.07  # 7 cm
 
 # Center circle radius (used for kickoff clearance)
-CENTER_RADIUS: float = 0.10  # 10 cm
+CENTER_RADIUS: float = 0.20  # 20 cm
 
 # ---------------------------------------------------------------------------
 # Teams
@@ -96,6 +100,11 @@ KICKOFF_CLEAR_DIST: float = 0.20  # minimum robot distance from centre at kickof
 # (Δx for the blue team; blue attacks +x). Telescopes to coef * (x_end - x_start)
 # over an episode, so per-episode shaping is bounded by coef * FIELD_LENGTH.
 BALL_FORWARD_REWARD_COEF: float = 0.10
+
+# Penalty applied every tick that 2 or more allied (blue) robots occupy the
+# same goal area (either side). Each area is checked independently, so the
+# worst-case penalty per tick is 2× this value.
+GOAL_AREA_CROWDING_PENALTY: float = -0.02
 
 # ---------------------------------------------------------------------------
 # Normalisation headroom factor for velocity observations (ensures values
