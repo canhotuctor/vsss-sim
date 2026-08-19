@@ -32,6 +32,12 @@ stoix  = [
     "flax>=0.10",
     "chex>=0.1.85",
 ]
+"jax-rl" = [
+    "jumanji>=1.0",
+    "optax>=0.2",
+    "flax>=0.10",
+    "chex>=0.1.85",
+]
 dev    = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.4"]
 
 [project.urls]

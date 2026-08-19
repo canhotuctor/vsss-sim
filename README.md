@@ -40,6 +40,9 @@ pip install -e ".[render]"
 # With the JAX physics backend
 pip install -e ".[jax]"
 
+# With the end-to-end JAX environment and PPO trainer
+pip install -e ".[jax-rl]"
+
 # Developer tools (tests + linter)
 pip install -e ".[dev]"
 ```
@@ -86,6 +89,23 @@ obs, rew, term, trunc, info = envs.step(envs.action_space.sample())
 ```
 
 Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256)`.
+
+### End-to-end JAX PPO
+
+This path bypasses Gymnasium, NumPy, SB3, and PyTorch during training. Policy
+inference, VMAP'd physics, rollout collection, GAE, gradients, and Optax updates
+remain on the JAX device.
+
+```bash
+python scripts/train_jax.py \
+    --total-timesteps 1000000 \
+    --num-envs 256 \
+    --rollout-length 128
+```
+
+Use `--opponent random --init-mode random` for the randomized starting setup.
+The first update includes XLA compilation; subsequent updates report training
+throughput excluding that compilation time.
 
 ### Training with SB3 PPO + batched env (~4–8× wall-clock speedup)
 
@@ -247,14 +267,15 @@ src/vsss_sim/
 ├── envs/
 │   ├── base.py            VSSBaseEnv (spaces, observation builder)
 │   ├── vsss_3v3.py        VSSEnv — single-env Gymnasium Env
-│   └── vsss_vec.py        VSSVecEnv — batched JAX Gymnasium VectorEnv
+│   ├── vsss_vec.py        VSSVecEnv — batched JAX Gymnasium VectorEnv
+│   └── jumanji.py         VSSJumanjiEnv — fully JAX-resident RL interface
 ├── physics/
 │   ├── __init__.py        Backend resolver (get_backend)
 │   ├── numpy_backend.py   Reference CPU backend (mutable SimState)
 │   └── jax_backend.py     JAX backend (functional, jittable, vmap-ready)
 ├── rendering/pygame.py
 └── sb3_adapter.py         VSSVecEnvToSB3 — SB3 VecEnv around VSSVecEnv
-tests/                     174 tests across agents, envs, physics, config
+tests/                     tests across agents, envs, physics, config
 scripts/                   smoke, train, visualize, bench_backends, check_gpu
 docs/superpowers/plans/    Implementation plans for major features
 pyproject.toml
@@ -265,7 +286,7 @@ pyproject.toml
 ## Roadmap
 
 - **CUDA on Ubuntu RTX 3060** ✓ — verified; 909k env-steps/sec at batch=1024 (raw physics ceiling).
-- **JAX-native RL (Stoix)** — design spec in `docs/superpowers/specs/`; wrap `jax_backend` as a Jumanji env to close the ~10× Gymnasium boundary gap vs raw `vmap`.
+- **JAX-native RL** ✓ — Jumanji environment plus a fully compiled Flax/Optax PPO loop in `scripts/train_jax.py`. See `docs/jax-rl-integration.md` for the library comparison.
 - **Selector InitMode** — learned/heuristic placement (`InitMode.SELECTOR`); reset infrastructure is in place.
 - **Pymunk backend** — optional third backend for sanity-checking the hand-rolled physics.
 
