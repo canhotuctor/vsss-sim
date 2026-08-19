@@ -90,3 +90,26 @@ def test_one_compiled_update_changes_parameters_and_counts_steps():
     assert int(metrics["env_steps"]) == config.batch_size
     assert int(metrics["episodes"]) == config.num_envs
     assert all(np.isfinite(np.asarray(value)).all() for value in metrics.values())
+
+
+def test_multiple_generations_run_inside_compiled_scan():
+    env = VSSJumanjiEnv(max_episode_steps=3)
+    config = PPOConfig(
+        num_envs=2,
+        rollout_length=2,
+        update_epochs=1,
+        num_minibatches=1,
+        hidden_sizes=(8,),
+    )
+    trainer = PPO(env, config)
+    runner = trainer.initialize(jax.random.PRNGKey(9))
+
+    runner, metrics_history = trainer.train(runner, num_updates=3)
+    jax.block_until_ready((runner, metrics_history))
+
+    assert int(runner.env_steps) == 3 * config.batch_size
+    assert metrics_history["loss"].shape == (3,)
+    assert int(metrics_history["env_steps"][-1]) == 3 * config.batch_size
+    assert all(
+        np.isfinite(np.asarray(values)).all() for values in metrics_history.values()
+    )

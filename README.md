@@ -98,14 +98,14 @@ remain on the JAX device.
 
 ```bash
 python scripts/train_jax.py \
-    --total-timesteps 1000000 \
+    --generations 30 \
     --num-envs 256 \
     --rollout-length 128
 ```
 
 Use `--opponent random --init-mode random` for the randomized starting setup.
-The first update includes XLA compilation; subsequent updates report training
-throughput excluding that compilation time.
+All generations execute in one compiled `lax.scan`. The script reports
+initialization, compilation, and device execution times separately.
 
 ### Training with SB3 PPO + batched env (~4–8× wall-clock speedup)
 

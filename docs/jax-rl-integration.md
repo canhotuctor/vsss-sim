@@ -67,9 +67,10 @@ The Flax/Optax PPO loop is implemented in `vsss_sim.rl.ppo`, with
 algorithm/reference comparison rather than the runtime training dependency.
 
 ```bash
-python scripts/train_jax.py --total-timesteps 1000000 --num-envs 256
+python scripts/train_jax.py --generations 30 --num-envs 256
 ```
 
-Each call to `PPO.update` compiles the rollout scan, truncation-aware GAE, and
-all PPO minibatch epochs together. Python only coordinates updates and emits
-periodic metrics; it is not part of the per-environment-step hot path.
+`PPO.train` wraps complete PPO generations in an outer `lax.scan`. Rollout
+collection, truncation-aware GAE, minibatch epochs, optimizer updates, and the
+generation loop therefore execute in one XLA program. Python only configures,
+compiles, starts the executable, and reads the final metrics.

@@ -20,7 +20,11 @@ def train(args: argparse.Namespace) -> None:
         num_minibatches=args.num_minibatches,
     )
     steps_per_update = config.batch_size
-    num_updates = args.total_timesteps // steps_per_update
+    num_updates = (
+        args.generations
+        if args.generations is not None
+        else args.total_timesteps // steps_per_update
+    )
     if num_updates < 1:
         raise ValueError(
             f"total_timesteps must be at least one batch ({steps_per_update:,})"
@@ -34,46 +38,48 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"JAX devices : {jax.devices()}")
     print(f"Batch       : {config.num_envs} envs × {config.rollout_length} steps")
-    print(f"Updates     : {num_updates} ({num_updates * steps_per_update:,} env steps)")
+    print(f"Generations : {num_updates} ({num_updates * steps_per_update:,} env steps)")
+
+    init_start = time.perf_counter()
+    runner = trainer.initialize(jax.random.PRNGKey(args.seed))
+    jax.block_until_ready(runner)
+    init_seconds = time.perf_counter() - init_start
 
     compile_start = time.perf_counter()
-    runner = trainer.initialize(jax.random.PRNGKey(args.seed))
-    runner, metrics = trainer.update(runner)
-    jax.block_until_ready(metrics)
+    train_executable = trainer.compile_train(runner, num_updates)
     compile_seconds = time.perf_counter() - compile_start
-    print(f"Compile + first update: {compile_seconds:.2f}s")
 
-    start = time.perf_counter()
-    completed_updates = 1
-    for update in range(1, num_updates):
-        runner, metrics = trainer.update(runner)
-        if (update + 1) % args.log_interval == 0 or update + 1 == num_updates:
-            host_metrics = jax.device_get(metrics)
-            elapsed = time.perf_counter() - start
-            measured_steps = update * steps_per_update
-            fps = measured_steps / elapsed if elapsed else 0.0
-            print(
-                f"update={update + 1:>5}/{num_updates} "
-                f"steps={int(host_metrics['env_steps']):>10,} "
-                f"fps={fps:>10,.0f} "
-                f"loss={float(host_metrics['loss']):>9.4f} "
-                f"return={float(host_metrics['mean_episode_return']):>8.3f} "
-                f"episodes={int(host_metrics['episodes']):>5}"
-            )
-        completed_updates = update + 1
+    execution_start = time.perf_counter()
+    runner, metrics_history = train_executable(runner)
+    jax.block_until_ready((runner, metrics_history))
+    execution_seconds = time.perf_counter() - execution_start
 
-    if completed_updates == 1:
-        host_metrics = jax.device_get(metrics)
-        print(
-            f"steps={int(host_metrics['env_steps']):,} "
-            f"loss={float(host_metrics['loss']):.4f} "
-            f"mean_reward={float(host_metrics['mean_reward']):.5f}"
-        )
+    host_metrics = jax.device_get(
+        jax.tree_util.tree_map(lambda values: values[-1], metrics_history)
+    )
+    total_steps = num_updates * steps_per_update
+    fps = total_steps / execution_seconds if execution_seconds else 0.0
+    print(f"Initialize   : {init_seconds:.3f}s")
+    print(f"XLA compile  : {compile_seconds:.3f}s")
+    print(f"Execute      : {execution_seconds:.3f}s")
+    print(f"Throughput   : {fps:,.0f} env-steps/s")
+    print(
+        f"Final        : steps={int(host_metrics['env_steps']):,} "
+        f"loss={float(host_metrics['loss']):.4f} "
+        f"return={float(host_metrics['mean_episode_return']):.3f} "
+        f"episodes={int(host_metrics['episodes'])}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument(
+        "--generations",
+        type=int,
+        default=None,
+        help="Fixed PPO update count; overrides --total-timesteps.",
+    )
     parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument("--rollout-length", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -82,10 +88,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opponent", choices=("stationary", "random"), default="stationary")
     parser.add_argument("--init-mode", choices=("kickoff", "random"), default="kickoff")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--log-interval", type=int, default=10)
     args = parser.parse_args()
-    if args.log_interval < 1:
-        parser.error("--log-interval must be at least 1")
+    if args.generations is not None and args.generations < 1:
+        parser.error("--generations must be at least 1")
     return args
 
 

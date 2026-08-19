@@ -182,6 +182,7 @@ class PPO:
         self._batched_step = jax.vmap(env.step)
         self._compiled_initialize = jax.jit(self._initialize)
         self._compiled_update = jax.jit(self._update)
+        self._compiled_train = jax.jit(self._train, static_argnames=("num_updates",))
 
     def initialize(self, key: jax.Array) -> RunnerState:
         """Initialize model, optimizer, and VMAP'd environments."""
@@ -190,6 +191,20 @@ class PPO:
     def update(self, runner: RunnerState) -> tuple[RunnerState, dict[str, jax.Array]]:
         """Collect one rollout and perform all PPO epochs in one JIT call."""
         return self._compiled_update(runner)
+
+    def train(
+        self, runner: RunnerState, num_updates: int
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Run every PPO generation inside one compiled ``lax.scan``."""
+        if num_updates < 1:
+            raise ValueError("num_updates must be at least 1")
+        return self._compiled_train(runner, num_updates=num_updates)
+
+    def compile_train(self, runner: RunnerState, num_updates: int):
+        """Compile, but do not execute, a fixed-length multi-generation train run."""
+        if num_updates < 1:
+            raise ValueError("num_updates must be at least 1")
+        return self._compiled_train.lower(runner, num_updates=num_updates).compile()
 
     def act(
         self,
@@ -431,3 +446,14 @@ class PPO:
             }
         )
         return runner, metrics
+
+    def _train(
+        self, runner: RunnerState, num_updates: int
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Scan complete PPO updates without returning control to Python."""
+        return jax.lax.scan(
+            lambda carry, _: self._update(carry),
+            runner,
+            xs=None,
+            length=num_updates,
+        )
