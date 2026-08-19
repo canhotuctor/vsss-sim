@@ -28,11 +28,12 @@ from pathlib import Path
 
 import jax
 import mlflow
-import vsss_sim  # noqa: F401 – registers "VSSS-v0"
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 
+import vsss_sim  # noqa: F401 – registers "VSSS-v0"
+from vsss_sim import config
 from vsss_sim.config import InitMode
 from vsss_sim.envs import VSSVecEnv
 from vsss_sim.sb3_adapter import VSSVecEnvToSB3
@@ -281,8 +282,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--max-episode-steps", type=int, default=None,
-        help="Episode length cap in steps (e.g. 300 = 5 s at 60 Hz). "
-             "Defaults to config.MAX_EPISODE_STEPS (currently 1200 = 20 s).",
+        help="Episode length cap in 15 Hz control steps (e.g. 75 = 5 s; "
+             "each control step contains four 60 Hz physics substeps). "
+             f"Defaults to config.MAX_EPISODE_STEPS ({config.MAX_EPISODE_STEPS} = "
+             f"{config.MAX_EPISODE_STEPS / config.FPS:.0f} s).",
     )
     parser.add_argument(
         "--n-steps", type=int, default=None,

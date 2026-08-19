@@ -20,8 +20,9 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
-import vsss_sim  # noqa: F401 — registers "VSSS-v0"
 from stable_baselines3 import PPO
+
+import vsss_sim  # noqa: F401 — registers "VSSS-v0"
 from vsss_sim import config
 from vsss_sim.config import InitMode
 
@@ -145,7 +146,8 @@ if __name__ == "__main__":
         "--max-episode-steps",
         type=int,
         default=None,
-        help="Episode length cap in steps (e.g. 300 = 5 s at 60 Hz). "
+        help="Episode length cap in 15 Hz control steps (e.g. 75 = 5 s; "
+             "each control step contains four 60 Hz physics substeps). "
              f"Defaults to config.MAX_EPISODE_STEPS ({config.MAX_EPISODE_STEPS} = "
              f"{config.MAX_EPISODE_STEPS / config.FPS:.0f} s).",
     )

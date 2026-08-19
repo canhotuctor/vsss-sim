@@ -157,7 +157,8 @@ Sparse goal signal plus a small dense shaping term (see `BALL_FORWARD_REWARD_COE
 The shaping term telescopes to at most ~0.15 per episode — well below a single goal — so scoring stays the primary incentive.
 
 Goals trigger an in-episode kickoff; episodes truncate at `MAX_EPISODE_STEPS`
-(default 1200 ≈ 20 s of sim at 60 Hz).
+(default 300 control steps = 20 s at 15 Hz, with four 60 Hz physics substeps
+per control step).
 
 ---
 
