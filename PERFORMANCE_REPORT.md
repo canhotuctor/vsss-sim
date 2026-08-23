@@ -1,5 +1,9 @@
 # vsss-sim Performance Report
 
+> Historical benchmark: the NumPy comparison below records the May 2026
+> implementation. That physics implementation was removed on 2026-08-19; the
+> current simulator uses JAX exclusively for physics.
+
 **Date:** 2026-05-31  
 **Platform:** macOS 15.7.7 · Apple M4 Pro · arm64  
 **Python:** 3.14.4 · JAX backend: CPU (no Metal/GPU on this run)  

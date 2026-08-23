@@ -1,5 +1,10 @@
 # VSSS-Sim: Project Development Report
 
+> Historical snapshot: this report describes the repository as it existed in
+> May 2026. The former NumPy physics implementation and runtime backend
+> selector were removed on 2026-08-19; current architecture is documented in
+> `README.md` and `STRUCTURE.md`.
+
 **Date:** 2026-05-30  
 **Project:** IEEE Very Small Size Soccer 3×3 Simulator for Reinforcement Learning  
 **Repository:** `canhotuctor/vsss-sim` (branch: `master`)  

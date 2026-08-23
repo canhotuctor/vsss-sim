@@ -3,22 +3,22 @@
 Smoke test — quick sanity check that the simulator, MLflow, and SB3 are wired up.
 
 Single-env mode (default, ``--num-envs 1``)
-    Uses SB3's ``DummyVecEnv`` around one VSSEnv. ``--backend numpy|jax``
-    selects the physics backend. ``--render`` opens a pygame window.
+    Uses SB3's ``DummyVecEnv`` around one VSSEnv. ``--render`` opens a pygame
+    window.
 
 Batched mode (``--num-envs N`` for N > 1)
     Uses ``VSSVecEnvToSB3(VSSVecEnv(num_envs=N))`` — N matches in parallel via
-    ``jit(vmap(step))``. Always uses the JAX physics backend. No render
+    ``jit(vmap(step))``. No render
     window (would only show env 0 anyway).
 
 Usage
 -----
-    python scripts/smoke.py --backend jax --timesteps 5000
+    python scripts/smoke.py --timesteps 5000
     python scripts/smoke.py --num-envs 64 --timesteps 50000
 
 Requires
 --------
-    pip install -e ".[dev,jax]" mlflow stable-baselines3
+    pip install -e ".[dev]" mlflow stable-baselines3
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ class _EpisodeDumpCallback(BaseCallback):
             self._pending_console_dump = False
 
 
-def _build_env(num_envs: int, seed: int, backend: str | None,
+def _build_env(num_envs: int, seed: int,
                render: bool, fps: float | None,
                max_episode_steps: int | None,
                init_mode: str | None = None):
@@ -142,10 +142,6 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
     if num_envs > 1:
         if render:
             print("warning: --render ignored in batched mode (num_envs > 1)")
-        if backend is not None and backend != "jax":
-            raise ValueError(
-                f"batched mode requires backend='jax', got '{backend}'"
-            )
         kwargs = {"num_envs": num_envs, "opponent_policy": PARAMS["opponent"]}
         if max_episode_steps is not None:
             kwargs["max_episode_steps"] = max_episode_steps
@@ -155,8 +151,6 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
 
     # Single-env path
     env_kwargs = {"opponent_policy": PARAMS["opponent"]}
-    if backend is not None:
-        env_kwargs["backend"] = backend
     if render:
         env_kwargs["render_mode"] = "human"
         env_kwargs["render_fps"] = fps
@@ -174,7 +168,7 @@ def _build_env(num_envs: int, seed: int, backend: str | None,
 
 def main(seed: int, render: bool, fps: float | None,
          timesteps: int | None, generations: int | None, forever: bool,
-         backend: str | None, num_envs: int,
+         num_envs: int,
          save_path: Path | None,
          max_episode_steps: int | None,
          n_steps: int | None,
@@ -202,13 +196,13 @@ def main(seed: int, render: bool, fps: float | None,
         mlflow.log_params({
             **PARAMS, "n_steps": n_steps, "seed": seed,
             "total_timesteps": total_timesteps,
-            "backend": backend or "default", "n_envs": num_envs,
+            "physics": "jax", "n_envs": num_envs,
             "max_episode_steps": max_episode_steps or "default",
             "init_mode": init_mode or "kickoff",
             "mode": "forever" if forever else ("generations" if generations is not None else "timesteps"),
         })
 
-        env = _build_env(num_envs, seed, backend, render, fps, max_episode_steps, init_mode)
+        env = _build_env(num_envs, seed, render, fps, max_episode_steps, init_mode)
 
         print(f"n_steps={n_steps}  num_envs={num_envs}  → {n_steps * num_envs} env-steps/generation")
 
@@ -268,12 +262,8 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--backend", type=str, default=None, choices=["numpy", "jax"],
-        help="Physics backend (single-env only; batched always uses jax).",
-    )
-    parser.add_argument(
         "--num-envs", type=int, default=1,
-        help="Number of parallel envs. >1 uses VSSVecEnv via the SB3 adapter (jax backend).",
+        help="Number of parallel envs. >1 uses VSSVecEnv via the SB3 adapter.",
     )
     parser.add_argument(
         "--save-path", type=Path, default=None,
@@ -307,6 +297,6 @@ if __name__ == "__main__":
     main(
         args.seed, args.render, args.fps,
         args.timesteps, args.generations, args.forever,
-        args.backend, args.num_envs,
+        args.num_envs,
         args.save_path, args.max_episode_steps, args.n_steps, args.init_mode,
     )

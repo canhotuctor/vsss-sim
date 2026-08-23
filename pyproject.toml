@@ -19,12 +19,12 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "gymnasium>=0.29",
+    "jax>=0.4",
 ]
 
 [project.optional-dependencies]
 render = ["pygame>=2.4"]
 gpu    = ["torch>=2.0"]
-jax    = ["jax>=0.4"]
 cuda   = ["jax[cuda12]>=0.4"]
 stoix  = [
     "jumanji>=1.0",

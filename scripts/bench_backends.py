@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Benchmark physics throughput: numpy vs JAX single-env vs JAX vmap'd batches.
+Benchmark JAX physics throughput: single-state, vectorized, and Gymnasium paths.
 
 This is the empirical answer to "will VSSVecEnv be faster?" — the last block
 runs `jax.vmap(step)` at increasing batch sizes, which is exactly what
@@ -29,27 +29,13 @@ for _i, _a in enumerate(sys.argv):
         os.environ["JAX_PLATFORMS"] = "cpu" if _v == "cpu" else "cuda"
         break
 
-import jax
-import jax.numpy as jnp
-import numpy as np
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
 
-from vsss_sim import config
-from vsss_sim.envs import VSSVecEnv
-from vsss_sim.physics import jax_backend as jb
-from vsss_sim.physics import numpy_backend as nb
-
-
-def _bench_numpy(steps: int, seed: int) -> float:
-    s = nb.SimState()
-    nb.reset_kickoff(s, rng=np.random.default_rng(seed))
-    a = np.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=np.float64)
-    # Warm-up
-    for _ in range(50):
-        nb.step(s, a)
-    t0 = time.perf_counter()
-    for _ in range(steps):
-        nb.step(s, a)
-    return steps / (time.perf_counter() - t0)
+from vsss_sim import config  # noqa: E402
+from vsss_sim.envs import VSSVecEnv  # noqa: E402
+from vsss_sim.physics import jax_backend as jb  # noqa: E402
 
 
 def _bench_jax_single(steps: int, seed: int) -> float:
@@ -148,28 +134,25 @@ def main(steps: int, seed: int, sb3: bool, sb3_timesteps: int) -> None:
     print(f"JAX devices: {jax.devices()}   default backend: {jax.default_backend()}")
     print(f"Steps per measurement: {steps}\n")
 
-    print("== Single env (raw physics calls) ==")
-    np_fps = _bench_numpy(steps, seed)
-    print(f"  numpy            : {np_fps:>10,.0f} fps")
+    print("== Single state (raw physics calls) ==")
     jx1 = _bench_jax_single(steps, seed)
-    print(f"  jax  (no vmap)   : {jx1:>10,.0f} fps")
-    print(f"  ratio jax/numpy  : {jx1 / np_fps:>10.2f}x\n")
+    print(f"  jax (no vmap)    : {jx1:>10,.0f} fps\n")
 
     print("== Raw jax.vmap(step) — physics ceiling ==")
-    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}  {'vs numpy':>10}")
+    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}")
     for batch in (1, 8, 64, 256, 1024):
         per_env, total = _bench_jax_vmap(steps, batch, seed)
-        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}  {total / np_fps:>9.1f}x")
+        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}")
 
     print("\n== VSSVecEnv — what your RL trainer actually sees ==")
-    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}  {'vs numpy':>10}")
+    print(f"  {'batch':>5}  {'per-env fps':>14}  {'total fps':>14}")
     for batch in (1, 8, 64, 256, 1024):
         per_env, total = _bench_vssvecenv(steps, batch, seed)
-        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}  {total / np_fps:>9.1f}x")
+        print(f"  {batch:>5}  {per_env:>14,.0f}  {total:>14,.0f}")
 
     if sb3:
         print("\n== End-to-end SB3 PPO training fps ==")
-        print(f"  (includes PyTorch policy, JAX physics, conversions, rollout, gradient)")
+        print("  (includes PyTorch policy, JAX physics, conversions, rollout, gradient)")
         baseline_fps = None
         print(f"  {'num_envs':>9}  {'fps':>10}  {'vs num_envs=1':>14}")
         for num_envs in (1, 8, 64, 256):
@@ -181,7 +164,7 @@ def main(steps: int, seed: int, sb3: bool, sb3_timesteps: int) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark physics backends.")
+    parser = argparse.ArgumentParser(description="Benchmark JAX physics throughput.")
     parser.add_argument("--steps", type=int, default=2000,
                         help="Raw-physics steps per measurement (default: 2000).")
     parser.add_argument("--seed", type=int, default=0)

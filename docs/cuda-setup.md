@@ -1,6 +1,6 @@
 # CUDA setup on Ubuntu (NVIDIA RTX 3060)
 
-This recipe gets the JAX physics backend running on a CUDA GPU and captures
+This recipe gets the JAX physics engine running on a CUDA GPU and captures
 benchmark numbers for `docs/vsss-sim-progress-2026-05.md` and `CLAUDE.md`.
 
 > **Scope:** Linux x86_64 with an NVIDIA GPU. On macOS the `[cuda]` extra
@@ -26,7 +26,7 @@ From the repo root:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # if not already
-pip install -e ".[dev,jax,cuda]"
+pip install -e ".[dev,cuda]"
 ```
 
 `jax[cuda12]` pulls in the matching `jaxlib` build and the CUDA 12 PJRT
@@ -64,10 +64,10 @@ GPU, CPU↔GPU parity within `atol=1e-3`, and the `vmap`'d batched step.
 A full `pytest` run on Ubuntu should report:
 
 ```
-151 passed, 0 warnings
+138 passed
 ```
 
-(147 pre-existing + 4 CUDA tests now active.)
+(The four CUDA tests skipped on a CPU-only machine are active on Ubuntu.)
 
 ## Capture benchmark numbers
 

@@ -87,7 +87,6 @@ def main() -> int:
     duration.add_argument("--generations", type=int, default=None)
     duration.add_argument("--forever", action="store_true")
 
-    parser.add_argument("--backend", type=str, default=None, choices=["numpy", "jax"])
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--max-episode-steps", type=int, default=None)
     parser.add_argument("--n-steps", type=int, default=None)
@@ -117,8 +116,6 @@ def main() -> int:
         smoke_extra.extend(["--timesteps", str(args.timesteps)])
     if args.generations is not None:
         smoke_extra.extend(["--generations", str(args.generations)])
-    if args.backend is not None:
-        smoke_extra.extend(["--backend", args.backend])
     if args.num_envs != 1:
         smoke_extra.extend(["--num-envs", str(args.num_envs)])
     if args.max_episode_steps is not None:

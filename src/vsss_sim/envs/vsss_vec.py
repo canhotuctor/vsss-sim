@@ -2,7 +2,7 @@
 Batched IEEE VSSS 3 v 3 vector environment (Gymnasium ``VectorEnv``).
 
 Runs ``num_envs`` independent matches in parallel by ``jax.vmap``-ing the JAX
-physics backend. A single batched ``SimState`` PyTree is held on the active
+physics engine. A single batched ``SimState`` PyTree is held on the active
 JAX device; ``step`` is ``jit``-compiled and operates on the leading
 ``num_envs`` axis.
 
@@ -32,10 +32,8 @@ import numpy as np
 from gymnasium import spaces
 from gymnasium.vector import VectorEnv
 
-from .. import config
+from .. import config, physics
 from ..config import InitMode
-from .. import physics as _physics_pkg
-
 
 # ---------------------------------------------------------------------------
 # Normalisation constants (mirror envs.base)
@@ -99,19 +97,12 @@ class VSSVecEnv(VectorEnv):
         num_envs: int = 8,
         opponent_policy: str | Callable = "stationary",
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
-        backend: str = "jax",
         init_mode: InitMode | str = InitMode.KICKOFF,
     ) -> None:
         super().__init__()
 
         if num_envs < 1:
             raise ValueError(f"num_envs must be >= 1, got {num_envs}")
-        backend_lc = (backend or "jax").lower()
-        if backend_lc != "jax":
-            raise ValueError(
-                f"VSSVecEnv currently only supports backend='jax', got '{backend}'. "
-                "For the numpy backend, use SyncVectorEnv around VSSEnv instead."
-            )
         if not callable(opponent_policy) and opponent_policy not in ("stationary", "random"):
             raise ValueError(
                 f"Unknown opponent_policy '{opponent_policy}'. "
@@ -120,7 +111,6 @@ class VSSVecEnv(VectorEnv):
 
         self.num_envs = num_envs
         self.max_episode_steps = max_episode_steps
-        self._backend = _physics_pkg.get_backend(backend_lc)
         self._opponent_policy_spec: str | Callable = opponent_policy
         self._init_mode = InitMode(init_mode)
 
@@ -141,12 +131,12 @@ class VSSVecEnv(VectorEnv):
 
         # JIT-compiled batched primitives
         _reset_fn = (
-            self._backend.reset_kickoff
+            physics.reset_kickoff
             if self._init_mode == InitMode.KICKOFF
-            else self._backend.reset_random
+            else physics.reset_random
         )
         self._batched_reset = jax.jit(jax.vmap(_reset_fn))
-        self._batched_step = jax.jit(jax.vmap(self._backend.step))
+        self._batched_step = jax.jit(jax.vmap(physics.step))
 
         # Per-env Python-side bookkeeping (kept on host)
         self._rng = np.random.default_rng()

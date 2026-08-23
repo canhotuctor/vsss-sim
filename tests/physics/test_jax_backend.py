@@ -1,12 +1,10 @@
-"""Tests for the JAX physics backend."""
+"""Tests for the JAX physics engine."""
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
 from vsss_sim import config
 from vsss_sim.physics import jax_backend as jb
-from vsss_sim.physics.numpy_backend import SimState as NumpySimState
 
 
 class TestSimState:
@@ -35,22 +33,6 @@ class TestSimState:
         s = jb.empty_state()
         leaves = jax.tree_util.tree_leaves(s)
         assert len(leaves) == 5  # ball, robots, score, t, wheel_speeds
-
-    def test_from_numpy_round_trip(self):
-        np_s = NumpySimState()
-        np_s.ball[:] = [0.1, 0.2, 0.3, 0.4]
-        np_s.robots[0, 0, :] = [0.5, -0.5, 1.0, 0.0, 0.0, 0.0]
-        np_s.score[:] = [1, 2]
-        np_s.t = 1.5
-
-        j_s = jb.from_numpy(np_s)
-        np_s2 = jb.to_numpy(j_s)
-
-        assert np.allclose(np_s2.ball, np_s.ball, atol=1e-5)
-        assert np.allclose(np_s2.robots, np_s.robots, atol=1e-5)
-        assert np.all(np_s2.score == np_s.score)
-        assert np_s2.t == pytest.approx(np_s.t, abs=1e-5)
-
 
 class TestDiffDrive:
     def test_straight_forward(self):
@@ -301,52 +283,3 @@ class TestStep:
         s2, info = step_jit(s, a)
         assert s2.robots.shape == s.robots.shape
         assert "goal" in info
-
-
-class TestParityWithNumpy:
-    """Trajectories from numpy and jax backends should match within tolerance."""
-
-    def test_step_parity_zero_actions(self):
-        from vsss_sim.physics import numpy_backend as nb
-
-        np_s = nb.SimState()
-        nb.reset_kickoff(np_s, rng=np.random.default_rng(0))
-        j_s = jb.from_numpy(np_s)
-
-        np_a = np.zeros((config.N_TEAMS, config.N_ROBOTS, 2))
-        j_a = jnp.asarray(np_a, dtype=jnp.float32)
-
-        for _ in range(20):
-            nb.step(np_s, np_a)
-            j_s, _ = jb.step(j_s, j_a)
-
-        np.testing.assert_allclose(
-            np.asarray(j_s.robots[:, :, 0:2]),
-            np_s.robots[:, :, 0:2],
-            atol=1e-3,
-        )
-        np.testing.assert_allclose(
-            np.asarray(j_s.ball[0:2]), np_s.ball[0:2], atol=1e-3,
-        )
-
-    def test_step_parity_forward_action(self):
-        from vsss_sim.physics import numpy_backend as nb
-
-        np_s = nb.SimState()
-        nb.reset_kickoff(np_s, rng=np.random.default_rng(2))
-        j_s = jb.from_numpy(np_s)
-
-        np_a = np.zeros((config.N_TEAMS, config.N_ROBOTS, 2))
-        np_a[config.TEAM_BLUE, 0, :] = 1.0
-        j_a = jnp.asarray(np_a, dtype=jnp.float32)
-
-        for _ in range(15):
-            nb.step(np_s, np_a)
-            j_s, _ = jb.step(j_s, j_a)
-
-        # The moving robot's x position should match within a few mm.
-        np.testing.assert_allclose(
-            float(j_s.robots[config.TEAM_BLUE, 0, 0]),
-            np_s.robots[config.TEAM_BLUE, 0, 0],
-            atol=5e-3,
-        )

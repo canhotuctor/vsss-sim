@@ -13,8 +13,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from .. import config
-from .. import physics as _physics_pkg
+from .. import config, physics
 
 # ---------------------------------------------------------------------------
 # Normalisation constants
@@ -34,11 +33,6 @@ class VSSBaseEnv(gym.Env):
 
     Subclasses implement ``reset``, ``step``, ``render``, and ``close``.
 
-    Parameters
-    ----------
-    backend : str, optional
-        Physics backend name (``"numpy"`` or ``"jax"``). Defaults to the
-        ``VSSS_PHYSICS_BACKEND`` environment variable, then ``"numpy"``.
     """
 
     metadata: dict[str, Any] = {
@@ -51,7 +45,6 @@ class VSSBaseEnv(gym.Env):
         render_mode: Optional[str] = None,
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         render_fps: Optional[float] = None,
-        backend: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -59,8 +52,6 @@ class VSSBaseEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self._render_fps = render_fps
         self._rng = np.random.default_rng()
-        self._backend = _physics_pkg.get_backend(backend)
-        self._backend_name = self._backend.__name__.rsplit(".", 1)[-1]
         self._state = self._initial_state()
         self._step_count = 0
         self._episode_count = 0
@@ -88,14 +79,12 @@ class VSSBaseEnv(gym.Env):
         )
 
     # ------------------------------------------------------------------
-    # Backend-agnostic state helpers
+    # State helpers
     # ------------------------------------------------------------------
 
     def _initial_state(self):
-        """Create a zero state appropriate for the active backend."""
-        if self._backend_name == "jax_backend":
-            return self._backend.empty_state()
-        return self._backend.SimState()
+        """Create an empty JAX simulation state."""
+        return physics.empty_state()
 
     # ------------------------------------------------------------------
     # Observation builder

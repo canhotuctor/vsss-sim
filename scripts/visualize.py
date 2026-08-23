@@ -32,7 +32,6 @@ def main(
     episodes: int,
     fps: float | None,
     opponent: str,
-    backend: str | None,
     seed: int,
     deterministic: bool,
     max_episode_steps: int | None,
@@ -49,8 +48,6 @@ def main(
         "render_mode": "human",
         "render_fps": fps,
     }
-    if backend is not None:
-        env_kwargs["backend"] = backend
     if max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = max_episode_steps
     if init_mode is not None:
@@ -59,7 +56,7 @@ def main(
     env = gym.make("VSSS-v0", **env_kwargs)
     print(
         f"running {episodes} episode(s) — opponent={opponent}, "
-        f"backend={backend or 'default'}, init={init_mode or 'kickoff'}, "
+        f"init={init_mode or 'kickoff'}, "
         f"deterministic={deterministic}"
     )
 
@@ -129,13 +126,6 @@ if __name__ == "__main__":
         choices=["stationary", "random"],
         help="Opponent policy for the yellow team (default: stationary).",
     )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        choices=["numpy", "jax"],
-        help="Physics backend (default: env default, usually numpy).",
-    )
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed (offset per episode).")
     parser.add_argument(
         "--stochastic",
@@ -168,7 +158,6 @@ if __name__ == "__main__":
         episodes=args.episodes,
         fps=fps,
         opponent=args.opponent,
-        backend=args.backend,
         seed=args.seed,
         deterministic=not args.stochastic,
         max_episode_steps=args.max_episode_steps,

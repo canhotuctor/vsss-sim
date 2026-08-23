@@ -1,6 +1,7 @@
 # Core runtime dependencies
 numpy>=1.24
 gymnasium>=0.29
+jax>=0.4
 
 # Optional: rendering (pip install vsss-sim[render])
 # pygame>=2.4

@@ -1,10 +1,8 @@
-"""JAX physics backend for vsss-sim.
+"""Pure-functional JAX physics engine for vsss-sim.
 
-Pure-functional mirror of ``numpy_backend.py``. ``SimState`` is a
-:class:`typing.NamedTuple` PyTree — register-free, immutable, ``vmap``-friendly.
-
-Float dtype is ``float32`` (GPU default). Tests assert semantic parity with the
-float64 numpy backend within a generous tolerance.
+``SimState`` is a :class:`typing.NamedTuple` PyTree: register-free, immutable,
+JIT-compatible, and ``vmap``-friendly. Physics arrays use ``float32`` so the
+same implementation runs efficiently on CPU and accelerators.
 """
 from __future__ import annotations
 
@@ -13,11 +11,8 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from .. import config
-from .numpy_backend import SimState as NumpySimState
-
 
 # ---------------------------------------------------------------------------
 # State container (PyTree)
@@ -41,28 +36,6 @@ def empty_state() -> SimState:
         score=jnp.zeros(2, dtype=jnp.int32),
         t=jnp.zeros((), dtype=jnp.float32),
         wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
-    )
-
-
-def from_numpy(np_state: NumpySimState) -> SimState:
-    """Convert a NumPy ``SimState`` to a JAX ``SimState``."""
-    return SimState(
-        ball=jnp.asarray(np_state.ball, dtype=jnp.float32),
-        robots=jnp.asarray(np_state.robots, dtype=jnp.float32),
-        score=jnp.asarray(np_state.score, dtype=jnp.int32),
-        t=jnp.asarray(np_state.t, dtype=jnp.float32),
-        wheel_speeds=jnp.asarray(np_state.wheel_speeds, dtype=jnp.float32),
-    )
-
-
-def to_numpy(state: SimState) -> NumpySimState:
-    """Convert a JAX ``SimState`` to a NumPy ``SimState``."""
-    return NumpySimState(
-        ball=np.asarray(state.ball, dtype=np.float64),
-        robots=np.asarray(state.robots, dtype=np.float64),
-        score=np.asarray(state.score, dtype=np.int32),
-        t=float(state.t),
-        wheel_speeds=np.asarray(state.wheel_speeds, dtype=np.float64),
     )
 
 

@@ -23,24 +23,18 @@ flowchart LR
         base["VSSBaseEnv<br/>spaces + observation builder"]
         opponent["Opponent policy<br/>stationary / random / callable"]
         renderer["Pygame renderer<br/>human / rgb_array"]
-        resolver["Backend resolver"]
-        numpy["NumPy physics<br/>mutable state, CPU"]
-        jaxsingle["JAX physics<br/>functional state, JIT"]
+        physics["JAX physics<br/>functional state, JIT"]
 
         env --> base
         env --> opponent
         env --> renderer
-        env --> resolver
-        resolver --> numpy
-        resolver --> jaxsingle
+        env --> physics
     end
 
     subgraph batch["Compatibility training path"]
         adapter["VSSVecEnvToSB3<br/>API + autoreset adapter"]
         vec["VSSVecEnv<br/>Gymnasium VectorEnv"]
-        kernel["JAX physics kernel"]
-
-        adapter --> vec --> kernel
+        adapter --> vec --> physics
     end
 
     subgraph native["Fully JAX-native training path"]
@@ -48,7 +42,7 @@ flowchart LR
         ppojax["Flax/Optax PPO<br/>nested lax.scan"]
         jumanji["VSSJumanjiEnv<br/>functional JAX state"]
 
-        trainjax --> ppojax --> jumanji --> kernel
+        trainjax --> ppojax --> jumanji --> physics
     end
 
     sb3["Stable-Baselines3 PPO"]
@@ -62,10 +56,10 @@ flowchart LR
     user --> trainjax
 ```
 
-Key boundary: `VSSEnv` can select NumPy or JAX. `VSSVecEnv` is JAX-only because batching is
-implemented by applying `vmap` to the pure JAX physics step and compiling the result with `jit`.
-`VSSJumanjiEnv` represents one pure match; PPO applies `vmap` for the environment batch and
-keeps the policy, rollout, GAE, gradients, and optimizer state on the JAX device.
+All three paths share the same functional JAX physics step. `VSSVecEnv` batches it with `vmap`
+and compiles the result with `jit`. `VSSJumanjiEnv` represents one pure match; PPO applies
+`vmap` for the environment batch and keeps the policy, rollout, GAE, gradients, and optimizer
+state on the JAX device.
 
 ## 2. One control step in `VSSEnv`
 
@@ -78,7 +72,7 @@ sequenceDiagram
     participant P as Blue policy
     participant E as VSSEnv
     participant O as Opponent policy
-    participant X as Physics backend
+    participant X as JAX physics engine
     participant R as Renderer
 
     P->>E: action (6,) in [-1, 1]
@@ -265,7 +259,7 @@ the rollout dimension `T` to stored transitions.
 
 ## 6. Physics step: 15 Hz control, 4 sub-steps
 
-A policy selects target wheel speeds once per 1/15-second control step. The physics backend
+A policy selects target wheel speeds once per 1/15-second control step. The physics engine
 splits that interval into four smaller steps for smoother acceleration and more reliable
 collision handling.
 
@@ -280,9 +274,9 @@ flowchart TD
     friction["Apply rolling friction to ball"]
     integrateBall["Integrate ball position"]
     walls["Resolve robot-wall collisions"]
-    robotChamfers["JAX only: resolve<br/>robot-corner chamfers"]
+    robotChamfers["Resolve robot-corner chamfers"]
     ballwalls["Resolve ball-wall collisions<br/>and detect goals"]
-    ballChamfers["JAX only: resolve<br/>ball-corner chamfers"]
+    ballChamfers["Resolve ball-corner chamfers"]
     ballrobots["Resolve ball-robot collisions<br/>circle vs oriented box"]
     robotrobots["Resolve robot-robot collisions<br/>oriented box SAT"]
     done["Advance simulation time by 1/15 s<br/>return first goal event"]
@@ -294,14 +288,8 @@ flowchart TD
     repeat -->|"after 4"| done
 ```
 
-The backends share the core pipeline but use different state-update styles:
-
-| Concern | NumPy backend | JAX backend |
-|---|---|---|
-| State | mutable dataclass, float64 | immutable `NamedTuple` PyTree, float32 |
-| Step | Python loop, modifies state in place | pure return value, `jax.jit` + `lax.fori_loop` |
-| Natural use | debugging, rendering, single CPU match | batched CPU/GPU training |
-| Batch strategy | external env wrappers | `vmap` over the single-match step |
+State is an immutable float32 `NamedTuple` PyTree. `step` returns a new state, uses
+`lax.fori_loop` for substeps, and can be transformed directly with `jax.jit` and `jax.vmap`.
 
 ## 7. Match and reset lifecycle
 
@@ -328,13 +316,11 @@ to resolve.
 These details matter when comparing trajectories across execution paths:
 
 - `VSSEnv` supports rendering; `VSSVecEnv` currently does not.
-- Human rendering advances and draws each physics sub-step. Non-human stepping runs one backend
+- Human rendering advances and draws each physics sub-step. Non-human stepping runs one engine
   call for the whole control step.
-- NumPy reset helpers mutate an existing state and preserve its score/time. JAX reset helpers
-  return a fresh state whose score/time are zero. Therefore a JAX in-match kickoff currently
-  resets those fields, unlike NumPy.
-- JAX currently resolves the field's 45-degree corner chamfers for both robots and the ball;
-  the NumPy step currently resolves only the rectangular walls.
+- Reset helpers return a fresh state whose score and simulation time are zero. The single-env
+  in-match kickoff therefore resets those fields; the Jumanji path explicitly preserves them.
+- Physics resolves the field's 45-degree corner chamfers for both robots and the ball.
 - On a goal, single `VSSEnv` builds the returned observation before its kickoff reset. Batched
   `VSSVecEnv` performs the kickoff before exporting the returned observation.
 - The single path calculates goal-area crowding from the post-physics state. On a goal, the
@@ -358,15 +344,14 @@ flowchart TD
     vector["envs/vsss_vec.py<br/>batched orchestration + observation encoding"]
     jumanji["envs/jumanji.py<br/>pure state, TimeStep, reward + truncation semantics"]
     ppo["rl/ppo.py<br/>Flax actor-critic, GAE, PPO scans"]
-    resolver["physics/__init__.py<br/>backend selection"]
-    np["physics/numpy_backend.py"]
-    jax["physics/jax_backend.py"]
+    physicsapi["physics/__init__.py<br/>public physics API"]
+    jax["physics/jax_backend.py<br/>JAX physics engine"]
     agents["agents/<br/>opponent policies"]
     render["rendering/pygame.py"]
     adapter["sb3_adapter.py"]
     trainjax["scripts/train_jax.py<br/>compile, execute, benchmark"]
     scripts["scripts/<br/>Gymnasium/SB3 training, benchmark, visualize"]
-    tests["tests/<br/>env, adapter, parity, CUDA, reset, PPO"]
+    tests["tests/<br/>env, adapter, physics, CUDA, reset, PPO"]
     report["docs/jax-native-ppo-report-2026-08.md"]
 
     registration --> single
@@ -375,13 +360,10 @@ flowchart TD
     config --> base
     config --> single
     config --> vector
-    config --> np
     config --> jax
     base --> single
     agents --> single
-    single --> resolver
-    resolver --> np
-    resolver --> jax
+    single --> physicsapi --> jax
     vector --> jax
     jumanji --> jax
     ppo --> jumanji
@@ -393,7 +375,6 @@ flowchart TD
     tests -. verify .-> vector
     tests -. verify .-> jumanji
     tests -. verify .-> ppo
-    tests -. parity .-> np
-    tests -. parity .-> jax
+    tests -. verify .-> jax
     report -. documents .-> ppo
 ```

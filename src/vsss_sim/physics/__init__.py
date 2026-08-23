@@ -1,64 +1,34 @@
-"""Physics package — backend resolver and default re-exports.
+"""JAX physics engine for the VSSS simulator.
 
-A backend is a module that defines:
-    ``SimState``, ``step``, ``reset_kickoff``,
-    ``_diff_drive``, ``_ball_wall_collisions``, ``_robot_wall_collisions``,
-    ``_ball_robot_collisions``, ``_robot_robot_collisions``.
-
-Default backend is ``"numpy"``. Override with the ``VSSS_PHYSICS_BACKEND``
-environment variable or by passing ``backend=...`` to ``get_backend()`` /
-``VSSEnv``.
+The public physics API is re-exported from :mod:`jax_backend`. Keeping the
+implementation in a dedicated module makes it convenient for benchmarks and
+tests to import the complete engine while package-level imports remain concise.
 """
 
-from __future__ import annotations
-
-import importlib
-import os
-from types import ModuleType
-from typing import Optional
-
-# Keep direct re-exports of the numpy backend so existing imports
-# (`from vsss_sim.physics import SimState, step, ...`) keep working.
-from .numpy_backend import (
+from . import jax_backend
+from .jax_backend import (
     SimState,
     _ball_robot_collisions,
     _ball_wall_collisions,
     _diff_drive,
     _robot_robot_collisions,
     _robot_wall_collisions,
+    empty_state,
     reset_kickoff,
+    reset_random,
     step,
 )
 
-_BACKENDS = {
-    "numpy": "vsss_sim.physics.numpy_backend",
-    "jax": "vsss_sim.physics.jax_backend",
-}
-
-
-def get_backend(name: Optional[str] = None) -> ModuleType:
-    """Resolve a physics backend module.
-
-    Priority: explicit ``name`` kwarg > ``VSSS_PHYSICS_BACKEND`` env var > ``"numpy"``.
-    """
-    if name is None:
-        name = os.environ.get("VSSS_PHYSICS_BACKEND", "numpy")
-    name = name.lower()
-    if name not in _BACKENDS:
-        raise ValueError(
-            f"Unknown backend '{name}'. Available: {sorted(_BACKENDS)}"
-        )
-    return importlib.import_module(_BACKENDS[name])
-
-
 __all__ = [
     "SimState",
+    "empty_state",
     "step",
     "reset_kickoff",
+    "reset_random",
     "_diff_drive",
     "_ball_wall_collisions",
     "_robot_wall_collisions",
     "_ball_robot_collisions",
     "_robot_robot_collisions",
-    "get_backend",
+    "jax_backend",
 ]

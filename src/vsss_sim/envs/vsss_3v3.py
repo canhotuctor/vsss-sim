@@ -12,19 +12,20 @@ Action space for the controlled team (``Box`` shape ``(6,)``):
 The **controlled team** is ``config.TEAM_BLUE`` by default.
 The **opponent** follows a pluggable policy (default: stationary zeros).
 
-Physics backend is selectable via the ``backend`` kwarg (``"numpy"`` or
-``"jax"``) or the ``VSSS_PHYSICS_BACKEND`` environment variable.
+Physics runs through the project's pure-functional JAX engine.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Optional, SupportsFloat
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
-from .. import config
-from ..config import InitMode
+from .. import config, physics
 from ..agents import random_policy, stationary_policy
+from ..config import InitMode
 from .base import VSSBaseEnv
 
 
@@ -43,8 +44,6 @@ class VSSEnv(VSSBaseEnv):
     render_mode : ``"human"`` | ``"rgb_array"`` | ``None``
     max_episode_steps : int
         Episode length in simulation steps (default: ``config.MAX_EPISODE_STEPS``).
-    backend : ``"numpy"`` | ``"jax"`` | ``None``
-        Physics backend. ``None`` defers to ``VSSS_PHYSICS_BACKEND``, then ``"numpy"``.
     init_mode : ``InitMode`` | ``"kickoff"`` | ``"random"``
         Placement strategy used at every episode reset and in-episode kickoff.
         ``"kickoff"`` (default) uses the standard formation with small jitter.
@@ -59,14 +58,12 @@ class VSSEnv(VSSBaseEnv):
         render_mode: Optional[str] = None,
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         render_fps: Optional[float] = None,
-        backend: Optional[str] = None,
         init_mode: InitMode | str = InitMode.KICKOFF,
     ) -> None:
         super().__init__(
             render_mode=render_mode,
             max_episode_steps=max_episode_steps,
             render_fps=render_fps,
-            backend=backend,
         )
 
         self._init_mode = InitMode(init_mode)
@@ -84,33 +81,21 @@ class VSSEnv(VSSBaseEnv):
             )
 
     # ------------------------------------------------------------------
-    # Backend dispatch helpers
+    # Physics helpers
     # ------------------------------------------------------------------
-
-    def _is_jax(self) -> bool:
-        return self._backend_name == "jax_backend"
 
     def _reset_state(self) -> None:
         """Replace ``self._state`` using the configured init_mode."""
         reset_fn_name = (
             "reset_kickoff" if self._init_mode == InitMode.KICKOFF else "reset_random"
         )
-        if self._is_jax():
-            import jax
-            key = jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
-            self._state = getattr(self._backend, reset_fn_name)(key)
-        else:
-            self._state = self._backend.SimState()
-            getattr(self._backend, reset_fn_name)(self._state, rng=self._rng)
+        key = jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
+        self._state = getattr(physics, reset_fn_name)(key)
 
     def _step_physics(self, all_actions: np.ndarray) -> int:
         """Advance the physics by one control step. Returns the goal event."""
-        if self._is_jax():
-            import jax.numpy as jnp
-            j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
-            self._state, info_phys = self._backend.step(self._state, j_actions)
-            return int(info_phys["goal"])
-        info_phys = self._backend.step(self._state, all_actions)
+        j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
+        self._state, info_phys = physics.step(self._state, j_actions)
         return int(info_phys["goal"])
 
     def _step_physics_substeps(self, all_actions: np.ndarray) -> int:
@@ -122,37 +107,23 @@ class VSSEnv(VSSBaseEnv):
         sub_dt = config.DT / config.SUB_STEPS
         goal = 0
 
-        if self._is_jax():
-            import jax.numpy as jnp
-            j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
-            for _ in range(config.SUB_STEPS):
-                self._state, info_phys = self._backend.step(
-                    self._state, j_actions, dt=sub_dt, sub_steps=1
-                )
-                g = int(info_phys["goal"])
-                if goal == 0:
-                    goal = g
-                self.render()
-        else:
-            for _ in range(config.SUB_STEPS):
-                info_phys = self._backend.step(
-                    self._state, all_actions, dt=sub_dt, sub_steps=1
-                )
-                g = int(info_phys["goal"])
-                if goal == 0:
-                    goal = g
-                self.render()
+        j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
+        for _ in range(config.SUB_STEPS):
+            self._state, info_phys = physics.step(
+                self._state, j_actions, dt=sub_dt, sub_steps=1
+            )
+            g = int(info_phys["goal"])
+            if goal == 0:
+                goal = g
+            self.render()
 
         return goal
 
     def _bump_score(self, team_idx: int) -> None:
-        """Increment the score of one team (backend-agnostic)."""
-        if self._is_jax():
-            self._state = self._state._replace(
-                score=self._state.score.at[team_idx].add(1)
-            )
-        else:
-            self._state.score[team_idx] += 1
+        """Increment the score of one team."""
+        self._state = self._state._replace(
+            score=self._state.score.at[team_idx].add(1)
+        )
 
     def _crowding_penalty(self) -> float:
         """Return a negative reward when 2+ allied robots crowd a goal area.
@@ -208,7 +179,7 @@ class VSSEnv(VSSBaseEnv):
             Normalised wheel speeds for the blue team:
             ``[vl_0, vr_0, vl_1, vr_1, vl_2, vr_2]``.
         """
-        blue_actions = np.array(action, dtype=np.float64).reshape(config.N_ROBOTS, 2)
+        blue_actions = np.asarray(action, dtype=np.float32).reshape(config.N_ROBOTS, 2)
         obs_current = self._get_obs()
         yellow_actions = self._opponent_policy(obs_current).reshape(config.N_ROBOTS, 2)
         all_actions = np.stack([blue_actions, yellow_actions], axis=0)
