@@ -18,6 +18,7 @@ from jumanji.types import TimeStep, restart, transition, truncation
 
 from .. import config
 from ..config import InitMode
+from ..perspective import switch_team_perspective
 from ..physics import jax_backend as physics
 
 _OBS_DIM = 4 + config.N_TEAMS * config.N_ROBOTS * 7
@@ -148,11 +149,34 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         return state, restart(build_observation(simulation), dtype=jnp.float32)
 
     def step(
-        self, state: State, action: chex.Array
+        self,
+        state: State,
+        action: chex.Array,
+        opponent_action: chex.Array | None = None,
+        opponent_mode: chex.Array | int | None = None,
     ) -> tuple[State, TimeStep[jax.Array]]:
         next_key, opponent_key, kickoff_key = jax.random.split(state.key, 3)
         blue = jnp.asarray(action, dtype=jnp.float32).reshape(config.N_ROBOTS, 2)
-        if self.opponent_policy == "stationary":
+        if opponent_mode is not None:
+            # Runtime modes are used by historical self-play. 0 = learned,
+            # 1 = random, 2 = stationary. The learned action is already in
+            # yellow's robot-local wheel coordinates.
+            random_yellow = jax.random.uniform(
+                opponent_key, blue.shape, minval=-1.0, maxval=1.0, dtype=jnp.float32
+            )
+            learned_yellow = jnp.asarray(opponent_action, dtype=jnp.float32).reshape(
+                config.N_ROBOTS, 2
+            )
+            yellow = jnp.where(
+                jnp.asarray(opponent_mode) == 0,
+                learned_yellow,
+                jnp.where(jnp.asarray(opponent_mode) == 1, random_yellow, jnp.zeros_like(blue)),
+            )
+        elif opponent_action is not None:
+            yellow = jnp.asarray(opponent_action, dtype=jnp.float32).reshape(
+                config.N_ROBOTS, 2
+            )
+        elif self.opponent_policy == "stationary":
             yellow = jnp.zeros_like(blue)
         else:
             yellow = jax.random.uniform(
@@ -199,3 +223,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             lambda: transition(reward, observation, extras=extras, dtype=jnp.float32),
         )
         return next_state, timestep
+
+    def opponent_observation(self, state: State) -> jax.Array:
+        """Return the same match observation from yellow's canonical view."""
+        return switch_team_perspective(build_observation(state.simulation))

@@ -95,6 +95,11 @@ class RunnerState(NamedTuple):
     episode_return: jax.Array
     episode_length: jax.Array
     env_steps: jax.Array
+    opponent_params: dict | None
+    opponent_indices: jax.Array
+    opponent_modes: jax.Array
+    opponent_categories: jax.Array
+    opponent_generations: jax.Array
 
 
 class _Transition(NamedTuple):
@@ -109,6 +114,10 @@ class _Transition(NamedTuple):
     completed_return: jax.Array
     completed_length: jax.Array
     goal: jax.Array
+    opponent_index: jax.Array
+    opponent_mode: jax.Array
+    opponent_category: jax.Array
+    opponent_generation: jax.Array
 
 
 class _TrainingBatch(NamedTuple):
@@ -180,31 +189,181 @@ class PPO:
         )
         self._batched_reset = jax.vmap(env.reset)
         self._batched_step = jax.vmap(env.step)
+        self._batched_step_with_opponent = jax.vmap(
+            lambda state, action, opponent_action, opponent_mode: env.step(
+                state,
+                action,
+                opponent_action=opponent_action,
+                opponent_mode=opponent_mode,
+            )
+        )
+        self._batched_opponent_observation = jax.vmap(env.opponent_observation)
         self._compiled_initialize = jax.jit(self._initialize)
+        self._compiled_initialize_self_play = jax.jit(self._initialize_self_play)
         self._compiled_update = jax.jit(self._update)
+        self._compiled_update_many = jax.jit(
+            jax.vmap(self._update, in_axes=(0, 0, 0, 0))
+        )
         self._compiled_train = jax.jit(self._train, static_argnames=("num_updates",))
+        self._compiled_train_legacy = jax.jit(
+            self._train_legacy, static_argnames=("num_updates",)
+        )
+        self._compiled_train_many = jax.jit(
+            self._train_many, static_argnames=("num_updates",)
+        )
 
-    def initialize(self, key: jax.Array) -> RunnerState:
-        """Initialize model, optimizer, and VMAP'd environments."""
-        return self._compiled_initialize(key)
+    def initialize(
+        self,
+        key: jax.Array,
+        opponent_pool: dict | None = None,
+        opponent_probabilities: jax.Array | None = None,
+        opponent_generations: jax.Array | None = None,
+    ) -> RunnerState:
+        """Initialize one lineage, optionally assigning historical opponents."""
+        if opponent_pool is None:
+            return self._compiled_initialize(key)
+        if opponent_probabilities is None:
+            raise ValueError("opponent_probabilities are required with opponent_pool")
+        if opponent_generations is None:
+            opponent_generations = jnp.arange(
+                jax.tree_util.tree_leaves(opponent_pool)[0].shape[0], dtype=jnp.int32
+            )
+        return self._compiled_initialize_self_play(
+            key, opponent_pool, opponent_probabilities, opponent_generations
+        )
 
-    def update(self, runner: RunnerState) -> tuple[RunnerState, dict[str, jax.Array]]:
-        """Collect one rollout and perform all PPO epochs in one JIT call."""
-        return self._compiled_update(runner)
+    def initialize_lineages(
+        self,
+        keys: jax.Array,
+        opponent_pools: dict,
+        opponent_probabilities: jax.Array,
+        opponent_generations: jax.Array | None = None,
+    ) -> RunnerState:
+        """Initialize independent learner states along a leading lineage axis."""
+        if opponent_generations is None:
+            pool_size = jax.tree_util.tree_leaves(opponent_pools)[0].shape[1]
+            opponent_generations = jnp.broadcast_to(
+                jnp.arange(pool_size, dtype=jnp.int32),
+                (keys.shape[0], pool_size),
+            )
+        return jax.jit(
+            jax.vmap(self._initialize_self_play, in_axes=(0, 0, 0, 0))
+        )(keys, opponent_pools, opponent_probabilities, opponent_generations)
+
+    def update(
+        self,
+        runner: RunnerState,
+        opponent_pool: dict | None = None,
+        opponent_probabilities: jax.Array | None = None,
+        opponent_generations: jax.Array | None = None,
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Collect one rollout and perform PPO, optionally against frozen history."""
+        if opponent_pool is None:
+            return self._compiled_update(runner, None, None)
+        if opponent_probabilities is None:
+            raise ValueError("opponent_probabilities are required with opponent_pool")
+        if opponent_generations is None:
+            opponent_generations = jnp.arange(
+                jax.tree_util.tree_leaves(opponent_pool)[0].shape[0], dtype=jnp.int32
+            )
+        return self._compiled_update(
+            runner, opponent_pool, opponent_probabilities, opponent_generations
+        )
+
+    def update_lineages(
+        self,
+        runners: RunnerState,
+        opponent_pools: dict,
+        opponent_probabilities: jax.Array,
+        opponent_generations: jax.Array | None = None,
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Update independent learner states batched along a lineage axis."""
+        if opponent_generations is None:
+            pool_size = jax.tree_util.tree_leaves(opponent_pools)[0].shape[1]
+            opponent_generations = jnp.broadcast_to(
+                jnp.arange(pool_size, dtype=jnp.int32),
+                (runners.env_steps.shape[0], pool_size),
+            )
+        return self._compiled_update_many(
+            runners, opponent_pools, opponent_probabilities, opponent_generations
+        )
 
     def train(
-        self, runner: RunnerState, num_updates: int
+        self,
+        runner: RunnerState,
+        num_updates: int,
+        opponent_pool: dict | None = None,
+        opponent_probabilities: jax.Array | None = None,
+        opponent_generations: jax.Array | None = None,
     ) -> tuple[RunnerState, dict[str, jax.Array]]:
-        """Run every PPO generation inside one compiled ``lax.scan``."""
+        """Run PPO generations inside one compiled scan."""
         if num_updates < 1:
             raise ValueError("num_updates must be at least 1")
-        return self._compiled_train(runner, num_updates=num_updates)
+        if opponent_pool is None:
+            return self._compiled_train(runner, None, None, None, num_updates=num_updates)
+        if opponent_probabilities is None:
+            raise ValueError("opponent_probabilities are required with opponent_pool")
+        if opponent_generations is None:
+            opponent_generations = jnp.arange(
+                jax.tree_util.tree_leaves(opponent_pool)[0].shape[0], dtype=jnp.int32
+            )
+        return self._compiled_train(
+            runner,
+            opponent_pool,
+            opponent_probabilities,
+            opponent_generations,
+            num_updates=num_updates,
+        )
+
+    def train_lineages(
+        self,
+        runners: RunnerState,
+        opponent_pools: dict,
+        opponent_probabilities: jax.Array,
+        num_updates: int,
+        opponent_generations: jax.Array | None = None,
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Run a fixed number of updates for independent batched lineages."""
+        if num_updates < 1:
+            raise ValueError("num_updates must be at least 1")
+        if opponent_generations is None:
+            pool_size = jax.tree_util.tree_leaves(opponent_pools)[0].shape[1]
+            opponent_generations = jnp.broadcast_to(
+                jnp.arange(pool_size, dtype=jnp.int32),
+                (runners.env_steps.shape[0], pool_size),
+            )
+        return self._compiled_train_many(
+            runners,
+            opponent_pools,
+            opponent_probabilities,
+            opponent_generations,
+            num_updates=num_updates,
+        )
+
+    def compile_train_lineages(
+        self,
+        runners: RunnerState,
+        opponent_pools: dict,
+        opponent_probabilities: jax.Array,
+        opponent_generations: jax.Array,
+        num_updates: int,
+    ):
+        """Compile a fixed-size batched-lineage run without executing it."""
+        if num_updates < 1:
+            raise ValueError("num_updates must be at least 1")
+        return self._compiled_train_many.lower(
+            runners,
+            opponent_pools,
+            opponent_probabilities,
+            opponent_generations,
+            num_updates=num_updates,
+        ).compile()
 
     def compile_train(self, runner: RunnerState, num_updates: int):
         """Compile, but do not execute, a fixed-length multi-generation train run."""
         if num_updates < 1:
             raise ValueError("num_updates must be at least 1")
-        return self._compiled_train.lower(runner, num_updates=num_updates).compile()
+        return self._compiled_train_legacy.lower(runner, num_updates=num_updates).compile()
 
     def act(
         self,
@@ -245,6 +404,60 @@ class PPO:
             episode_return=zeros_float,
             episode_length=zeros_int,
             env_steps=jnp.zeros((), dtype=jnp.int32),
+            opponent_params=None,
+            opponent_indices=jnp.zeros(self.config.num_envs, dtype=jnp.int32),
+            opponent_modes=jnp.full(self.config.num_envs, 2, dtype=jnp.int32),
+            opponent_categories=jnp.full(self.config.num_envs, 4, dtype=jnp.int32),
+            opponent_generations=jnp.full(self.config.num_envs, -1, dtype=jnp.int32),
+        )
+
+    def _sample_opponent(
+        self,
+        key: jax.Array,
+        opponent_pool: dict,
+        category_probabilities: jax.Array,
+        generation_ids: jax.Array,
+    ) -> tuple[dict, jax.Array, jax.Array, jax.Array, jax.Array]:
+        pool_size = jax.tree_util.tree_leaves(opponent_pool)[0].shape[0]
+        category_key, all_key, recent_key = jax.random.split(key, 3)
+        category = jax.random.categorical(
+            category_key, jnp.log(category_probabilities)
+        ).astype(jnp.int32)
+        recent_count = max(1, (pool_size + 1) // 2)
+        all_index = jax.random.randint(all_key, (), 0, pool_size, dtype=jnp.int32)
+        recent_index = pool_size - recent_count + jax.random.randint(
+            recent_key, (), 0, recent_count, dtype=jnp.int32
+        )
+        opponent_index = jnp.where(
+            category == 0,
+            all_index,
+            jnp.where(category == 1, recent_index, jnp.maximum(pool_size - 1, 0)),
+        )
+        mode = jnp.where(category < 3, 0, category - 2).astype(jnp.int32)
+        params = jax.tree_util.tree_map(lambda value: value[opponent_index], opponent_pool)
+        generation = jnp.where(mode == 0, generation_ids[opponent_index], -1)
+        return params, opponent_index, mode, category, generation
+
+    def _initialize_self_play(
+        self,
+        key: jax.Array,
+        opponent_pool: dict,
+        opponent_probabilities: jax.Array,
+        opponent_generations: jax.Array,
+    ) -> RunnerState:
+        runner = self._initialize(key)
+        sample_key, next_key = jax.random.split(runner.key)
+        sample_keys = jax.random.split(sample_key, self.config.num_envs)
+        params, indices, modes, categories, generations = jax.vmap(
+            self._sample_opponent, in_axes=(0, None, None, None)
+        )(sample_keys, opponent_pool, opponent_probabilities, opponent_generations)
+        return runner._replace(
+            key=next_key,
+            opponent_params=params,
+            opponent_indices=indices,
+            opponent_modes=modes,
+            opponent_categories=categories,
+            opponent_generations=generations,
         )
 
     def _sample_policy(
@@ -261,23 +474,78 @@ class PPO:
         state: EnvState,
         observation: jax.Array,
         key: jax.Array,
-    ) -> tuple[EnvState, jax.Array]:
-        def reset(reset_key: jax.Array) -> tuple[EnvState, jax.Array]:
+        old_opponent_params: dict,
+        old_opponent_index: jax.Array,
+        old_opponent_mode: jax.Array,
+        old_opponent_category: jax.Array,
+        old_opponent_generation: jax.Array,
+        opponent_pool: dict,
+        opponent_probabilities: jax.Array,
+        opponent_generations: jax.Array,
+    ) -> tuple[EnvState, jax.Array, dict, jax.Array, jax.Array, jax.Array, jax.Array]:
+        def reset(args) -> tuple[
+            EnvState, jax.Array, dict, jax.Array, jax.Array, jax.Array, jax.Array
+        ]:
+            reset_key, sample_key = args
             reset_state, reset_timestep = self.env.reset(reset_key)
-            return reset_state, reset_timestep.observation
+            params, index, mode, category, generation = self._sample_opponent(
+                sample_key, opponent_pool, opponent_probabilities, opponent_generations
+            )
+            return (
+                reset_state,
+                reset_timestep.observation,
+                params,
+                index,
+                mode,
+                category,
+                generation,
+            )
 
-        def keep(_: jax.Array) -> tuple[EnvState, jax.Array]:
-            return state, observation
+        def keep(_: None) -> tuple[
+            EnvState, jax.Array, dict, jax.Array, jax.Array, jax.Array, jax.Array
+        ]:
+            return (
+                state,
+                observation,
+                old_opponent_params,
+                old_opponent_index,
+                old_opponent_mode,
+                old_opponent_category,
+                old_opponent_generation,
+            )
 
-        return jax.lax.cond(done, reset, keep, key)
+        reset_key, sample_key = jax.random.split(key)
+        return jax.lax.cond(done, reset, keep, (reset_key, sample_key))
 
-    def _collect_rollout(self, runner: RunnerState) -> tuple[RunnerState, _Transition]:
+    def _collect_rollout(
+        self,
+        runner: RunnerState,
+        opponent_pool: dict | None,
+        opponent_probabilities: jax.Array | None,
+        opponent_generations: jax.Array | None,
+    ) -> tuple[RunnerState, _Transition]:
         def rollout_step(carry: RunnerState, _: None):
-            policy_key, reset_key, next_key = jax.random.split(carry.key, 3)
+            policy_key, opponent_key, reset_key, next_key = jax.random.split(carry.key, 4)
             action, raw_action, log_prob, value = self._sample_policy(
                 carry.train_state.params, carry.observation, policy_key
             )
-            stepped_state, timestep = self._batched_step(carry.env_state, action)
+            if opponent_pool is None:
+                stepped_state, timestep = self._batched_step(carry.env_state, action)
+            else:
+                opponent_observation = self._batched_opponent_observation(carry.env_state)
+                mean, log_std, _ = jax.vmap(self.model.apply)(
+                    carry.opponent_params, opponent_observation
+                )
+                opponent_raw_action = mean + jnp.exp(log_std) * jax.random.normal(
+                    opponent_key, mean.shape
+                )
+                opponent_action = jnp.tanh(opponent_raw_action)
+                stepped_state, timestep = self._batched_step_with_opponent(
+                    carry.env_state,
+                    action,
+                    opponent_action,
+                    carry.opponent_modes,
+                )
 
             # Compute this before autoreset: a time-limit truncation bootstraps
             # from its final observation, not from the next episode's reset obs.
@@ -291,9 +559,51 @@ class PPO:
             completed_length = jnp.where(episode_end, running_length, 0)
 
             reset_keys = jax.random.split(reset_key, self.config.num_envs)
-            next_env_state, next_observation = jax.vmap(self._maybe_reset)(
-                episode_end, stepped_state, timestep.observation, reset_keys
-            )
+            if opponent_pool is None:
+                next_env_state, next_observation = jax.vmap(self._maybe_reset_legacy)(
+                    episode_end, stepped_state, timestep.observation, reset_keys
+                )
+                next_opponent_params = None
+                next_opponent_indices = carry.opponent_indices
+                next_opponent_modes = carry.opponent_modes
+                next_opponent_categories = carry.opponent_categories
+                next_opponent_generations = carry.opponent_generations
+            else:
+                reset_args = (
+                    episode_end,
+                    stepped_state,
+                    timestep.observation,
+                    reset_keys,
+                    carry.opponent_params,
+                    carry.opponent_indices,
+                    carry.opponent_modes,
+                    carry.opponent_categories,
+                    carry.opponent_generations,
+                )
+                (
+                    next_env_state,
+                    next_observation,
+                    next_opponent_params,
+                    next_opponent_indices,
+                    next_opponent_modes,
+                    next_opponent_categories,
+                    next_opponent_generations,
+                ) = jax.vmap(
+                    lambda done, state, obs, key, params, index, mode, category, generation: self._maybe_reset(
+                        done,
+                        state,
+                        obs,
+                        key,
+                        params,
+                        index,
+                        mode,
+                        category,
+                        generation,
+                        opponent_pool,
+                        opponent_probabilities,
+                        opponent_generations,
+                    )
+                )(*reset_args)
             next_runner = RunnerState(
                 train_state=carry.train_state,
                 env_state=next_env_state,
@@ -302,6 +612,11 @@ class PPO:
                 episode_return=jnp.where(episode_end, 0.0, running_return),
                 episode_length=jnp.where(episode_end, 0, running_length),
                 env_steps=carry.env_steps + jnp.int32(self.config.num_envs),
+                opponent_params=next_opponent_params,
+                opponent_indices=next_opponent_indices,
+                opponent_modes=next_opponent_modes,
+                opponent_categories=next_opponent_categories,
+                opponent_generations=next_opponent_generations,
             )
             transition_data = _Transition(
                 observation=carry.observation,
@@ -315,6 +630,10 @@ class PPO:
                 completed_return=completed_return,
                 completed_length=completed_length,
                 goal=timestep.extras["goal"],
+                opponent_index=carry.opponent_indices,
+                opponent_mode=carry.opponent_modes,
+                opponent_category=carry.opponent_categories,
+                opponent_generation=carry.opponent_generations,
             )
             return next_runner, transition_data
 
@@ -324,6 +643,22 @@ class PPO:
             xs=None,
             length=self.config.rollout_length,
         )
+
+    def _maybe_reset_legacy(
+        self,
+        done: jax.Array,
+        state: EnvState,
+        observation: jax.Array,
+        key: jax.Array,
+    ) -> tuple[EnvState, jax.Array]:
+        def reset(reset_key: jax.Array) -> tuple[EnvState, jax.Array]:
+            reset_state, reset_timestep = self.env.reset(reset_key)
+            return reset_state, reset_timestep.observation
+
+        def keep(_: None) -> tuple[EnvState, jax.Array]:
+            return state, observation
+
+        return jax.lax.cond(done, reset, keep, key)
 
     def _loss(
         self, params: dict, batch: _TrainingBatch
@@ -402,8 +737,16 @@ class PPO:
         metrics = jax.tree_util.tree_map(jnp.mean, metrics)
         return train_state, metrics, key
 
-    def _update(self, runner: RunnerState) -> tuple[RunnerState, dict[str, jax.Array]]:
-        rollout_runner, trajectory = self._collect_rollout(runner)
+    def _update(
+        self,
+        runner: RunnerState,
+        opponent_pool: dict | None = None,
+        opponent_probabilities: jax.Array | None = None,
+        opponent_generations: jax.Array | None = None,
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        rollout_runner, trajectory = self._collect_rollout(
+            runner, opponent_pool, opponent_probabilities, opponent_generations
+        )
         advantages, targets = compute_gae(
             rewards=trajectory.reward,
             values=trajectory.old_value,
@@ -445,15 +788,60 @@ class PPO:
                 "env_steps": runner.env_steps,
             }
         )
+        if opponent_pool is not None:
+            metrics.update(
+                {
+                    "opponent_selector_counts": jnp.bincount(
+                        trajectory.opponent_category.reshape(-1), length=5
+                    ),
+                    "opponent_generations": trajectory.opponent_generation,
+                }
+            )
         return runner, metrics
 
     def _train(
-        self, runner: RunnerState, num_updates: int
+        self,
+        runner: RunnerState,
+        opponent_pool: dict | None,
+        opponent_probabilities: jax.Array | None,
+        opponent_generations: jax.Array | None,
+        num_updates: int,
     ) -> tuple[RunnerState, dict[str, jax.Array]]:
         """Scan complete PPO updates without returning control to Python."""
         return jax.lax.scan(
-            lambda carry, _: self._update(carry),
+            lambda carry, _: self._update(
+                carry, opponent_pool, opponent_probabilities, opponent_generations
+            ),
             runner,
+            xs=None,
+            length=num_updates,
+        )
+
+    def _train_legacy(
+        self, runner: RunnerState, num_updates: int
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Keep the original one-argument compiled callable for legacy callers."""
+        return jax.lax.scan(
+            lambda carry, _: self._update(carry, None, None, None),
+            runner,
+            xs=None,
+            length=num_updates,
+        )
+
+    def _train_many(
+        self,
+        runners: RunnerState,
+        opponent_pools: dict,
+        opponent_probabilities: jax.Array,
+        opponent_generations: jax.Array,
+        num_updates: int,
+    ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        """Scan PPO updates while keeping each lineage on its own vmap lane."""
+        return jax.lax.scan(
+            lambda carry, _: self._compiled_update_many(
+                carry, opponent_pools, opponent_probabilities, opponent_generations
+            ),
+            runners,
             xs=None,
             length=num_updates,
         )

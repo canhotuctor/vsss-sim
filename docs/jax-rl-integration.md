@@ -74,3 +74,42 @@ python scripts/train_jax.py --generations 30 --num-envs 256
 collection, truncation-aware GAE, minibatch epochs, optimizer updates, and the
 generation loop therefore execute in one XLA program. Python only configures,
 compiles, starts the executable, and reads the final metrics.
+
+## Historical self-play experiments
+
+Historical self-play uses a JSON experiment config and keeps each lineage's
+policy pool in its own experiment directory. The supplied `experiment26`
+profile starts with 16 independently initialized lineages, 32 environments per
+lineage, 100 PPO generations, and a snapshot every 10 generations. Those
+throughput-sensitive values are an initial profile; override them for a GPU
+smoke test or copy the config to create a distinct experiment.
+
+```bash
+python scripts/train_jax.py --xp experiment26
+python scripts/train_jax.py --xp experiment26 --generations 2 --num-lineages 1 --num-envs-per-lineage 2
+python scripts/evaluate_jax.py --xp experiment26 --lineage 0 --opponents all --matches 100
+```
+
+The opponent is sampled at episode reset and held fixed through that episode.
+The default selector mixture is 100% historical: uniform over all active
+snapshots, uniform over the recent half, or the latest snapshot. Random and
+stationary opponents are available as configurable sampling categories and as
+separate evaluation baselines, but have zero training weight in the supplied
+profile. Evaluation uses 120-second matches and writes per-match plus aggregate
+W/D/L and goal-difference metrics under the experiment directory.
+
+To measure compilation, steady-state throughput, and device-memory growth for
+different lineage/environment/pool sizes on a target machine:
+
+```bash
+python scripts/bench_self_play.py \
+  --lineages 1,4,16 \
+  --envs-per-lineage 16,32,64 \
+  --pool-sizes 1,5,10 \
+  --output output/self-play-benchmark.json
+```
+
+Only policy parameters and snapshot metadata are stored; these snapshots are
+for inference as opponents, not for exact continuation of an interrupted PPO
+run. Run the evaluation script separately after training to compare each
+lineage against its own history and the random/stationary references.
