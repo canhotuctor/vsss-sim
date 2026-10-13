@@ -13,7 +13,7 @@
   "active_pool_limit": null,
   "max_episode_steps": 300,
   "init_mode": "kickoff",
-  "output_root": "output/experiments",
+  "output_root": "outputs/experiments",
   "evaluation_matches": 100,
   "evaluation_seconds": 120,
   "opponent_weights": {

@@ -1,0 +1,26 @@
+{
+  "experiment_name": "experiment26_smoke_gpu",
+  "num_generations": 1,
+  "num_lineages": 1,
+  "num_envs_per_lineage": 2,
+  "rollout_length": 128,
+  "learning_rate": 0.0003,
+  "update_epochs": 4,
+  "num_minibatches": 8,
+  "hidden_sizes": [64, 64],
+  "seed": 2600,
+  "snapshot_interval": 1,
+  "active_pool_limit": null,
+  "max_episode_steps": 300,
+  "init_mode": "kickoff",
+  "output_root": "outputs/experiments-smoke",
+  "evaluation_matches": 1,
+  "evaluation_seconds": 1,
+  "opponent_weights": {
+    "all_history": 66.6666666667,
+    "recent_half": 22.2222222222,
+    "latest": 11.1111111111,
+    "random": 0.0,
+    "stationary": 0.0
+  }
+}

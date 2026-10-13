@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 from jumanji import specs
 from jumanji.env import Environment
-from jumanji.types import TimeStep, restart, transition, truncation
+from jumanji.types import TimeStep, restart, termination, transition, truncation
 
 from .. import config
 from ..config import InitMode
@@ -91,7 +91,8 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
 
     Blue is controlled by the six-dimensional continuous action. Yellow uses
     either a stationary or random wheel-speed policy. Goals cause an in-match
-    kickoff; reaching ``max_episode_steps`` truncates the episode.
+    kickoff by default; optionally, a goal can terminate the episode. Reaching
+    ``max_episode_steps`` truncates the episode.
     """
 
     def __init__(
@@ -99,6 +100,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         opponent_policy: str = "stationary",
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         init_mode: InitMode | str = InitMode.KICKOFF,
+        terminate_on_goal: bool = False,
     ) -> None:
         if opponent_policy not in ("stationary", "random"):
             raise ValueError(
@@ -111,6 +113,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         self.opponent_policy = opponent_policy
         self.max_episode_steps = int(max_episode_steps)
         self.init_mode = InitMode(init_mode)
+        self.terminate_on_goal = bool(terminate_on_goal)
         self._reset_simulation = (
             physics.reset_kickoff
             if self.init_mode == InitMode.KICKOFF
@@ -192,13 +195,14 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         score_delta = jnp.asarray([goal == 1, goal == -1], dtype=jnp.int32)
         simulation = simulation._replace(score=simulation.score + score_delta)
 
-        # A goal starts a new kickoff inside the same match. Preserve match-level
-        # score and time while replacing positions and velocities.
-        def kickoff(scored_simulation: physics.SimState) -> physics.SimState:
-            fresh = physics.reset_kickoff(kickoff_key)
-            return fresh._replace(score=scored_simulation.score, t=scored_simulation.t)
+        if not self.terminate_on_goal:
+            # A goal starts a new kickoff inside the same match. Preserve match-level
+            # score and time while replacing positions and velocities.
+            def kickoff(scored_simulation: physics.SimState) -> physics.SimState:
+                fresh = physics.reset_kickoff(kickoff_key)
+                return fresh._replace(score=scored_simulation.score, t=scored_simulation.t)
 
-        simulation = jax.lax.cond(goal != 0, kickoff, lambda sim: sim, simulation)
+            simulation = jax.lax.cond(goal != 0, kickoff, lambda sim: sim, simulation)
         step_count = state.step_count + jnp.int32(1)
         next_state = State(simulation=simulation, key=next_key, step_count=step_count)
 
@@ -215,13 +219,28 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             "score_yellow": simulation.score[config.TEAM_YELLOW],
             "sim_time": simulation.t,
         }
-        timestep = jax.lax.cond(
-            step_count >= self.max_episode_steps,
-            lambda: truncation(
-                reward, observation, discount=jnp.float32(1.0), extras=extras
-            ),
-            lambda: transition(reward, observation, extras=extras, dtype=jnp.float32),
-        )
+        if self.terminate_on_goal:
+            timestep = jax.lax.cond(
+                goal != 0,
+                lambda: termination(reward, observation, extras=extras),
+                lambda: jax.lax.cond(
+                    step_count >= self.max_episode_steps,
+                    lambda: truncation(
+                        reward, observation, discount=jnp.float32(1.0), extras=extras
+                    ),
+                    lambda: transition(
+                        reward, observation, extras=extras, dtype=jnp.float32
+                    ),
+                ),
+            )
+        else:
+            timestep = jax.lax.cond(
+                step_count >= self.max_episode_steps,
+                lambda: truncation(
+                    reward, observation, discount=jnp.float32(1.0), extras=extras
+                ),
+                lambda: transition(reward, observation, extras=extras, dtype=jnp.float32),
+            )
         return next_state, timestep
 
     def opponent_observation(self, state: State) -> jax.Array:

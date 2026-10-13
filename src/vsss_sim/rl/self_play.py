@@ -89,6 +89,7 @@ class ExperimentConfig:
     snapshot_interval: int = 10
     active_pool_limit: int | None = None
     max_episode_steps: int = 300
+    terminate_on_goal: bool = False
     init_mode: str = "kickoff"
     output_root: str = "output/experiments"
     evaluation_matches: int = 100
@@ -279,6 +280,7 @@ def _make_env(config: ExperimentConfig) -> Any:
         opponent_policy="stationary",
         max_episode_steps=config.max_episode_steps,
         init_mode=InitMode(config.init_mode),
+        terminate_on_goal=config.terminate_on_goal,
     )
 
 

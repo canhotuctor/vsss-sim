@@ -1,0 +1,26 @@
+{
+  "experiment_name": "experiment26_long300",
+  "num_generations": 300,
+  "num_lineages": 16,
+  "num_envs_per_lineage": 32,
+  "rollout_length": 128,
+  "learning_rate": 0.0003,
+  "update_epochs": 4,
+  "num_minibatches": 8,
+  "hidden_sizes": [64, 64],
+  "seed": 2600,
+  "snapshot_interval": 25,
+  "active_pool_limit": null,
+  "max_episode_steps": 300,
+  "init_mode": "kickoff",
+  "output_root": "outputs/experiments",
+  "evaluation_matches": 100,
+  "evaluation_seconds": 120,
+  "opponent_weights": {
+    "all_history": 66.6666666667,
+    "recent_half": 22.2222222222,
+    "latest": 11.1111111111,
+    "random": 0.0,
+    "stationary": 0.0
+  }
+}

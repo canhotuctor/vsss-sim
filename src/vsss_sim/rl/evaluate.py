@@ -135,10 +135,14 @@ def evaluate_experiment(
         raise ValueError("lineage index is outside the configured experiment")
 
     horizon = int(round(config.evaluation_seconds * sim_config.FPS))
+    # Evaluation is a match-level rollout.  Goals reset the field position
+    # while the match score and wall-clock horizon continue, so use the
+    # environment's in-match kickoff path instead of episode termination.
     env = VSSJumanjiEnv(
         opponent_policy="stationary",
         max_episode_steps=horizon,
         init_mode=config.init_mode,
+        terminate_on_goal=False,
     )
     model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
     template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))
@@ -249,6 +253,122 @@ def evaluate_experiment(
     evaluation_dir = Path(config.output_root) / config.experiment_name / "evaluations"
     evaluation_dir.mkdir(parents=True, exist_ok=True)
     target = evaluation_dir / f"evaluation_seed_{base_seed}.json"
+    if target.exists():
+        raise FileExistsError(f"evaluation output already exists: {target}")
+    target.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return target
+
+
+def evaluate_experiment_exhaustive_history(
+    config: ExperimentConfig,
+    lineage: int | None = None,
+    generation: int | None = None,
+    matches_per_snapshot: int | None = None,
+    seed: int | None = None,
+    batch_size: int = 32,
+) -> Path:
+    """Evaluate each final policy against every prior snapshot of its lineage."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    match_count = (
+        config.evaluation_matches
+        if matches_per_snapshot is None
+        else matches_per_snapshot
+    )
+    if match_count < 1:
+        raise ValueError("matches_per_snapshot must be at least 1")
+    base_seed = config.seed + 10_000_000 if seed is None else seed
+    lineages = range(config.num_lineages) if lineage is None else (lineage,)
+    if any(value < 0 or value >= config.num_lineages for value in lineages):
+        raise ValueError("lineage index is outside the configured experiment")
+
+    horizon = int(round(config.evaluation_seconds * sim_config.FPS))
+    # Keep the same match-level semantics as the regular evaluator: a goal
+    # triggers a kickoff, but does not end the 120-second match rollout.
+    env = VSSJumanjiEnv(
+        opponent_policy="stationary",
+        max_episode_steps=horizon,
+        init_mode=config.init_mode,
+        terminate_on_goal=False,
+    )
+    model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
+    template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))
+    output_records = []
+
+    for lineage_id in lineages:
+        archive = SnapshotArchive(config.output_root, config.experiment_name, lineage_id)
+        snapshots = archive.list_snapshots()
+        if not snapshots:
+            raise FileNotFoundError(f"no snapshots for lineage {lineage_id}")
+        current_metadata = (
+            next((item for item in snapshots if item["generation"] == generation), None)
+            if generation is not None
+            else snapshots[-1]
+        )
+        if current_metadata is None:
+            raise FileNotFoundError(
+                f"no generation {generation} for lineage {lineage_id}"
+            )
+        current_generation = int(current_metadata["generation"])
+        current_params = archive.load(
+            template,
+            current_generation,
+            expected_hidden_sizes=config.hidden_sizes,
+        )
+        historical = [
+            item for item in snapshots if item["generation"] < current_generation
+        ]
+        if not historical:
+            historical = [current_metadata]
+        if config.active_pool_limit is not None:
+            historical = historical[-config.active_pool_limit :]
+        historical_generations = [int(item["generation"]) for item in historical]
+        historical_params = [
+            archive.load(template, item, expected_hidden_sizes=config.hidden_sizes)
+            for item in historical_generations
+        ]
+
+        opponent_params = []
+        opponent_generations = []
+        for snapshot_generation, snapshot_params in zip(
+            historical_generations, historical_params
+        ):
+            opponent_params.extend([snapshot_params] * match_count)
+            opponent_generations.extend([snapshot_generation] * match_count)
+        result = _evaluate_group(
+            env,
+            model,
+            current_params,
+            opponent_params,
+            np.zeros(len(opponent_params), dtype=np.int32),
+            opponent_generations,
+            seed=base_seed + lineage_id * 1_000_000,
+            batch_size=batch_size,
+        )
+        output_records.append(
+            {
+                "lineage": lineage_id,
+                "generation": current_generation,
+                "opponent_type": "history_exhaustive",
+                "matches_per_snapshot": match_count,
+                "opponent_generations": historical_generations,
+                "summary": result["summary"],
+                "matches": result["matches"],
+            }
+        )
+
+    result = {
+        "experiment_name": config.experiment_name,
+        "evaluation_mode": "exhaustive_history",
+        "evaluation_seconds": config.evaluation_seconds,
+        "control_steps": horizon,
+        "matches_per_snapshot": match_count,
+        "seed": base_seed,
+        "results": output_records,
+    }
+    evaluation_dir = Path(config.output_root) / config.experiment_name / "evaluations"
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
+    target = evaluation_dir / f"evaluation_exhaustive_history_seed_{base_seed}.json"
     if target.exists():
         raise FileExistsError(f"evaluation output already exists: {target}")
     target.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
