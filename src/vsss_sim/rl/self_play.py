@@ -90,6 +90,7 @@ class ExperimentConfig:
     active_pool_limit: int | None = None
     max_episode_steps: int = 300
     init_mode: str = "kickoff"
+    reward_profile: str = "default"
     output_root: str = "output/experiments"
     evaluation_matches: int = 100
     evaluation_seconds: int = 120
@@ -118,6 +119,8 @@ class ExperimentConfig:
             raise ValueError("active_pool_limit must be at least 1 when provided")
         if self.init_mode not in ("kickoff", "random"):
             raise ValueError("init_mode must be 'kickoff' or 'random'")
+        if self.reward_profile not in ("default", "brandao_2022"):
+            raise ValueError("reward_profile must be 'default' or 'brandao_2022'")
         # Reuse the trainer's validation before initializing a device or allocating state.
         self.ppo_config()
 
@@ -279,6 +282,7 @@ def _make_env(config: ExperimentConfig) -> Any:
         opponent_policy="stationary",
         max_episode_steps=config.max_episode_steps,
         init_mode=InitMode(config.init_mode),
+        reward_profile=config.reward_profile,
     )
 
 

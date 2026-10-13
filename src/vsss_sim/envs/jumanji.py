@@ -86,6 +86,65 @@ def _crowding_penalty(simulation: physics.SimState) -> jax.Array:
     return count * jnp.float32(config.GOAL_AREA_CROWDING_PENALTY)
 
 
+def _angle_reward(point_a: jax.Array, vertex: jax.Array, point_c: jax.Array) -> jax.Array:
+    """Return the paper's normalized angle term, in [-1, 0]."""
+    vector_a = point_a - vertex
+    vector_c = point_c - vertex
+    norm_product = jnp.linalg.norm(vector_a) * jnp.linalg.norm(vector_c)
+    cosine = jnp.sum(vector_a * vector_c) / jnp.maximum(norm_product, 1e-8)
+    angle = jnp.arccos(jnp.clip(cosine, -1.0, 1.0))
+    return angle / jnp.pi - 1.0
+
+
+def _brandao_2022_reward(
+    simulation: physics.SimState,
+    ball_before: jax.Array,
+    goal: jax.Array,
+    step_count: jax.Array,
+    max_episode_steps: int,
+) -> jax.Array:
+    """Brandao et al. (2022), Eq. (6)-(16), from blue's team perspective.
+
+    The simulator returns one shared team reward, so robot-specific offensive
+    and defensive terms are averaged over the three blue robots.
+    """
+    ball_after = simulation.ball[:2]
+    blue_robots = simulation.robots[config.TEAM_BLUE]
+    blue_positions = blue_robots[:, :2]
+    half_length = jnp.float32(config.FIELD_LENGTH / 2.0)
+    opponent_goal = jnp.asarray([half_length, 0.0], dtype=jnp.float32)
+    own_goal = jnp.asarray([-half_length, 0.0], dtype=jnp.float32)
+
+    # Positive when the ball moves closer to the opponent goal; stationary
+    # motion receives the paper's -0.05 offset before normalization.
+    distance_before = jnp.linalg.norm(ball_before[:2] - opponent_goal)
+    distance_after = jnp.linalg.norm(ball_after - opponent_goal)
+    speed_signal = (distance_before - distance_after - 0.05) / 0.14
+    speed_reward = jnp.clip(speed_signal, -1.0, 1.0)
+
+    nearest_distance = jnp.min(jnp.linalg.norm(blue_positions - ball_after, axis=-1))
+    proximity_reward = -jnp.minimum(nearest_distance, 1.0)
+
+    offensive_rewards = jax.vmap(
+        lambda robot: _angle_reward(robot, ball_after, opponent_goal)
+    )(blue_positions)
+    defensive_rewards = jax.vmap(
+        lambda robot: _angle_reward(ball_after, robot, own_goal)
+    )(blue_positions)
+    continuous_reward = (
+        0.7 * speed_reward
+        + 0.1 * proximity_reward
+        + 0.1 * jnp.mean(offensive_rewards)
+        + 0.1 * jnp.mean(defensive_rewards)
+    )
+
+    horizon = jnp.float32(max_episode_steps)
+    goal_reward = 10.0 * goal.astype(jnp.float32) * (
+        1.0 + (horizon - step_count.astype(jnp.float32)) / horizon
+    )
+    return jnp.where(goal != 0, goal_reward, continuous_reward).astype(jnp.float32)
+
+
 class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
     """Single-agent VSSS match exposed through Jumanji's pure JAX API.
 
@@ -99,6 +158,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         opponent_policy: str = "stationary",
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         init_mode: InitMode | str = InitMode.KICKOFF,
+        reward_profile: str = "default",
     ) -> None:
         if opponent_policy not in ("stationary", "random"):
             raise ValueError(
@@ -107,9 +167,12 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             )
         if max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
+        if reward_profile not in ("default", "brandao_2022"):
+            raise ValueError("reward_profile must be 'default' or 'brandao_2022'")
 
         self.opponent_policy = opponent_policy
         self.max_episode_steps = int(max_episode_steps)
+        self.reward_profile = reward_profile
         self.init_mode = InitMode(init_mode)
         self._reset_simulation = (
             physics.reset_kickoff
@@ -198,16 +261,25 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             fresh = physics.reset_kickoff(kickoff_key)
             return fresh._replace(score=scored_simulation.score, t=scored_simulation.t)
 
-        simulation = jax.lax.cond(goal != 0, kickoff, lambda sim: sim, simulation)
         step_count = state.step_count + jnp.int32(1)
-        next_state = State(simulation=simulation, key=next_key, step_count=step_count)
+        if self.reward_profile == "brandao_2022":
+            reward = _brandao_2022_reward(
+                simulation,
+                state.simulation.ball,
+                goal,
+                step_count,
+                self.max_episode_steps,
+            )
+        else:
+            reward = (
+                goal.astype(jnp.float32)
+                + jnp.float32(config.BALL_FORWARD_REWARD_COEF)
+                * (ball_x_after - ball_x_before)
+                + _crowding_penalty(simulation)
+            )
 
-        reward = (
-            goal.astype(jnp.float32)
-            + jnp.float32(config.BALL_FORWARD_REWARD_COEF)
-            * (ball_x_after - ball_x_before)
-            + _crowding_penalty(simulation)
-        )
+        simulation = jax.lax.cond(goal != 0, kickoff, lambda sim: sim, simulation)
+        next_state = State(simulation=simulation, key=next_key, step_count=step_count)
         observation = build_observation(simulation)
         extras = {
             "goal": goal,

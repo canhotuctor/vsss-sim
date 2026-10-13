@@ -139,6 +139,7 @@ def evaluate_experiment(
         opponent_policy="stationary",
         max_episode_steps=horizon,
         init_mode=config.init_mode,
+        reward_profile=config.reward_profile,
     )
     model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
     template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))

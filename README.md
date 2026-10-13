@@ -90,10 +90,13 @@ remain on the JAX device.
 python scripts/train_jax.py \
     --generations 30 \
     --num-envs 256 \
-    --rollout-length 128
+    --rollout-length 128 \
+    --symmetry all
 ```
 
 Use `--opponent random --init-mode random` for the randomized starting setup.
+`--symmetry reflection|permutation|all` enables episode-level, on-policy
+augmentation (the default is `none`, which provides the ablation baseline).
 All generations execute in one compiled `lax.scan`. The script reports
 initialization, compilation, and device execution times separately.
 
