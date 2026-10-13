@@ -61,25 +61,21 @@ pytest -m cuda
 Expected: `4 passed`. These tests verify GPU placement, the JIT'd step on
 GPU, CPU↔GPU parity within `atol=1e-3`, and the `vmap`'d batched step.
 
-A full `pytest` run on Ubuntu should report:
-
-```
-138 passed
-```
-
-(The four CUDA tests skipped on a CPU-only machine are active on Ubuntu.)
+A full `pytest` run should pass; CUDA-marked tests are skipped on machines
+without a CUDA-capable JAX device.
 
 ## Capture benchmark numbers
 
 ```bash
-python scripts/bench_backends.py --sb3 | tee bench-ubuntu-cuda.txt
+python scripts/bench_backends.py --device gpu | tee bench-ubuntu-cuda.txt
 ```
 
 Then fold the relevant rows into:
 
 - `docs/vsss-sim-progress-2026-05.md` — the "Measured throughput" table gets
-  new rows for `JAX vmap batch=256 (CUDA)`, `VSSVecEnv batch=256 (CUDA)`,
-  and the SB3 PPO numbers at `num_envs=256` on CUDA.
+  new rows for `JAX vmap batch=256 (CUDA)` and
+  `VSSVecEnv batch=256 (CUDA)`. Use `scripts/bench_self_play.py` to measure
+  end-to-end native-JAX PPO throughput and memory use.
 - `CLAUDE.md` — strike through / replace the "Open threads → CUDA on Ubuntu"
   bullet with measured results.
 

@@ -7,7 +7,6 @@ import vsss_sim  # noqa: F401 — registers VSSS-v0
 from vsss_sim import config
 from vsss_sim.envs import VSSVecEnv
 
-
 # ---------------------------------------------------------------------------
 # Spaces & basic shape
 # ---------------------------------------------------------------------------
@@ -120,6 +119,33 @@ class TestStep:
         assert np.all(info["goal"] == 0)
         assert rewards[0] > 0.0
         assert rewards[1] < 0.0
+        e.close()
+
+    def test_brandao_goal_reward_uses_remaining_horizon_and_kicks_off(self):
+        import jax.numpy as jnp
+
+        e = VSSVecEnv(
+            num_envs=2,
+            max_episode_steps=5,
+            opponent_policy="stationary",
+            reward_profile="brandao_reward",
+        )
+        e.reset(seed=0)
+        balls = e._state.ball.at[0].set(
+            jnp.asarray(
+                [config.FIELD_LENGTH / 2.0 + 0.02, 0.0, 0.05, 0.0],
+                dtype=jnp.float32,
+            )
+        )
+        e._state = e._state._replace(ball=balls)
+
+        obs, rewards, _, _, info = e.step(np.zeros((2, 6), dtype=np.float32))
+
+        assert info["goal"][0] == 1
+        assert rewards[0] == pytest.approx(18.0)
+        assert int(e._state.score[0, config.TEAM_BLUE]) == 1
+        np.testing.assert_allclose(obs, e.current_obs())
+        assert abs(float(e._state.ball[0, 0])) < 0.1
         e.close()
 
 

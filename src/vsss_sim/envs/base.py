@@ -14,14 +14,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .. import config, physics
-
-# ---------------------------------------------------------------------------
-# Normalisation constants
-# ---------------------------------------------------------------------------
-_NORM_POS_X = config.FIELD_LENGTH / 2.0
-_NORM_POS_Y = config.FIELD_WIDTH / 2.0
-_NORM_VEL = config.ROBOT_MAX_WHEEL_SPEED * config.VELOCITY_NORM_HEADROOM
-_NORM_OMEGA = _NORM_VEL / (config.ROBOT_WHEELBASE / 2.0)
+from .match_rules import build_observation
 
 # Observation index helpers
 OBS_BALL_SLICE = slice(0, 4)
@@ -92,32 +85,7 @@ class VSSBaseEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         """Return a normalised flat observation vector."""
-        s = self._state
-        ball = np.asarray(s.ball)
-        robots = np.asarray(s.robots)
-        obs = np.empty(4 + config.N_TEAMS * config.N_ROBOTS * 7, dtype=np.float32)
-
-        # Ball
-        obs[0] = ball[0] / _NORM_POS_X
-        obs[1] = ball[1] / _NORM_POS_Y
-        obs[2] = ball[2] / _NORM_VEL
-        obs[3] = ball[3] / _NORM_VEL
-
-        # Robots (both teams, blue first)
-        idx = 4
-        for team in range(config.N_TEAMS):
-            for r in range(config.N_ROBOTS):
-                x, y, theta, vx, vy, omega = robots[team, r]
-                obs[idx + 0] = x / _NORM_POS_X
-                obs[idx + 1] = y / _NORM_POS_Y
-                obs[idx + 2] = float(np.sin(theta))
-                obs[idx + 3] = float(np.cos(theta))
-                obs[idx + 4] = vx / _NORM_VEL
-                obs[idx + 5] = vy / _NORM_VEL
-                obs[idx + 6] = omega / _NORM_OMEGA
-                idx += 7
-
-        return obs
+        return np.array(build_observation(self._state), dtype=np.float32, copy=True)
 
     def _get_info(self) -> dict[str, Any]:
         score = np.asarray(self._state.score)

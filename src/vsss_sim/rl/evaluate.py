@@ -143,6 +143,7 @@ def evaluate_experiment(
         max_episode_steps=horizon,
         init_mode=config.init_mode,
         terminate_on_goal=False,
+        reward_profile=config.reward_profile,
     )
     model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
     template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))
@@ -245,6 +246,7 @@ def evaluate_experiment(
 
     result = {
         "experiment_name": config.experiment_name,
+        "reward_profile": config.reward_profile,
         "evaluation_seconds": config.evaluation_seconds,
         "control_steps": horizon,
         "seed": base_seed,
@@ -290,6 +292,7 @@ def evaluate_experiment_exhaustive_history(
         max_episode_steps=horizon,
         init_mode=config.init_mode,
         terminate_on_goal=False,
+        reward_profile=config.reward_profile,
     )
     model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
     template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))
@@ -359,6 +362,7 @@ def evaluate_experiment_exhaustive_history(
 
     result = {
         "experiment_name": config.experiment_name,
+        "reward_profile": config.reward_profile,
         "evaluation_mode": "exhaustive_history",
         "evaluation_seconds": config.evaluation_seconds,
         "control_steps": horizon,

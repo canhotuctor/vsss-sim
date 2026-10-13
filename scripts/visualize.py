@@ -1,165 +1,155 @@
 #!/usr/bin/env python3
-"""
-Visualize a trained policy — load a saved SB3 model and roll out a few episodes
-with the pygame renderer. No training happens here.
-
-Usage
------
-    python scripts/visualize.py path/to/policy.zip
-    python scripts/visualize.py path/to/policy.zip --episodes 5 --fps 30
-    python scripts/visualize.py path/to/policy.zip --opponent random --seed 7
-
-The model file is the ``policy.zip`` produced by ``scripts/train.py`` (logged
-to MLflow under ``model/policy.zip``). Pass the local path to that artifact.
-"""
-
+"""Render episodes using a policy snapshot produced by native JAX PPO."""
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
-import gymnasium as gym
+import jax
+import jax.numpy as jnp
 import numpy as np
-from stable_baselines3 import PPO
+from flax import serialization
 
-import vsss_sim  # noqa: F401 — registers "VSSS-v0"
 from vsss_sim import config
-from vsss_sim.config import InitMode
+from vsss_sim.config import InitMode, RewardProfile
+from vsss_sim.envs import VSSEnv
+from vsss_sim.rl.ppo import ActorCritic
 
 
-def main(
-    model_path: Path,
-    episodes: int,
-    fps: float | None,
-    opponent: str,
-    seed: int,
-    deterministic: bool,
-    max_episode_steps: int | None,
-    init_mode: str | None,
-) -> None:
-    if not model_path.exists():
-        raise FileNotFoundError(f"model artifact not found: {model_path}")
+def load_snapshot(snapshot_path: Path):
+    """Load parameters and their experiment settings from an archived snapshot."""
+    if not snapshot_path.is_file():
+        raise FileNotFoundError(f"policy snapshot not found: {snapshot_path}")
 
-    print(f"loading model: {model_path}")
-    model = PPO.load(str(model_path), device="cpu")
+    metadata_path = snapshot_path.with_suffix(".json")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"snapshot metadata not found: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("schema_version") != 1:
+        raise ValueError(f"unsupported snapshot schema in {metadata_path}")
+    if metadata.get("artifact") != snapshot_path.name:
+        raise ValueError(f"snapshot metadata artifact does not match {snapshot_path.name}")
 
-    env_kwargs: dict = {
-        "opponent_policy": opponent,
-        "render_mode": "human",
-        "render_fps": fps,
-    }
-    if max_episode_steps is not None:
-        env_kwargs["max_episode_steps"] = max_episode_steps
-    if init_mode is not None:
-        env_kwargs["init_mode"] = init_mode
+    experiment_path = snapshot_path.parents[2] / "config.json"
+    if not experiment_path.is_file():
+        raise FileNotFoundError(f"experiment config not found: {experiment_path}")
+    experiment_config = json.loads(experiment_path.read_text(encoding="utf-8"))
 
-    env = gym.make("VSSS-v0", **env_kwargs)
-    print(
-        f"running {episodes} episode(s) — opponent={opponent}, "
-        f"init={init_mode or 'kickoff'}, "
-        f"deterministic={deterministic}"
+    model = ActorCritic(
+        action_size=int(metadata["action_size"]),
+        hidden_sizes=tuple(int(size) for size in metadata["hidden_sizes"]),
     )
-
-    try:
-        ep_rewards: list[float] = []
-        ep_lengths: list[int] = []
-        ep_goals: list[tuple[int, int]] = []  # (blue_goals, yellow_goals)
-
-        for ep in range(1, episodes + 1):
-            obs, _info = env.reset(seed=seed + ep)
-            total_reward = 0.0
-            steps = 0
-            blue_goals = 0
-            yellow_goals = 0
-            done = False
-
-            while not done:
-                action, _ = model.predict(obs, deterministic=deterministic)
-                obs, reward, terminated, truncated, info = env.step(action)
-                total_reward += float(reward)
-                steps += 1
-                g = int(info.get("goal", 0))
-                if g == 1:
-                    blue_goals += 1
-                elif g == -1:
-                    yellow_goals += 1
-                done = bool(terminated or truncated)
-
-            ep_rewards.append(total_reward)
-            ep_lengths.append(steps)
-            ep_goals.append((blue_goals, yellow_goals))
-            print(
-                f"  episode {ep:>2}: reward={total_reward:+.3f}  "
-                f"length={steps}  score(blue:yellow)={blue_goals}:{yellow_goals}"
-            )
-
-        print(
-            f"\nsummary over {episodes} episode(s): "
-            f"mean reward={np.mean(ep_rewards):+.3f}  "
-            f"mean length={np.mean(ep_lengths):.0f}  "
-            f"goals blue:yellow="
-            f"{sum(b for b, _ in ep_goals)}:{sum(y for _, y in ep_goals)}"
-        )
-    finally:
-        env.close()
+    dummy_observation = jnp.zeros((int(metadata["observation_size"]),), dtype=jnp.float32)
+    template = model.init(jax.random.PRNGKey(0), dummy_observation)
+    params = serialization.from_bytes(template, snapshot_path.read_bytes())
+    return model, params, metadata, experiment_config
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualize a trained VSSS policy")
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "model",
+        "snapshot",
         type=Path,
-        help="Path to the saved SB3 model (.zip), e.g. mlruns/<exp>/<run>/artifacts/model/policy.zip",
+        help="JAX snapshot .msgpack file, e.g. output/experiments/<name>/lineage_000/snapshots/generation_00000010.msgpack",
     )
-    parser.add_argument("--episodes", type=int, default=10, help="Number of episodes to roll out (default: 10).")
+    parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument(
         "--fps",
         type=float,
         default=config.FPS,
-        help=f"Render FPS cap (default: {config.FPS:g} = sim rate, real-time playback; "
-             "pass 0 for uncapped).",
+        help=f"Render FPS cap (default: {config.FPS:g}; pass 0 for uncapped).",
     )
     parser.add_argument(
-        "--opponent",
-        type=str,
-        default="stationary",
-        choices=["stationary", "random"],
-        help="Opponent policy for the yellow team (default: stationary).",
+        "--opponent", choices=("stationary", "random"), default="stationary"
     )
-    parser.add_argument("--seed", type=int, default=42, help="Base RNG seed (offset per episode).")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--stochastic", action="store_true")
+    parser.add_argument("--max-episode-steps", type=int)
+    parser.add_argument("--init-mode", choices=tuple(mode.value for mode in InitMode))
     parser.add_argument(
-        "--stochastic",
-        action="store_true",
-        help="Sample from the policy distribution instead of taking the deterministic action.",
-    )
-    parser.add_argument(
-        "--max-episode-steps",
-        type=int,
-        default=None,
-        help="Episode length cap in 15 Hz control steps (e.g. 75 = 5 s; "
-             "each control step contains four 60 Hz physics substeps). "
-             f"Defaults to config.MAX_EPISODE_STEPS ({config.MAX_EPISODE_STEPS} = "
-             f"{config.MAX_EPISODE_STEPS / config.FPS:.0f} s).",
-    )
-    parser.add_argument(
-        "--init-mode",
-        type=str,
-        default=None,
-        choices=[m.value for m in InitMode],
-        help="Robot/ball placement strategy at episode reset. "
-             "'kickoff' (default) uses the standard formation; "
-             "'random' places robots uniformly in their respective halves.",
+        "--reward-profile", choices=tuple(profile.value for profile in RewardProfile)
     )
     args = parser.parse_args()
+    if args.episodes < 1:
+        parser.error("episodes must be positive")
+    if args.max_episode_steps is not None and args.max_episode_steps < 1:
+        parser.error("max-episode-steps must be positive")
 
-    fps = None if args.fps == 0 else args.fps
-    main(
-        model_path=args.model,
-        episodes=args.episodes,
-        fps=fps,
-        opponent=args.opponent,
-        seed=args.seed,
-        deterministic=not args.stochastic,
-        max_episode_steps=args.max_episode_steps,
-        init_mode=args.init_mode,
+    model, params, metadata, experiment_config = load_snapshot(args.snapshot)
+    max_episode_steps = (
+        args.max_episode_steps
+        if args.max_episode_steps is not None
+        else experiment_config.get("max_episode_steps", config.MAX_EPISODE_STEPS)
     )
+    init_mode = args.init_mode or experiment_config.get("init_mode", InitMode.KICKOFF.value)
+    reward_profile = args.reward_profile or experiment_config.get(
+        "reward_profile", RewardProfile.DEFAULT.value
+    )
+    fps = None if args.fps == 0 else args.fps
+    env = VSSEnv(
+        opponent_policy=args.opponent,
+        render_mode="human",
+        render_fps=fps,
+        max_episode_steps=max_episode_steps,
+        init_mode=init_mode,
+        reward_profile=reward_profile,
+    )
+    key = jax.random.PRNGKey(args.seed)
+
+    def action_for(observation: np.ndarray) -> np.ndarray:
+        nonlocal key
+        mean, log_std, _ = model.apply(params, jnp.asarray(observation, dtype=jnp.float32))
+        raw_action = mean
+        if args.stochastic:
+            key, sample_key = jax.random.split(key)
+            raw_action = mean + jnp.exp(log_std) * jax.random.normal(sample_key, mean.shape)
+        return np.asarray(jax.device_get(jnp.tanh(raw_action)), dtype=np.float32)
+
+    print(
+        f"snapshot generation={metadata['generation']} lineage={metadata['lineage']} "
+        f"— opponent={args.opponent}, init={init_mode}, stochastic={args.stochastic}"
+    )
+    episode_rewards: list[float] = []
+    episode_lengths: list[int] = []
+    goals_blue = goals_yellow = 0
+    try:
+        for episode in range(1, args.episodes + 1):
+            observation, _ = env.reset(seed=args.seed + episode)
+            reward_total = 0.0
+            steps = 0
+            score_blue = score_yellow = 0
+            done = False
+            while not done:
+                observation, reward, terminated, truncated, info = env.step(
+                    action_for(observation)
+                )
+                reward_total += float(reward)
+                steps += 1
+                goal = int(info.get("goal", 0))
+                goals_blue += goal == 1
+                goals_yellow += goal == -1
+                score_blue = int(info["score_blue"])
+                score_yellow = int(info["score_yellow"])
+                done = bool(terminated or truncated)
+
+            episode_rewards.append(reward_total)
+            episode_lengths.append(steps)
+            print(
+                f"  episode {episode:>2}: reward={reward_total:+.3f} "
+                f"length={steps} score(blue:yellow)="
+                f"{score_blue}:{score_yellow}"
+            )
+    finally:
+        env.close()
+
+    print(
+        f"\nsummary over {args.episodes} episode(s): "
+        f"mean reward={np.mean(episode_rewards):+.3f} "
+        f"mean length={np.mean(episode_lengths):.0f} "
+        f"goals blue:yellow={goals_blue}:{goals_yellow}"
+    )
+
+
+if __name__ == "__main__":
+    main()

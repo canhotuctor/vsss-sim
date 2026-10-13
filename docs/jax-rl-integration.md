@@ -13,7 +13,7 @@ This keeps the dependency set focused on JAX, Flax, and Optax.
 action)` interface. Environment state, observation construction, opponent
 actions, reward shaping, goal kickoffs, scoring, and episode truncation all
 remain in JAX. A trainer can therefore compile and vectorize the complete
-rollout without the Gymnasium, NumPy, or PyTorch boundaries.
+rollout without Gymnasium or NumPy host transfers.
 
 ## Alternatives
 
@@ -22,7 +22,6 @@ rollout without the Gymnasium, NumPy, or PyTorch boundaries.
 | PureJaxRL-style local PPO | Best fit | Minimal JAX/Flax/Optax dependencies, fully compiled, easy to specialize for VSSS | The project owns correctness tests, checkpoints, and experiment tooling |
 | [Stoix](https://github.com/EdanToledo/Stoix) | Best algorithm reference | Broad single-agent algorithm set, Anakin end-to-end JAX design, Jumanji-native | Explicitly not designed as an importable library; clone-and-adapt workflow and heavier Hydra configuration |
 | [PureJaxRL](https://github.com/luchris429/purejaxrl) | Best execution reference | Small, understandable, fully compiled PPO | Not a library and intentionally single-file; adapt the pattern rather than add it as a dependency |
-| [SBX](https://github.com/araffin/sbx) | Migration fallback | Familiar SB3 API with JAX policy updates and several continuous algorithms | Gymnasium environment boundary remains, so it does not unlock the raw JAX physics ceiling |
 | [Mava](https://github.com/instadeepai/mava) | Future MARL path | End-to-end JAX IPPO/MAPPO and CTDE support, including continuous environments | Premature while the blue team is modeled as one centralized six-dimensional agent; also clone-oriented |
 | [JaxMARL](https://github.com/FLAIROx/JaxMARL) | Future environment API/reference | Packaged environment API and standard IPPO/MAPPO baselines | Its published compatibility currently trails this repo's JAX version, and integration is more natural after exposing robots as separate agents |
 | [Brax training](https://github.com/google/brax) | Rejected | Maintained and fast PPO/SAC implementations | The package pulls MuJoCo/MJX and a large simulation stack that this project does not need |

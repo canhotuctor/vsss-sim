@@ -3,6 +3,10 @@
 > Historical benchmark: the NumPy comparison below records the May 2026
 > implementation. That physics implementation was removed on 2026-08-19; the
 > current simulator uses JAX exclusively for physics.
+> The Stable-Baselines3 results in this report are historical comparisons; the
+> adapter and runtime training scripts have since been removed in favor of native JAX PPO.
+> The benchmark command below records the old script revision and is not
+> runnable with the current `scripts/perf_bench.py` interface.
 
 **Date:** 2026-05-31  
 **Platform:** macOS 15.7.7 · Apple M4 Pro · arm64  

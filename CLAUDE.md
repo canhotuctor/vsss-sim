@@ -33,90 +33,49 @@ See `~/dev/personal/docs/ssl-vs-vsss.md` in the Obsidian vault for the longer wr
 
 ## Hardware targets
 
-Code must run on both:
-- **Ubuntu laptop with NVIDIA RTX 3060** — primary target for GPU training
-- **Mac M4 Pro (Apple Silicon)** — primary dev machine; can fall back to slower CPU backends if Mac GPU support isn't available
-
-When picking GPU libraries, prefer cross-platform (JAX with Metal, PyTorch MPS) over CUDA-exclusive (Isaac Gym) unless the user confirms Ubuntu-only is acceptable.
+Code targets macOS development and Ubuntu with an NVIDIA GPU. Training and physics use JAX;
+install the CUDA extra on supported Linux machines when GPU execution is needed.
 
 ## Repo layout
 
 ```
 vsss-sim/
 ├── src/vsss_sim/
-│   ├── __init__.py        # registers VSSS-v0
-│   ├── config.py          # IEEE VSSS constants
-│   ├── agents/            # stationary.py, random.py (pluggable opponents)
-│   ├── envs/              # base.py, vsss_3v3.py (VSSEnv), vsss_vec.py (VSSVecEnv)
-│   ├── physics/           # numpy_backend.py + jax_backend.py (resolver in __init__.py)
-│   └── rendering/         # pygame.py
-├── tests/
-│   ├── agents/
-│   ├── envs/test_env.py
-│   ├── physics/test_physics.py
-│   └── test_config.py
-├── scripts/
-│   ├── smoke.py           # quick run with --render, --timesteps, --fps
-│   └── train.py           # MLflow-tracked training
-├── mlruns/                # MLflow artifacts
-├── mlflow.db              # MLflow SQLite backend
+│   ├── config.py          # field, timing, initialization, reward profiles
+│   ├── envs/              # Gymnasium single/vector and Jumanji interfaces
+│   ├── physics/           # pure-functional JAX engine
+│   ├── rl/                # Flax/Optax PPO, snapshots, self-play, evaluation
+│   └── rendering/         # Pygame rendering
+├── configs/experiments/   # serializable native-JAX experiment profiles
+├── tests/                 # environment, rules, physics, CUDA, and PPO tests
+├── scripts/               # JAX training, evaluation, visualization, benchmarks
 ├── pyproject.toml
 └── requirements.txt
 ```
 
-Last known test state: 173/173 passing (numpy + jax backends + VSSVecEnv + SB3 adapter + random init).
-
 ## Environment setup
-
-Python 3.14 venv at `.venv/`. On Mac, pygame needs SDL2 from Homebrew (`brew install sdl2 sdl2_image sdl2_mixer sdl2_ttf`).
 
 ```bash
 source .venv/bin/activate
-pip install -e ".[dev,render]"     # includes pytest, ruff, pygame
-# optional extras: [gpu] for torch, [jax] for the JAX physics backend
-pytest                              # run tests
-python scripts/smoke.py --render    # visual smoke test (numpy)
-python scripts/smoke.py --backend jax   # smoke test on the JAX backend
-python scripts/bench_backends.py    # numpy vs JAX vs VSSVecEnv throughput
-python scripts/train.py             # MLflow-tracked training
+pip install -e ".[dev,render,jax-rl]"
+pytest
+python scripts/smoke.py
+python scripts/train_jax.py --xp experiment26_brandao_reward
+python scripts/evaluate_jax.py --xp experiment26_brandao_reward --lineage 0
 ```
 
-The active physics backend can also be set via the `VSSS_PHYSICS_BACKEND`
-environment variable (`numpy` or `jax`); the `backend=` kwarg on `VSSEnv` /
-`gym.make("VSSS-v0", backend=...)` overrides the env var.
+The Gymnasium environments support interactive use and external clients. Training uses the
+Jumanji environment and the repository's native Flax/Optax PPO implementation. To inspect a
+saved experiment policy, pass a `.msgpack` snapshot to `scripts/visualize.py`.
 
-For batched training-throughput envs:
-
-```python
-import gymnasium as gym
-import vsss_sim  # noqa: F401 — registers VSSS-v0
-
-envs = gym.make_vec(
-    "VSSS-v0", num_envs=256, vectorization_mode="vector_entry_point",
-)
-obs, info = envs.reset(seed=0)            # obs: (256, 46) float32
-obs, rew, term, trunc, info = envs.step(envs.action_space.sample())
-```
-
-Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256, ...)`.
-
-For SB3 (PPO etc.) with batched physics, use the adapter:
-
-```python
-from stable_baselines3 import PPO
-from vsss_sim.envs import VSSVecEnv
-from vsss_sim.sb3_adapter import VSSVecEnvToSB3
-
-env = VSSVecEnvToSB3(VSSVecEnv(num_envs=256, opponent_policy="stationary"))
-model = PPO("MlpPolicy", env, n_steps=128, verbose=1)
-model.learn(total_timesteps=1_000_000)
-```
-
-Or via `scripts/smoke.py --num-envs 256 --timesteps 50000`.
-
-`pyproject.toml` uses ruff (`line-length=100`), pytest configured for `tests/`.
+The active physics implementation is JAX-only. CUDA device selection can be forced for benchmark
+scripts with `--device cpu` or `--device gpu`.
 
 ## What's been built (chronological)
+
+> Entries below are historical and may describe retired code paths. Use the setup and entry
+> points above for the current workflow.
+
 
 1. Initial scaffolding — venv, pyproject extras, src layout, Gymnasium registration.
 2. Branch rename `main` → `master` (local + GitHub default + `origin/HEAD`).
@@ -127,11 +86,9 @@ Or via `scripts/smoke.py --num-envs 256 --timesteps 50000`.
 7. MLflow callback changed to log **per-episode** metrics instead of per-step (commit `40fc902`).
 8. **Switchable physics backends**: `physics/__init__.py` resolver picks between `numpy_backend.py` and `jax_backend.py`. JAX backend is a pure-functional mirror — `SimState` as a `NamedTuple` PyTree, `step()` is `jax.jit`-compiled with `lax.fori_loop` substeps and `vmap`-ready shapes. Parity tested vs the NumPy backend within `atol=1e-3` for positions.
 9. **Batched `VSSVecEnv`** (Gymnasium `VectorEnv`): runs `num_envs` matches in parallel via `jit(vmap(jb.step))` over a single batched `SimState`. Registered as the `vector_entry_point` for `VSSS-v0` so `gym.make_vec("VSSS-v0", num_envs=N, vectorization_mode="vector_entry_point")` returns one. `NEXT_STEP` autoreset on truncation; goals trigger in-episode kickoffs (no step-counter reset). Bench at batch=256 on Mac M4 Pro CPU: ~111k env-steps/sec via wrapper, ~303k via raw `jax.vmap` — gap is the Gymnasium boundary overhead.
-10. **SB3 ↔ VSSVecEnv adapter** (`src/vsss_sim/sb3_adapter.py::VSSVecEnvToSB3`): translates between SB3's `VecEnv` interface and `VSSVecEnv`'s Gymnasium `VectorEnv`. Bridges (a) `reset()` returning only obs, (b) `step → (obs, rewards, dones, list[dict])` with `dones = term|trunc`, (c) eager auto-reset with `terminal_observation` and `episode={"r","l","t"}` per SB3 convention. `scripts/smoke.py` gained `--num-envs N` that routes through the adapter.
+10. A former adapter connected the Gymnasium vector environment to an external PPO trainer. It
+    was retired after the native JAX training path was implemented.
 
-    **Wall-clock training speedup on Mac M4 Pro CPU** (default PPO hyperparams, `n_steps=512`):
-    - Rollout collection alone: **~60×** (from JAX batched physics).
-    - Full PPO cycle (rollout + gradient update): **~4-8×** end-to-end — Amdahl: PyTorch CPU gradient updates become the new bottleneck (~25 s per 131k-sample rollout). The 60× rollout speedup applies to ~70% of the wall-clock, the rest is gradient. GPU (PR 4) and JAX-native RL (PR 5) are the paths to recover the remaining gap. `scripts/bench_backends.py --sb3` reports the cumulative fps; `n_steps=32` config gets close to the rollout ceiling.
 
 11. **CUDA support on Ubuntu RTX 3060** — JAX 0.6.2 + `jax[cuda12]`, driver 580. GPU verified: 909k env-steps/sec at batch=1024 (raw physics ceiling). `scripts/check_gpu.py` for diagnostics; `--device gpu|cpu` flag on `bench_backends.py`; conditional CUDA test suite in `tests/physics/test_cuda.py`.
 
@@ -148,7 +105,7 @@ Or via `scripts/smoke.py --num-envs 256 --timesteps 50000`.
 ## Open threads / next directions
 
 - **CUDA on Ubuntu RTX 3060** ✓ — verified 2026-05-27; 909k fps at batch=1024.
-- **JAX-native RL libraries** — `purejaxrl`, `Stoix`, `JaxMARL`, `Brax` (env + RL), `RLax` (building blocks only). These would skip the Gymnasium + SB3 boundary entirely and recover the gap between VSSVecEnv (~92k fps batch=1024 on GPU) and raw vmap ceiling (~909k fps). Biggest win on GPU.
+- **Alternative JAX RL libraries** — `Stoix`, `JaxMARL`, and `RLax` remain references for future algorithm and multi-agent needs. The project already has a native Flax/Optax PPO trainer; benchmark it with `scripts/bench_self_play.py`.
 - **Simulator efficiency optimizations (PR 6, optional)** — profile and reduce the VSSVecEnv↔numpy boundary overhead. Candidates: batch obs construction in JAX before copy, fused autoreset, fewer Python calls per step.
 - **Selector init mode** — learned/heuristic model that outputs robot placement distributions; extend `InitMode` and wire a callable into `_batched_reset`.
 - **Pymunk backend** mentioned as a possible alternative once user evaluates it. Isaac Gym / PhysX explicitly deferred.

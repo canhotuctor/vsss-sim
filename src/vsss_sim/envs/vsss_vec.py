@@ -33,50 +33,17 @@ from gymnasium import spaces
 from gymnasium.vector import VectorEnv
 
 from .. import config, physics
-from ..config import InitMode
-
-# ---------------------------------------------------------------------------
-# Normalisation constants (mirror envs.base)
-# ---------------------------------------------------------------------------
-_NORM_POS_X = config.FIELD_LENGTH / 2.0
-_NORM_POS_Y = config.FIELD_WIDTH / 2.0
-_NORM_VEL = config.ROBOT_MAX_WHEEL_SPEED * config.VELOCITY_NORM_HEADROOM
-_NORM_OMEGA = _NORM_VEL / (config.ROBOT_WHEELBASE / 2.0)
+from ..config import InitMode, RewardProfile
+from .match_rules import MatchRules, MatchStepInput, build_observation
 
 
 def _build_obs_batched(state) -> jnp.ndarray:
     """Build a normalised (num_envs, 46) observation array from a batched SimState."""
-    ball = state.ball       # (B, 4)
-    robots = state.robots   # (B, N_TEAMS, N_ROBOTS, 6)
-    B = ball.shape[0]
-
-    obs_ball = jnp.stack([
-        ball[:, 0] / _NORM_POS_X,
-        ball[:, 1] / _NORM_POS_Y,
-        ball[:, 2] / _NORM_VEL,
-        ball[:, 3] / _NORM_VEL,
-    ], axis=-1)  # (B, 4)
-
-    flat = robots.reshape(B, config.N_TEAMS * config.N_ROBOTS, 6)  # (B, 6, 6)
-    x = flat[:, :, 0] / _NORM_POS_X
-    y = flat[:, :, 1] / _NORM_POS_Y
-    theta = flat[:, :, 2]
-    vx = flat[:, :, 3] / _NORM_VEL
-    vy = flat[:, :, 4] / _NORM_VEL
-    omega = flat[:, :, 5] / _NORM_OMEGA
-    per_robot = jnp.stack([x, y, jnp.sin(theta), jnp.cos(theta), vx, vy, omega], axis=-1)
-    # (B, 6, 7) → (B, 42)
-    obs_robots = per_robot.reshape(B, -1)
-    return jnp.concatenate([obs_ball, obs_robots], axis=-1).astype(jnp.float32)
+    return build_observation(state)
 
 
 def _export_obs(state) -> np.ndarray:
-    """JAX → numpy obs at the wrapper boundary.
-
-    Forces a **writable** copy. ``np.asarray`` on a JAX-on-CPU array returns
-    a read-only view, which makes downstream ``torch.as_tensor`` warn about
-    undefined behaviour. The copy is cheap (~num_envs × 46 × 4 bytes).
-    """
+    """Return writable NumPy observations at the Gymnasium interface."""
     return np.array(_build_obs_batched(state), dtype=np.float32, copy=True)
 
 
@@ -98,6 +65,7 @@ class VSSVecEnv(VectorEnv):
         opponent_policy: str | Callable = "stationary",
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         init_mode: InitMode | str = InitMode.KICKOFF,
+        reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
     ) -> None:
         super().__init__()
 
@@ -113,6 +81,11 @@ class VSSVecEnv(VectorEnv):
         self.max_episode_steps = max_episode_steps
         self._opponent_policy_spec: str | Callable = opponent_policy
         self._init_mode = InitMode(init_mode)
+        self._match_rules = MatchRules(
+            reward_profile=reward_profile,
+            max_episode_steps=max_episode_steps,
+            init_mode=self._init_mode,
+        )
 
         # Spaces
         obs_dim = 4 + config.N_TEAMS * config.N_ROBOTS * 7
@@ -137,6 +110,7 @@ class VSSVecEnv(VectorEnv):
         )
         self._batched_reset = jax.jit(jax.vmap(_reset_fn))
         self._batched_step = jax.jit(jax.vmap(physics.step))
+        self._batched_match_step = jax.jit(jax.vmap(self._match_rules.step))
 
         # Per-env Python-side bookkeeping (kept on host)
         self._rng = np.random.default_rng()
@@ -179,28 +153,8 @@ class VSSVecEnv(VectorEnv):
         self._step_count[mask] = 0
 
     # ------------------------------------------------------------------
-    # Public helpers for wrappers (e.g. SB3 adapter)
+    # Public state inspection helpers
     # ------------------------------------------------------------------
-
-    def reset_envs(self, mask: np.ndarray) -> np.ndarray:
-        """Reset (kickoff + zero step counter) the envs where ``mask`` is True.
-
-        Returns the full batched observation after the reset. Wrappers that
-        want eager auto-reset semantics (e.g. SB3's VecEnv) call this after
-        ``step`` to bring done envs to their post-reset state immediately,
-        rather than waiting for the next ``step`` call.
-        """
-        mask = np.asarray(mask, dtype=bool)
-        if mask.shape != (self.num_envs,):
-            raise ValueError(
-                f"mask shape {mask.shape} != (num_envs,) = ({self.num_envs},)"
-            )
-        if mask.any():
-            self._reset_subset(mask)
-            # Cancel any pending NEXT_STEP auto-reset for these envs — they
-            # were just reset eagerly.
-            self._needs_reset[mask] = False
-        return _export_obs(self._state)
 
     def current_obs(self) -> np.ndarray:
         """Return the current batched observation without stepping."""
@@ -230,31 +184,6 @@ class VSSVecEnv(VectorEnv):
                 dtype=np.float32,
             ).reshape(config.N_ROBOTS, 2)
         return out
-
-    def _crowding_penalties(self) -> np.ndarray:
-        """Return per-env crowding penalty array, shape ``(num_envs,)``.
-
-        Mirrors ``VSSEnv._crowding_penalty``: −GOAL_AREA_CROWDING_PENALTY for
-        each goal area where 2+ allied robots are present simultaneously.
-        """
-        blue_pos = np.asarray(
-            self._state.robots[:, config.TEAM_BLUE, :, 0:2]
-        )  # (B, N_ROBOTS, 2)
-        half_l = config.FIELD_LENGTH / 2.0
-        ga_half_y = config.GOAL_AREA_LENGTH_Y / 2.0
-        ga_x = config.GOAL_AREA_LENGTH_X
-
-        penalties = np.zeros(self.num_envs, dtype=np.float32)
-        for x_min, x_max in (
-            (-half_l, -half_l + ga_x),   # allied goal area
-            ( half_l - ga_x,  half_l),   # opponent goal area
-        ):
-            in_area = (
-                (blue_pos[:, :, 0] >= x_min) & (blue_pos[:, :, 0] <= x_max)
-                & (np.abs(blue_pos[:, :, 1]) <= ga_half_y)
-            )  # (B, N_ROBOTS) bool
-            penalties += (in_area.sum(axis=1) >= 2) * np.float32(config.GOAL_AREA_CROWDING_PENALTY)
-        return penalties
 
     # ------------------------------------------------------------------
     # Gymnasium VectorEnv interface
@@ -294,29 +223,32 @@ class VSSVecEnv(VectorEnv):
         all_actions_j = jnp.asarray(all_actions)
 
         # --- 3) One JIT'd vmap'd physics step ---
-        ball_x_pre = np.asarray(self._state.ball[:, 0], dtype=np.float32)
-        self._state, info_phys = self._batched_step(self._state, all_actions_j)
-        ball_x_post = np.asarray(self._state.ball[:, 0], dtype=np.float32)
+        simulation_before = self._state
+        simulation_after_physics, info_phys = self._batched_step(
+            simulation_before, all_actions_j
+        )
         goals = np.asarray(info_phys["goal"], dtype=np.int32)  # (B,)
-
-        # --- 4) Score bookkeeping + in-episode kickoff on goal ---
+        self._step_count += 1
         scored_mask = goals != 0
         if scored_mask.any():
-            blue_inc = (goals == 1).astype(np.int32)
-            yellow_inc = (goals == -1).astype(np.int32)
-            inc = np.stack([blue_inc, yellow_inc], axis=-1)  # (B, 2)
-            new_score = self._state.score + jnp.asarray(inc, dtype=jnp.int32)
-            self._state = self._state._replace(score=new_score)
-            # Goals trigger a kickoff but DO NOT end the episode (no step-counter reset).
-            self._kickoff_subset(scored_mask)
-
-        # --- 5) Step counter + truncation ---
-        self._step_count += 1
-        rewards = (
-            goals.astype(np.float32)
-            + np.float32(config.BALL_FORWARD_REWARD_COEF) * (ball_x_post - ball_x_pre)
-            + self._crowding_penalties()
+            kickoff_keys = self._split_keys(self.num_envs)
+        else:
+            kickoff_keys = jnp.broadcast_to(
+                jax.random.PRNGKey(0), (self.num_envs, 2)
+            )
+        transition = self._batched_match_step(
+            MatchStepInput(
+                simulation_before=simulation_before,
+                simulation_after_physics=simulation_after_physics,
+                goal=jnp.asarray(goals),
+                step_count=jnp.asarray(self._step_count),
+                kickoff_key=kickoff_keys,
+            )
         )
+        self._state = transition.simulation
+        rewards = np.asarray(transition.reward, dtype=np.float32)
+
+        # --- 5) Episode truncation ---
         terminations = np.zeros(self.num_envs, dtype=bool)
         truncations = self._step_count >= self.max_episode_steps
 

@@ -40,12 +40,12 @@ for _i, _a in enumerate(sys.argv):
         os.environ["JAX_PLATFORMS"] = "cpu" if _v == "cpu" else "cuda"
         break
 
-import jax
-import jax.numpy as jnp
-import numpy as np
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
 
-from vsss_sim import config
-from vsss_sim.physics import jax_backend as jb
+from vsss_sim import config  # noqa: E402
+from vsss_sim.physics import jax_backend as jb  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Timing helpers
@@ -197,7 +197,7 @@ def main(batches: list[int], steps: int, skip_vecenv: bool) -> None:
         return
 
     print()
-    print("-- VSSVecEnv (Gymnasium wrapper, what SB3 sees) --")
+    print("-- VSSVecEnv (Gymnasium VectorEnv wrapper) --")
     print(f"  {'batch':>7}  {'min':>10}  {'median':>10}  {'p95':>10}  "
           f"{'total_fps':>12}  {'vs_vmap':>10}  {'overhead':>10}")
 

@@ -19,6 +19,7 @@ from vsss_sim.rl.self_play import (  # noqa: E402
     ExperimentConfig,
     OpponentSamplingWeights,
     SnapshotArchive,
+    _make_env,
     run_experiment,
 )
 
@@ -39,6 +40,27 @@ def test_default_historical_selector_weights_are_normalized():
     np.testing.assert_allclose(probabilities.sum(), 1.0)
     np.testing.assert_allclose(probabilities[:3], [2 / 9, 1 / 3, 4 / 9], rtol=1e-6)
     assert probabilities[-2:].sum() == 0.0
+
+
+def test_brandao_reward_profile_round_trips_and_reaches_environment():
+    config = ExperimentConfig(
+        experiment_name="brandao",
+        num_generations=1,
+        reward_profile="brandao_reward",
+    )
+    restored = ExperimentConfig.from_dict(config.to_dict())
+
+    assert restored.reward_profile == "brandao_reward"
+    assert _make_env(restored).reward_profile.value == "brandao_reward"
+
+
+def test_experiment_config_rejects_unknown_reward_profile():
+    with pytest.raises(ValueError, match="reward_profile"):
+        ExperimentConfig(
+            experiment_name="bad-profile",
+            num_generations=1,
+            reward_profile="unknown",
+        )
 
 
 def test_selector_weights_allow_explicit_random_and_stationary_mix():
@@ -172,6 +194,7 @@ def test_short_evaluation_writes_long_match_metrics(tmp_path):
         num_minibatches=1,
         hidden_sizes=(8,),
         max_episode_steps=1,
+        reward_profile="brandao_reward",
         evaluation_matches=1,
         evaluation_seconds=1,
         output_root=str(tmp_path),
@@ -188,6 +211,7 @@ def test_short_evaluation_writes_long_match_metrics(tmp_path):
     result = json.loads(result_path.read_text())
 
     assert result["control_steps"] == 15
+    assert result["reward_profile"] == "brandao_reward"
     assert [item["opponent_type"] for item in result["results"]] == [
         "history",
         "random",

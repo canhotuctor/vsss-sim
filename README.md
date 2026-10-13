@@ -82,9 +82,9 @@ Or directly: `from vsss_sim.envs import VSSVecEnv; envs = VSSVecEnv(num_envs=256
 
 ### End-to-end JAX PPO
 
-This path bypasses Gymnasium, NumPy, SB3, and PyTorch during training. Policy
-inference, VMAP'd physics, rollout collection, GAE, gradients, and Optax updates
-remain on the JAX device.
+This path bypasses Gymnasium and NumPy during training. Policy inference,
+VMAP'd physics, rollout collection, GAE, gradients, and Optax updates remain
+on the JAX device.
 
 ```bash
 python scripts/train_jax.py \
@@ -97,19 +97,14 @@ Use `--opponent random --init-mode random` for the randomized starting setup.
 All generations execute in one compiled `lax.scan`. The script reports
 initialization, compilation, and device execution times separately.
 
-### Training with SB3 PPO + batched env (~4–8× wall-clock speedup)
+### PPO smoke check
 
-```python
-from stable_baselines3 import PPO
-from vsss_sim.envs import VSSVecEnv
-from vsss_sim.sb3_adapter import VSSVecEnvToSB3
-
-env = VSSVecEnvToSB3(VSSVecEnv(num_envs=256, opponent_policy="stationary"))
-model = PPO("MlpPolicy", env, n_steps=128, verbose=1)
-model.learn(total_timesteps=1_000_000)
+```bash
+python scripts/smoke.py
 ```
 
-Or via the smoke script: `python scripts/smoke.py --num-envs 256 --timesteps 50000`.
+This runs one small compiled JAX PPO update. Increase `--generations`,
+`--num-envs`, or `--rollout-length` to exercise a larger setup.
 
 ---
 
@@ -150,6 +145,16 @@ Goals trigger an in-episode kickoff; episodes truncate at `MAX_EPISODE_STEPS`
 (default 300 control steps = 20 s at 15 Hz, with four 60 Hz physics substeps
 per control step).
 
+The shared match rules also provide the `brandao_reward` profile based on
+Brandão et al. (2022). Select it for a JAX PPO run with
+`--reward-profile brandao_reward`, or set `"reward_profile": "brandao_reward"`
+in an experiment JSON. The same profile option is available on `VSSEnv`,
+`VSSVecEnv`, and `VSSJumanjiEnv`; `default` preserves the reward above.
+The included long-run configuration can be started with
+`python scripts/train_jax.py --xp experiment26_brandao_reward`.
+See [the profile notes](docs/brandao-reward-profile.md) for the terms and the
+team-reward adaptation.
+
 ---
 
 ## Field layout
@@ -177,9 +182,12 @@ and fully device-resident Jumanji environment.
 
 ### Throughput
 
-Measured with `python scripts/bench_backends.py --steps 5000 --sb3`.
+Measured with `python scripts/bench_backends.py --steps 5000`.
 
 **Hardware:** Apple M4 Pro (12-core CPU, JAX CPU backend) · Ubuntu 22.04, NVIDIA RTX 3060 Laptop GPU 6 GB (JAX CUDA 12 backend).
+
+The throughput values below are previously recorded CPU/GPU measurements; rerun the command
+above to measure the current checkout.
 
 #### Raw physics ceiling — `jax.vmap(step)`, no Gymnasium overhead
 
@@ -204,29 +212,24 @@ env-steps/sec — 3.7× faster than Mac CPU.
 | 256 | 120,930 fps | 23,468 fps |
 | 1024 | **169,000 fps** | **92,400 fps** |
 
-Mac wins across all batch sizes. The per-step CUDA↔CPU copy (obs array transfer at the Gymnasium boundary) costs more than the GPU gains from the physics kernel. JAX-native RL (PR 5) eliminates this boundary and is the path to realising the 909k ceiling.
+The per-step CUDA↔CPU copy at the Gymnasium interface can cost more than the GPU gains from
+the physics kernel. Native JAX PPO uses the Jumanji environment and avoids that per-step host
+transfer during training.
 
-#### End-to-end SB3 PPO — `n_steps=32`, PyTorch MLP policy + JAX physics
-
-| `num_envs` | Mac M4 Pro CPU | Ubuntu RTX 3060 GPU | GPU speedup vs GPU `num_envs=1` |
-|-----------:|---------------:|--------------------:|--------------------------------:|
-| 1 | 614 fps | 77 fps | 1× |
-| 8 | 4,367 fps | 616 fps | 8× |
-| 64 | 23,600 fps | 4,903 fps | 64× |
-| 256 | **46,600 fps** | **18,500 fps** | 242× |
-
-Mac is faster end-to-end with SB3 — same boundary cost as VSSVecEnv, plus PyTorch MLP policies are not GPU-efficient at small batch sizes. The 242× GPU scaling within Ubuntu is driven by JAX physics; the PyTorch policy is the remaining bottleneck.
-
-Reproduce with `python scripts/bench_backends.py --steps 5000 --sb3`. Use `--device cpu` or `--device gpu` (after `pip install -e ".[cuda]"`) to force a specific device type.
+End-to-end JAX PPO throughput is measured by `scripts/bench_self_play.py`;
+`scripts/perf_bench.py` compares raw physics, the Gymnasium vector interface,
+and native Flax policy inference. Use `--device cpu` or `--device gpu` (after
+`pip install -e ".[cuda]")` to force a specific device type.
 
 ---
 
 ## Scripts
 
-- `scripts/smoke.py` — SB3 PPO smoke with MLflow logging. Flags: `--num-envs`, `--init-mode`, `--generations`, `--forever`, `--n-steps`, `--max-episode-steps`, `--render`, `--timesteps`.
-- `scripts/train.py` — full MLflow-tracked PPO run (`mlflow.db` + `mlruns/`).
-- `scripts/visualize.py` — render-only inspection (`--init-mode`, `--fps`).
-- `scripts/bench_backends.py` — throughput across single-state JAX, raw `jax.vmap`, and `VSSVecEnv`; `--sb3` for end-to-end PPO; `--device cpu|gpu`.
+- `scripts/smoke.py` — one small native-JAX PPO training pass.
+- `scripts/train_jax.py` — JAX PPO and historical self-play training.
+- `scripts/visualize.py` — render a saved native-JAX policy snapshot.
+- `scripts/bench_backends.py` — throughput across single-state JAX, raw `jax.vmap`, and `VSSVecEnv`; `--device cpu|gpu`.
+- `scripts/bench_self_play.py` — end-to-end JAX self-play throughput and memory benchmark.
 - `scripts/check_gpu.py` — JAX device diagnostics.
 
 ---
@@ -234,7 +237,7 @@ Reproduce with `python scripts/bench_backends.py --steps 5000 --sb3`. Use `--dev
 ## Running tests
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,jax-rl]"
 pytest
 ```
 
@@ -256,9 +259,9 @@ src/vsss_sim/
 │   ├── __init__.py        Public physics API
 │   └── jax_backend.py     Functional, jittable, vmap-ready physics engine
 ├── rendering/pygame.py
-└── sb3_adapter.py         VSSVecEnvToSB3 — SB3 VecEnv around VSSVecEnv
-tests/                     tests across agents, envs, physics, config
-scripts/                   smoke, train, visualize, bench_backends, check_gpu
+└── rl/                     Flax/Optax PPO, self-play, evaluation, and CLI
+tests/                     tests across agents, envs, physics, config, and PPO
+scripts/                   native-JAX train, smoke, visualize, and benchmark tools
 docs/superpowers/plans/    Implementation plans for major features
 pyproject.toml
 ```

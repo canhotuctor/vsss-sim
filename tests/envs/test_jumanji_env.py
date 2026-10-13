@@ -68,6 +68,25 @@ def test_goal_kickoff_preserves_score_and_match_time():
     assert abs(float(next_state.simulation.ball[0])) < 0.1
 
 
+def test_brandao_goal_reward_is_jittable_and_uses_remaining_horizon():
+    env = VSSJumanjiEnv(max_episode_steps=5, reward_profile="brandao_reward")
+    state, _ = env.reset(jax.random.PRNGKey(0))
+    ball = state.simulation.ball.at[0].set(config.FIELD_LENGTH / 2.0 + 0.02)
+    ball = ball.at[1].set(0.0).at[2].set(0.05)
+    state = state._replace(simulation=state.simulation._replace(ball=ball))
+
+    next_state, timestep = jax.jit(env.step)(state, jnp.zeros(6, dtype=jnp.float32))
+
+    assert int(timestep.extras["goal"]) == 1
+    np.testing.assert_allclose(timestep.reward, 18.0, atol=1e-6)
+    assert int(next_state.simulation.score[config.TEAM_BLUE]) == 1
+    assert abs(float(next_state.simulation.ball[0])) < 0.1
+    np.testing.assert_allclose(
+        timestep.observation,
+        env._match_rules.observation(next_state.simulation),
+    )
+
+
 def test_only_jax_native_opponents_are_accepted():
     with pytest.raises(ValueError, match="JAX-native"):
         VSSJumanjiEnv(opponent_policy="custom")

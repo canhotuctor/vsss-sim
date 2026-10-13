@@ -183,6 +183,31 @@ class TestStep:
         bound = config.BALL_FORWARD_REWARD_COEF * config.FIELD_LENGTH
         assert 1.0 - bound - 1e-6 <= reward <= 1.0 + bound + 1e-6
         assert info["goal"] == 1
+        assert info["score_blue"] == 1
+        assert info["score_yellow"] == 0
+        np.testing.assert_allclose(obs, e._get_obs())
+        e.close()
+
+    def test_brandao_goal_reward_and_kickoff_observation(self):
+        e = VSSEnv(
+            render_mode=None,
+            max_episode_steps=5,
+            reward_profile="brandao_reward",
+        )
+        e.reset(seed=0)
+        e._state = e._state._replace(
+            ball=e._state.ball.at[:].set(np.array(
+                [config.FIELD_LENGTH / 2.0 + 0.02, 0.0, 0.05, 0.0], dtype=np.float32
+            ))
+        )
+
+        obs, reward, _, _, info = e.step(np.zeros(config.N_ROBOTS * 2))
+
+        assert reward == pytest.approx(18.0)
+        assert info["goal"] == 1
+        assert info["score_blue"] == 1
+        np.testing.assert_allclose(obs, e._get_obs())
+        assert abs(float(e._state.ball[0])) < 0.1
         e.close()
 
 

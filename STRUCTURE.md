@@ -1,17 +1,17 @@
 # Simulator structure
 
 This document is a visual map of the simulator as it exists today. Read it top-to-bottom
-for progressively more detail: public entry points, one environment step, both batched training
-paths, data shapes, physics, and reset semantics.
+for progressively more detail: public entry points, one environment step, the Gymnasium vector
+interface, native PPO data flow, data shapes, physics, and reset semantics.
 
 > This is **IEEE VSSS 3v3**: six differential-drive robots, two wheel commands per robot,
 > no kicker or dribbler, and a walled 150 x 130 cm field.
 
 ## 1. System map
 
-The simulator exposes three paths over shared physics: a flexible single-match Gymnasium path,
-a Gymnasium/SB3 compatibility path, and a fully JAX-native PPO path. The native path uses a
-functional Jumanji contract so complete rollouts and optimizer generations can be compiled.
+The simulator provides Gymnasium single-match and batched interfaces for interactive use and
+external clients, plus a fully JAX-native PPO path for training. All three use the same JAX
+physics implementation; native PPO runs the policy, environment, rollout, and optimizer on device.
 
 ```mermaid
 flowchart LR
@@ -24,48 +24,40 @@ flowchart LR
         opponent["Opponent policy<br/>stationary / random / callable"]
         renderer["Pygame renderer<br/>human / rgb_array"]
         physics["JAX physics<br/>functional state, JIT"]
-
         env --> base
         env --> opponent
         env --> renderer
         env --> physics
     end
 
-    subgraph batch["Compatibility training path"]
-        adapter["VSSVecEnvToSB3<br/>API + autoreset adapter"]
+    subgraph vector["Batched Gymnasium path"]
         vec["VSSVecEnv<br/>Gymnasium VectorEnv"]
-        adapter --> vec --> physics
+        vec --> physics
     end
 
-    subgraph native["Fully JAX-native training path"]
+    subgraph native["Native JAX PPO path"]
         trainjax["scripts/train_jax.py"]
         ppojax["Flax/Optax PPO<br/>nested lax.scan"]
         jumanji["VSSJumanjiEnv<br/>functional JAX state"]
-
         trainjax --> ppojax --> jumanji --> physics
     end
-
-    sb3["Stable-Baselines3 PPO"]
-    mlflow["MLflow metrics + artifacts"]
 
     user --> gym
     gym --> env
     gym --> vec
-    sb3 --> adapter
-    sb3 --> mlflow
     user --> trainjax
 ```
 
-All three paths share the same functional JAX physics step. `VSSVecEnv` batches it with `vmap`
-and compiles the result with `jit`. `VSSJumanjiEnv` represents one pure match; PPO applies
-`vmap` for the environment batch and keeps the policy, rollout, GAE, gradients, and optimizer
-state on the JAX device.
+`VSSEnv` provides rendering and Python opponent callables. `VSSVecEnv` batches physics with
+`vmap` and exposes the standard Gymnasium VectorEnv interface, including NumPy observations.
+`VSSJumanjiEnv` represents a pure match; PPO batches it with `vmap` and keeps policy, rollout,
+GAE, gradients, and optimizer state on the JAX device.
 
 ## 2. One control step in `VSSEnv`
 
 The controlled policy only commands blue. The environment obtains yellow's commands from the
-configured opponent, combines both teams, advances physics, and turns the result into the RL
-transition.
+configured opponent, combines both teams, advances physics, and delegates reward, score, kickoff,
+and observation semantics to the shared `MatchRules` module.
 
 ```mermaid
 sequenceDiagram
@@ -73,6 +65,7 @@ sequenceDiagram
     participant E as VSSEnv
     participant O as Opponent policy
     participant X as JAX physics engine
+    participant M as Shared MatchRules
     participant R as Renderer
 
     P->>E: action (6,) in [-1, 1]
@@ -81,13 +74,13 @@ sequenceDiagram
     O-->>E: yellow wheels (3, 2)
     E->>E: reshape blue to (3, 2)<br/>stack all actions to (2, 3, 2)
     E->>X: step(state, all_actions)
-    X-->>E: new state + goal event
-    E->>E: update score and step count
-    E->>E: reward = goal + 0.10 * delta ball-x<br/>+ goal-area crowding penalty
-    E->>E: build obs, terminated, truncated, info
-    opt goal scored
-        E->>E: reset placement for in-match kickoff
-    end
+    X-->>E: post-physics state + goal event
+    E->>E: increment step count
+    E->>M: MatchStepInput(before, after, goal, step count, kickoff key)
+    M->>M: apply configured reward profile
+    M->>M: update score and optionally reset kickoff placement
+    M-->>E: carried state, observation, reward
+    E->>E: package terminated, truncated, info
     opt rendering enabled
         E->>R: rgb_array after control step<br/>human after every physics sub-step
     end
@@ -97,86 +90,35 @@ sequenceDiagram
 `terminated` is always false: a match has no absorbing mid-episode state. The time limit sets
 `truncated`; goals update the score and trigger a kickoff without ending the episode.
 
-## 3. Batched PPO data paths
+## 3. Batched Gymnasium path
 
-### Gymnasium/SB3 compatibility path
-
-The batched design keeps simulation state on the JAX device, but SB3/PyTorch consumes NumPy
-arrays on the host. That boundary explains both the large physics speedup and the remaining
-end-to-end overhead.
+`VSSVecEnv` keeps the batched simulation state on the JAX device and exposes observations and
+step results through Gymnasium's VectorEnv contract. This interface is useful for rendering-
+adjacent tooling and external clients that consume Gymnasium directly. Native PPO uses
+`VSSJumanjiEnv` instead, avoiding per-step host transfers while keeping the same match rules.
 
 ```mermaid
 flowchart LR
-    ppo["SB3 PPO<br/>PyTorch policy"]
-    sb3api["VSSVecEnvToSB3<br/>SB3 VecEnv contract"]
-
-    subgraph host["Python / host"]
-        actions["Blue actions<br/>(B, 6)"]
-        opponents["Built-in opponent actions<br/>(B, 3, 2)"]
-        bookkeeping["Per-env counters<br/>rewards, done flags,<br/>episode statistics"]
-        numpyobs["Writable NumPy observations<br/>(B, 46)"]
-    end
+    actions["Blue actions<br/>(B, 6) in NumPy"]
+    opponents["Built-in opponent actions<br/>(B, 3, 2)"]
 
     subgraph device["JAX device"]
         state["Batched SimState<br/>leading axis B"]
-        vmapped["jit(vmap(step))"]
-        obsbuilder["JAX observation builder"]
-        state --> vmapped --> state
-        state --> obsbuilder
+        step["jit(vmap(step))"]
+        observation["JAX observation builder"]
+        state --> step --> state
+        state --> observation
     end
 
-    ppo --> sb3api --> actions
-    actions --> vmapped
-    opponents --> vmapped
-    vmapped --> bookkeeping
-    obsbuilder -->|"device to host copy"| numpyobs
-    bookkeeping --> sb3api
-    numpyobs --> sb3api --> ppo
+    exported["Writable NumPy observations<br/>(B, 46)"]
+    actions --> step
+    opponents --> step
+    observation -->|"device to host copy"| exported
 ```
 
-Built-in stationary and random opponents are assembled as batches. A custom callable receives
-one observation at a time through a Python loop, so it is intentionally the slow path.
-
-The adapter exists because Gymnasium and SB3 use different vector-environment contracts:
-
-```mermaid
-flowchart LR
-    gymvec["VSSVecEnv<br/>reset -> obs, info<br/>step -> obs, reward, term, trunc, info<br/>NEXT_STEP autoreset"]
-    adapter["VSSVecEnvToSB3<br/>merge term OR trunc<br/>build per-env infos<br/>track episode stats<br/>eagerly reset done envs"]
-    sb3vec["SB3 VecEnv<br/>reset -> obs<br/>step -> obs, reward, done, infos<br/>terminal_observation in info"]
-
-    gymvec --> adapter --> sb3vec
-```
-
-### Fully JAX-native path
-
-The native path removes the per-step Python framework boundary. One compiled executable owns
-the policy, environment batch, rollout buffer, advantage calculation, and optimizer updates.
-
-```mermaid
-flowchart LR
-    config["Python configuration"] --> compile["XLA compile once"]
-
-    subgraph device["One JAX executable"]
-        generations["generation lax.scan"]
-        rollout["rollout lax.scan"]
-        policy["Flax actor-critic<br/>(B,46) -> (B,6) + value"]
-        env["vmap(VSSJumanjiEnv.step)"]
-        gae["reverse lax.scan<br/>truncation-aware GAE"]
-        epochs["epoch + minibatch lax.scan"]
-        optax["Optax gradients + Adam"]
-
-        generations --> rollout
-        rollout --> policy --> env --> rollout
-        rollout --> gae --> epochs --> optax --> generations
-    end
-
-    compile --> generations
-    generations --> metrics["Final metric history to host"]
-```
-
-The Gymnasium path remains useful for SB3 compatibility, rendering-adjacent workflows, and
-external RL libraries. The Jumanji path is the high-throughput training implementation.
+Stationary and random opponents are assembled as batches. A custom callable receives one
+observation at a time through a Python loop, so it is intended for development rather than
+maximum training throughput. Gymnasium vector mode uses next-step autoreset after truncation.
 
 ## 4. One fully compiled PPO generation
 
@@ -318,20 +260,17 @@ These details matter when comparing trajectories across execution paths:
 - `VSSEnv` supports rendering; `VSSVecEnv` currently does not.
 - Human rendering advances and draws each physics sub-step. Non-human stepping runs one engine
   call for the whole control step.
-- Reset helpers return a fresh state whose score and simulation time are zero. The single-env
-  in-match kickoff therefore resets those fields; the Jumanji path explicitly preserves them.
+- A goal kickoff creates fresh placement but preserves match score and simulation time in all
+  environment adapters. Episode step counts continue through in-match kickoffs.
+- Shared `MatchRules` computes reward from the post-physics state before kickoff, then returns an
+  observation of the state carried forward after any kickoff. Single, vector, and Jumanji paths
+  use this same ordering.
 - Physics resolves the field's 45-degree corner chamfers for both robots and the ball.
-- On a goal, single `VSSEnv` builds the returned observation before its kickoff reset. Batched
-  `VSSVecEnv` performs the kickoff before exporting the returned observation.
-- The single path calculates goal-area crowding from the post-physics state. On a goal, the
-  batched path performs its kickoff first and then calculates crowding from the new placement.
-- Gymnasium vector mode uses next-step autoreset after truncation. The SB3 adapter changes this
-  to eager autoreset and preserves the terminal observation in `info`.
+- `VSSVecEnv` uses Gymnasium next-step autoreset after truncation.
 - `VSSJumanjiEnv` is functional and renderer-free. Its built-in stationary and random opponents
   stay in JAX; arbitrary Python opponent callables are intentionally unsupported in this path.
-- The Jumanji goal kickoff explicitly preserves match score and simulation time. Native PPO
-  autoresets ended episodes through `lax.cond` and bootstraps timeout values from the final
-  observation before replacing it with the reset observation.
+- Native PPO autoresets ended episodes through `lax.cond` and bootstraps timeout values from the
+  final observation before replacing it with the reset observation.
 
 ## 8. Source map
 
@@ -343,20 +282,23 @@ flowchart TD
     single["envs/vsss_3v3.py<br/>single-match orchestration"]
     vector["envs/vsss_vec.py<br/>batched orchestration + observation encoding"]
     jumanji["envs/jumanji.py<br/>pure state, TimeStep, reward + truncation semantics"]
+    matchrules["envs/match_rules.py<br/>shared observation, reward, score, kickoff"]
     ppo["rl/ppo.py<br/>Flax actor-critic, GAE, PPO scans"]
     physicsapi["physics/__init__.py<br/>public physics API"]
     jax["physics/jax_backend.py<br/>JAX physics engine"]
     agents["agents/<br/>opponent policies"]
     render["rendering/pygame.py"]
-    adapter["sb3_adapter.py"]
     trainjax["scripts/train_jax.py<br/>compile, execute, benchmark"]
-    scripts["scripts/<br/>Gymnasium/SB3 training, benchmark, visualize"]
-    tests["tests/<br/>env, adapter, physics, CUDA, reset, PPO"]
+    scripts["scripts/<br/>JAX training, benchmark, visualize"]
+    tests["tests/<br/>env, physics, CUDA, reset, PPO"]
     report["docs/jax-native-ppo-report-2026-08.md"]
 
     registration --> single
     registration --> vector
     config --> jumanji
+    matchrules --> single
+    matchrules --> vector
+    matchrules --> jumanji
     config --> base
     config --> single
     config --> vector
@@ -369,7 +311,6 @@ flowchart TD
     ppo --> jumanji
     trainjax --> ppo
     single --> render
-    adapter --> vector
     scripts --> registration
     tests -. verify .-> single
     tests -. verify .-> vector

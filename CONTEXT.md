@@ -23,3 +23,7 @@ _Avoid_: global pool, unless intentionally discussing a pool shared across exper
 **Opponent selector**:
 A configured rule that chooses a historical snapshot (for example, uniformly from all history, from the recent half, or the latest snapshot).
 _Avoid_: opponent policy, when referring specifically to the rule rather than the selected policy.
+
+**Reward profile**:
+A named set of rules that assigns the controlled team a reward for each match step. One profile is selected for an experiment so reward comparisons remain attributable to that choice.
+_Avoid_: reward function, when referring to the experiment-level choice rather than the calculation itself.

@@ -2,6 +2,10 @@
 
 Date: 2026-08-19
 
+> Archived comparison: this report records a runtime comparison made before the
+> Stable-Baselines3 adapter and scripts were removed. Those measurements remain
+> historical data; supported training now uses the native JAX PPO implementation.
+
 Machine: Apple M1 MacBook Air, 8 CPU cores (4 performance + 4 efficiency),
 8 GB RAM, JAX CPU backend
 

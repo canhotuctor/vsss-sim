@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import serialization
 
-from ..config import InitMode
+from ..config import InitMode, RewardProfile
 from ..envs.jumanji import VSSJumanjiEnv
 from .ppo import PPO, PPOConfig
 
@@ -91,6 +91,7 @@ class ExperimentConfig:
     max_episode_steps: int = 300
     terminate_on_goal: bool = False
     init_mode: str = "kickoff"
+    reward_profile: str = RewardProfile.DEFAULT.value
     output_root: str = "output/experiments"
     evaluation_matches: int = 100
     evaluation_seconds: int = 120
@@ -119,6 +120,12 @@ class ExperimentConfig:
             raise ValueError("active_pool_limit must be at least 1 when provided")
         if self.init_mode not in ("kickoff", "random"):
             raise ValueError("init_mode must be 'kickoff' or 'random'")
+        try:
+            profile = RewardProfile(self.reward_profile)
+        except ValueError as error:
+            choices = ", ".join(profile.value for profile in RewardProfile)
+            raise ValueError(f"reward_profile must be one of: {choices}") from error
+        object.__setattr__(self, "reward_profile", profile.value)
         # Reuse the trainer's validation before initializing a device or allocating state.
         self.ppo_config()
 
@@ -281,6 +288,7 @@ def _make_env(config: ExperimentConfig) -> Any:
         max_episode_steps=config.max_episode_steps,
         init_mode=InitMode(config.init_mode),
         terminate_on_goal=config.terminate_on_goal,
+        reward_profile=config.reward_profile,
     )
 
 

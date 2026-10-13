@@ -25,8 +25,9 @@ import numpy as np
 
 from .. import config, physics
 from ..agents import random_policy, stationary_policy
-from ..config import InitMode
+from ..config import InitMode, RewardProfile
 from .base import VSSBaseEnv
+from .match_rules import MatchRules, MatchStepInput
 
 
 class VSSEnv(VSSBaseEnv):
@@ -59,6 +60,7 @@ class VSSEnv(VSSBaseEnv):
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         render_fps: Optional[float] = None,
         init_mode: InitMode | str = InitMode.KICKOFF,
+        reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
     ) -> None:
         super().__init__(
             render_mode=render_mode,
@@ -67,6 +69,11 @@ class VSSEnv(VSSBaseEnv):
         )
 
         self._init_mode = InitMode(init_mode)
+        self._match_rules = MatchRules(
+            reward_profile=reward_profile,
+            max_episode_steps=max_episode_steps,
+            init_mode=self._init_mode,
+        )
 
         if callable(opponent_policy):
             self._opponent_policy: Callable = opponent_policy
@@ -119,35 +126,6 @@ class VSSEnv(VSSBaseEnv):
 
         return goal
 
-    def _bump_score(self, team_idx: int) -> None:
-        """Increment the score of one team."""
-        self._state = self._state._replace(
-            score=self._state.score.at[team_idx].add(1)
-        )
-
-    def _crowding_penalty(self) -> float:
-        """Return a negative reward when 2+ allied robots crowd a goal area.
-
-        Both goal areas are checked.
-        """
-        blue_pos = np.asarray(self._state.robots)[config.TEAM_BLUE, :, 0:2]
-        half_l = config.FIELD_LENGTH / 2.0
-        ga_half_y = config.GOAL_AREA_LENGTH_Y / 2.0
-        ga_x = config.GOAL_AREA_LENGTH_X
-
-        penalty = 0.0
-        for x_min, x_max in (
-            (-half_l, -half_l + ga_x),   # allied (blue) goal area
-            ( half_l - ga_x,  half_l),   # opponent (yellow) goal area
-        ):
-            in_area = (
-                (blue_pos[:, 0] >= x_min) & (blue_pos[:, 0] <= x_max)
-                & (np.abs(blue_pos[:, 1]) <= ga_half_y)
-            )
-            if int(np.sum(in_area)) >= 2:
-                penalty += config.GOAL_AREA_CROWDING_PENALTY
-        return penalty
-
     # ------------------------------------------------------------------
     # Gymnasium interface
     # ------------------------------------------------------------------
@@ -179,41 +157,40 @@ class VSSEnv(VSSBaseEnv):
             Normalised wheel speeds for the blue team:
             ``[vl_0, vr_0, vl_1, vr_1, vl_2, vr_2]``.
         """
+        simulation_before = self._state
         blue_actions = np.asarray(action, dtype=np.float32).reshape(config.N_ROBOTS, 2)
         obs_current = self._get_obs()
         yellow_actions = self._opponent_policy(obs_current).reshape(config.N_ROBOTS, 2)
         all_actions = np.stack([blue_actions, yellow_actions], axis=0)
 
-        ball_x_pre = float(np.asarray(self._state.ball)[0])
         if self.render_mode == "human":
             goal = self._step_physics_substeps(all_actions)
         else:
             goal = self._step_physics(all_actions)
-        ball_x_post = float(np.asarray(self._state.ball)[0])
         self._step_count += 1
-
-        if goal == 1:
-            self._bump_score(config.TEAM_BLUE)
-        elif goal == -1:
-            self._bump_score(config.TEAM_YELLOW)
-
-        # Reward: sparse ±1 on goal + small dense ball-forward-progress shaping
-        # + penalty for packing 2+ allied robots into any goal area
-        reward = (
-            float(goal)
-            + config.BALL_FORWARD_REWARD_COEF * (ball_x_post - ball_x_pre)
-            + self._crowding_penalty()
+        kickoff_key = (
+            jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
+            if goal != 0
+            else jax.random.PRNGKey(0)
         )
+        transition = self._match_rules.step(
+            MatchStepInput(
+                simulation_before=simulation_before,
+                simulation_after_physics=self._state,
+                goal=jnp.asarray(goal, dtype=jnp.int32),
+                step_count=jnp.asarray(self._step_count, dtype=jnp.int32),
+                kickoff_key=kickoff_key,
+            )
+        )
+        self._state = transition.simulation
+        reward = float(np.asarray(transition.reward))
 
         terminated = False  # VSSS has no terminal state mid-match
         truncated = self._step_count >= self.max_episode_steps
 
-        obs = self._get_obs()
+        obs = np.asarray(transition.observation, dtype=np.float32)
         info = self._get_info()
         info["goal"] = goal
-
-        if goal != 0:
-            self._reset_state()
 
         if self.render_mode == "rgb_array":
             self.render()

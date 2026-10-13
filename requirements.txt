@@ -6,9 +6,6 @@ jax>=0.4
 # Optional: rendering (pip install vsss-sim[render])
 # pygame>=2.4
 
-# Optional: GPU acceleration via PyTorch (pip install vsss-sim[gpu])
-# torch>=2.0
-
 # Development / testing
 pytest>=7.4
 pytest-cov>=4.1

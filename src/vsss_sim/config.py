@@ -24,6 +24,13 @@ class InitMode(str, Enum):
     KICKOFF = "kickoff"
     RANDOM = "random"
 
+
+class RewardProfile(str, Enum):
+    """Team reward rule selected for a match or RL experiment."""
+
+    DEFAULT = "default"
+    BRANDAO_REWARD = "brandao_reward"
+
 # ---------------------------------------------------------------------------
 # Field (all dimensions in metres)
 # ---------------------------------------------------------------------------
@@ -86,7 +93,7 @@ ROBOT_WHEEL_ACCEL_LIMIT: float = 1.0 * 9.81  # m/s² (≈ 1 g)
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
-FPS: float = 15.0           # control loop frequency in-game (Hz)   
+FPS: float = 15.0           # control loop frequency in-game (Hz)
 DT: float = 1.0 / FPS       # control loop timestep in-game (s)
 SUB_STEPS: int = 4          # number of physics sub-steps per control loop step
 

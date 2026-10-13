@@ -1,302 +1,77 @@
 #!/usr/bin/env python3
-"""
-Smoke test — quick sanity check that the simulator, MLflow, and SB3 are wired up.
-
-Single-env mode (default, ``--num-envs 1``)
-    Uses SB3's ``DummyVecEnv`` around one VSSEnv. ``--render`` opens a pygame
-    window.
-
-Batched mode (``--num-envs N`` for N > 1)
-    Uses ``VSSVecEnvToSB3(VSSVecEnv(num_envs=N))`` — N matches in parallel via
-    ``jit(vmap(step))``. No render
-    window (would only show env 0 anyway).
-
-Usage
------
-    python scripts/smoke.py --timesteps 5000
-    python scripts/smoke.py --num-envs 64 --timesteps 50000
-
-Requires
---------
-    pip install -e ".[dev]" mlflow stable-baselines3
-"""
-
+"""Run a small native-JAX PPO training pass to smoke-check the training stack."""
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import time
 
 import jax
-import mlflow
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.env_util import make_vec_env
 
-import vsss_sim  # noqa: F401 – registers "VSSS-v0"
-from vsss_sim import config
-from vsss_sim.config import InitMode
-from vsss_sim.envs import VSSVecEnv
-from vsss_sim.sb3_adapter import VSSVecEnvToSB3
-
-PARAMS = {
-    "algorithm": "PPO",
-    "policy": "MlpPolicy",
-    "opponent": "stationary",
-    "learning_rate": 3e-4,
-    "n_steps": 512,  # overridden at runtime if --n-steps or --max-episode-steps is set
-}
+from vsss_sim.config import InitMode, RewardProfile
+from vsss_sim.envs.jumanji import VSSJumanjiEnv
+from vsss_sim.rl import PPO, PPOConfig
 
 
-class _EpisodeDumpCallback(BaseCallback):
-    """Log episode metrics to MLflow once per PPO iteration (generation).
-
-    Accumulates all episodes that finish during a rollout in _on_step, then
-    flushes metrics to MLflow in _on_rollout_end and to the console in the
-    *following* _on_rollout_start (which fires after the gradient update).
-    This ensures the SB3 ``time/fps`` metric printed to stdout covers a full
-    rollout + gradient-update cycle, not rollout-only — the latter inflates
-    the first-iteration fps when batch sizes are large.
-
-    When ``save_every_gen=True``, saves the policy to ``save_path`` after each generation.
-    """
-
-    def __init__(self, save_path: Path | None = None, save_every_gen: bool = False):
-        super().__init__()
-        self._iteration = 0
-        self._episode = 0
-        self._rollout_rewards: list[float] = []
-        self._rollout_lengths: list[int] = []
-        self._save_path = save_path
-        self._save_every_gen = save_every_gen and save_path is not None
-        self._pending_console_dump = False  # defer dump until after train()
-
-    def _on_rollout_start(self) -> None:
-        # Fires right after the *previous* self.train() call — flush pending
-        # logger records so fps denominator includes the gradient update.
-        if self._pending_console_dump:
-            self.model.dump_logs(iteration=self._iteration)
-            self._pending_console_dump = False
-
-    def _on_step(self) -> bool:
-        for info in self.locals["infos"]:
-            if "episode" not in info:
-                continue
-            self._episode += 1
-            ep = info["episode"]
-            self._rollout_rewards.append(float(ep["r"]))
-            self._rollout_lengths.append(int(ep["l"]))
-        return True
-
-    def _on_rollout_end(self) -> None:
-        self._iteration += 1
-        rewards = self._rollout_rewards
-        lengths = self._rollout_lengths
-
-        if rewards:
-            mean_r = sum(rewards) / len(rewards)
-            last_r = min(rewards)
-            mean_l = sum(lengths) / len(lengths)
-            max_l = max(lengths)
-
-            # MLflow: log immediately (not affected by the dump timing).
-            mlflow.log_metrics(
-                {
-                    "generation": self._iteration,
-                    "ep_reward/mean": mean_r,
-                    "ep_reward/min": last_r,
-                    "ep_length/mean": mean_l,
-                    "ep_length/max": max_l,
-                    "episodes": self._episode,
-                    "gen_n_episodes": len(rewards),
-                },
-                step=self._iteration,
-            )
-            # SB3 logger: accumulate — will be flushed in _on_rollout_start of
-            # the next gen (after train()) or in _on_training_end for the last gen.
-            self.logger.record("rollout/iteration", self._iteration)
-            self.logger.record("rollout/episode", self._episode)
-            self.logger.record("rollout/ep_reward_mean", mean_r)
-            self.logger.record("rollout/ep_reward_min", last_r)
-            self.logger.record("rollout/ep_length_mean", mean_l)
-            self.logger.record("rollout/ep_length_max", max_l)
-            self._pending_console_dump = True
-
-        self._rollout_rewards = []
-        self._rollout_lengths = []
-
-        if self._save_every_gen:
-            self.model.save(str(self._save_path))
-
-    def _on_training_end(self) -> None:
-        # Flush metrics for the final generation (no subsequent _on_rollout_start).
-        if self._pending_console_dump:
-            self.model.dump_logs(iteration=self._iteration)
-            self._pending_console_dump = False
-
-
-def _build_env(num_envs: int, seed: int,
-               render: bool, fps: float | None,
-               max_episode_steps: int | None,
-               init_mode: str | None = None):
-    """Pick the right env based on `num_envs`."""
-    if num_envs > 1:
-        if render:
-            print("warning: --render ignored in batched mode (num_envs > 1)")
-        kwargs = {"num_envs": num_envs, "opponent_policy": PARAMS["opponent"]}
-        if max_episode_steps is not None:
-            kwargs["max_episode_steps"] = max_episode_steps
-        if init_mode is not None:
-            kwargs["init_mode"] = init_mode
-        return VSSVecEnvToSB3(VSSVecEnv(**kwargs))
-
-    # Single-env path
-    env_kwargs = {"opponent_policy": PARAMS["opponent"]}
-    if render:
-        env_kwargs["render_mode"] = "human"
-        env_kwargs["render_fps"] = fps
-    if max_episode_steps is not None:
-        env_kwargs["max_episode_steps"] = max_episode_steps
-    if init_mode is not None:
-        env_kwargs["init_mode"] = init_mode
-    return make_vec_env(
-        "VSSS-v0",
-        n_envs=1,
-        seed=seed,
-        env_kwargs=env_kwargs,
-    )
-
-
-def main(seed: int, render: bool, fps: float | None,
-         timesteps: int | None, generations: int | None, forever: bool,
-         num_envs: int,
-         save_path: Path | None,
-         max_episode_steps: int | None,
-         n_steps: int | None,
-         init_mode: str | None) -> None:
-    print(f"JAX devices: {jax.devices()}   default backend: {jax.default_backend()}")
-
-    # Auto-align n_steps to max_episode_steps when not explicitly set,
-    # so each generation contains exactly num_envs episodes.
-    if n_steps is None:
-        n_steps = max_episode_steps if max_episode_steps is not None else PARAMS["n_steps"]
-
-    if forever:
-        total_timesteps = int(1e15)
-        save_every_gen = True
-    elif generations is not None:
-        total_timesteps = generations * n_steps * num_envs
-        save_every_gen = False
-    else:
-        total_timesteps = timesteps if timesteps is not None else 10_000
-        save_every_gen = False
-
-    mlflow.set_experiment("vsss-smoke")
-
-    with mlflow.start_run(run_name=f"smoke-seed{seed}-n{num_envs}"):
-        mlflow.log_params({
-            **PARAMS, "n_steps": n_steps, "seed": seed,
-            "total_timesteps": total_timesteps,
-            "physics": "jax", "n_envs": num_envs,
-            "max_episode_steps": max_episode_steps or "default",
-            "init_mode": init_mode or "kickoff",
-            "mode": "forever" if forever else ("generations" if generations is not None else "timesteps"),
-        })
-
-        env = _build_env(num_envs, seed, render, fps, max_episode_steps, init_mode)
-
-        print(f"n_steps={n_steps}  num_envs={num_envs}  → {n_steps * num_envs} env-steps/generation")
-
-        model = PPO(
-            PARAMS["policy"],
-            env,
-            learning_rate=PARAMS["learning_rate"],
-            n_steps=n_steps,
-            seed=seed,
-            verbose=1,
-            device="cpu",
-        )
-
-        try:
-            model.learn(
-                total_timesteps=total_timesteps,
-                log_interval=None,
-                callback=_EpisodeDumpCallback(
-                    save_path=save_path,
-                    save_every_gen=save_every_gen,
-                ),
-            )
-        except KeyboardInterrupt:
-            print("\nTraining interrupted.")
-
-        if save_path is not None and not save_every_gen:
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            model.save(str(save_path))
-            mlflow.log_artifact(str(save_path), artifact_path="model")
-            print(f"saved policy: {save_path}")
-
-        env.close()
-
-    print("Done. Run `mlflow ui` to inspect results.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VSSS smoke / training script")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--render", action="store_true", help="Open a live pygame window (single-env only)")
-    parser.add_argument("--fps", type=float, default=None, help="Cap render FPS (e.g. 30). Uncapped by default.")
-
-    duration = parser.add_mutually_exclusive_group()
-    duration.add_argument(
-        "--timesteps", type=int, default=None,
-        help="Total env steps to run (default: 10 000 when no other duration flag is set).",
-    )
-    duration.add_argument(
-        "--generations", type=int, default=None,
-        help="Number of PPO generations (iterations) to run. "
-             "total_timesteps = generations × n_steps × num_envs.",
-    )
-    duration.add_argument(
-        "--forever", action="store_true",
-        help="Run indefinitely (Ctrl-C to stop). Saves policy to --save-path after every "
-             "generation in a background thread. Requires --save-path.",
-    )
-
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--generations", type=int, default=1)
+    parser.add_argument("--num-envs", type=int, default=2)
+    parser.add_argument("--rollout-length", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--opponent", choices=("stationary", "random"), default="stationary")
     parser.add_argument(
-        "--num-envs", type=int, default=1,
-        help="Number of parallel envs. >1 uses VSSVecEnv via the SB3 adapter.",
+        "--init-mode", choices=tuple(mode.value for mode in InitMode), default=InitMode.KICKOFF.value
     )
     parser.add_argument(
-        "--save-path", type=Path, default=None,
-        help="Where to save policy.zip. In normal/generations mode: saved once at the end "
-             "(also as an MLflow artifact). In --forever mode: overwritten after every generation.",
-    )
-    parser.add_argument(
-        "--max-episode-steps", type=int, default=None,
-        help="Episode length cap in 15 Hz control steps (e.g. 75 = 5 s; "
-             "each control step contains four 60 Hz physics substeps). "
-             f"Defaults to config.MAX_EPISODE_STEPS ({config.MAX_EPISODE_STEPS} = "
-             f"{config.MAX_EPISODE_STEPS / config.FPS:.0f} s).",
-    )
-    parser.add_argument(
-        "--n-steps", type=int, default=None,
-        help="PPO rollout length per env per generation (default: auto-aligned to "
-             "--max-episode-steps when set, otherwise 512). Setting this equal to "
-             "--max-episode-steps gives exactly num-envs episodes per generation.",
-    )
-    parser.add_argument(
-        "--init-mode", type=str, default=None, choices=[m.value for m in InitMode],
-        help="Robot/ball placement strategy at episode reset. "
-             "'kickoff' (default) uses the standard formation; "
-             "'random' places robots uniformly in their respective halves.",
+        "--reward-profile",
+        choices=tuple(profile.value for profile in RewardProfile),
+        default=RewardProfile.DEFAULT.value,
     )
     args = parser.parse_args()
 
-    if args.forever and args.save_path is None:
-        parser.error("--forever requires --save-path")
+    if args.generations < 1 or args.num_envs < 1 or args.rollout_length < 1:
+        parser.error("generations, num-envs, and rollout-length must be positive")
 
-    main(
-        args.seed, args.render, args.fps,
-        args.timesteps, args.generations, args.forever,
-        args.num_envs,
-        args.save_path, args.max_episode_steps, args.n_steps, args.init_mode,
+    ppo_config = PPOConfig(
+        num_envs=args.num_envs,
+        rollout_length=args.rollout_length,
+        update_epochs=1,
+        num_minibatches=1,
     )
+    env = VSSJumanjiEnv(
+        opponent_policy=args.opponent,
+        init_mode=args.init_mode,
+        reward_profile=args.reward_profile,
+    )
+    trainer = PPO(env, ppo_config)
+
+    initialize_started = time.perf_counter()
+    runner = trainer.initialize(jax.random.PRNGKey(args.seed))
+    jax.block_until_ready(runner)
+    initialize_seconds = time.perf_counter() - initialize_started
+
+    compile_started = time.perf_counter()
+    executable = trainer.compile_train(runner, args.generations)
+    compile_seconds = time.perf_counter() - compile_started
+
+    execute_started = time.perf_counter()
+    runner, metrics = executable(runner)
+    jax.block_until_ready((runner, metrics))
+    execute_seconds = time.perf_counter() - execute_started
+    final = jax.device_get(jax.tree_util.tree_map(lambda values: values[-1], metrics))
+
+    print(f"JAX devices  : {jax.devices()}")
+    print(f"Batch        : {args.num_envs} envs × {args.rollout_length} steps")
+    print(f"Initialize   : {initialize_seconds:.3f}s")
+    print(f"XLA compile  : {compile_seconds:.3f}s")
+    print(f"Execute      : {execute_seconds:.3f}s")
+    print(
+        f"Final        : steps={int(final['env_steps']):,} "
+        f"loss={float(final['loss']):.4f} "
+        f"return={float(final['mean_episode_return']):.3f} "
+        f"episodes={int(final['episodes'])}"
+    )
+
+
+if __name__ == "__main__":
+    main()

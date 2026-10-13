@@ -3,7 +3,8 @@
 > Historical snapshot: this report describes the repository as it existed in
 > May 2026. The former NumPy physics implementation and runtime backend
 > selector were removed on 2026-08-19; current architecture is documented in
-> `README.md` and `STRUCTURE.md`.
+> `README.md` and `STRUCTURE.md`. The SB3 adapter and training scripts were
+> later removed after the native JAX PPO implementation became the training path.
 
 **Date:** 2026-05-30  
 **Project:** IEEE Very Small Size Soccer 3×3 Simulator for Reinforcement Learning  

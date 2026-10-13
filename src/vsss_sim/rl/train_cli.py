@@ -8,6 +8,7 @@ from pathlib import Path
 
 import jax
 
+from ..config import RewardProfile
 from ..envs.jumanji import VSSJumanjiEnv
 from .ppo import PPO, PPOConfig
 from .self_play import ExperimentConfig, run_experiment
@@ -43,7 +44,11 @@ def _legacy_train(args: argparse.Namespace) -> None:
     if num_updates < 1:
         raise ValueError(f"total_timesteps must be at least one batch ({steps_per_update:,})")
 
-    env = VSSJumanjiEnv(opponent_policy=args.opponent, init_mode=args.init_mode)
+    env = VSSJumanjiEnv(
+        opponent_policy=args.opponent,
+        init_mode=args.init_mode,
+        reward_profile=args.reward_profile or RewardProfile.DEFAULT.value,
+    )
     trainer = PPO(env, config)
 
     print(f"JAX devices : {jax.devices()}")
@@ -98,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-minibatches", type=int, default=8)
     parser.add_argument("--opponent", choices=("stationary", "random"), default="stationary")
     parser.add_argument("--init-mode", choices=("kickoff", "random"), default="kickoff")
+    parser.add_argument(
+        "--reward-profile",
+        choices=tuple(profile.value for profile in RewardProfile),
+        help="Team reward rules; an override for experiment JSON when using --xp.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
@@ -117,6 +127,8 @@ def main() -> None:
         overrides["num_lineages"] = args.num_lineages
     if args.num_envs_per_lineage is not None:
         overrides["num_envs_per_lineage"] = args.num_envs_per_lineage
+    if args.reward_profile is not None:
+        overrides["reward_profile"] = args.reward_profile
     if overrides:
         config = replace(config, **overrides)
     run_experiment(config, config_source=config_path)
