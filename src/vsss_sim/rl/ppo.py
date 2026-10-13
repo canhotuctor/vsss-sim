@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import jax.scipy as jsp
 import optax
 from flax import linen as nn
 from flax.training.train_state import TrainState
@@ -85,6 +86,68 @@ class ActorCritic(nn.Module):
         return mean, jnp.broadcast_to(log_std, mean.shape), jnp.squeeze(value, axis=-1)
 
 
+class BrandaoSharedActorCritic(nn.Module):
+    """Paper-shaped per-robot actor and value networks with a shared policy."""
+
+    @nn.compact
+    def __call__(
+        self, observation: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        actor = observation
+        for size in (300, 200, 100):
+            actor = nn.tanh(
+                nn.Dense(size, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(
+                    actor
+                )
+            )
+        alpha = nn.softplus(
+            nn.Dense(2, kernel_init=nn.initializers.orthogonal(0.01), name="alpha")(
+                actor
+            )
+        ) + 1.0
+        beta = nn.softplus(
+            nn.Dense(2, kernel_init=nn.initializers.orthogonal(0.01), name="beta")(
+                actor
+            )
+        ) + 1.0
+
+        critic = observation
+        for size in (256, 128, 64):
+            critic = nn.tanh(
+                nn.Dense(size, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(
+                    critic
+                )
+            )
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(critic)
+        return alpha, beta, jnp.squeeze(value, axis=-1)
+
+
+def create_policy_model(
+    policy_architecture: str, hidden_sizes: tuple[int, ...] = (64, 64)
+) -> nn.Module:
+    """Construct the selected checkpoint-compatible actor-critic model."""
+    if policy_architecture == "joint":
+        return ActorCritic(action_size=6, hidden_sizes=hidden_sizes)
+    if policy_architecture == "brandao_shared":
+        return BrandaoSharedActorCritic()
+    raise ValueError(
+        "policy_architecture must be 'joint' or 'brandao_shared'"
+    )
+
+
+def deterministic_policy_action(
+    model: nn.Module,
+    params: dict,
+    observation: jax.Array,
+    policy_architecture: str,
+) -> jax.Array:
+    """Map observations to the selected policy's deterministic wheel speeds."""
+    first, second, _ = model.apply(params, observation)
+    if policy_architecture == "brandao_shared":
+        return 2.0 * first / (first + second) - 1.0
+    return jnp.tanh(first)
+
+
 class RunnerState(NamedTuple):
     """All mutable training state carried from one PPO update to the next."""
 
@@ -140,6 +203,35 @@ def _normal_entropy(log_std: jax.Array) -> jax.Array:
     return jnp.sum(log_std + 0.5 * (1.0 + _LOG_2PI), axis=-1)
 
 
+def _beta_log_prob(
+    sample: jax.Array, alpha: jax.Array, beta: jax.Array
+) -> jax.Array:
+    sample = jnp.clip(sample, 1e-6, 1.0 - 1e-6)
+    log_normalizer = (
+        jsp.special.gammaln(alpha)
+        + jsp.special.gammaln(beta)
+        - jsp.special.gammaln(alpha + beta)
+    )
+    log_density = (
+        (alpha - 1.0) * jnp.log(sample)
+        + (beta - 1.0) * jnp.log1p(-sample)
+        - log_normalizer
+    )
+    # The policy's wheel space is [-1, 1], an affine transform of Beta [0, 1].
+    return jnp.sum(log_density, axis=-1) - 2.0 * jnp.log(jnp.float32(2.0))
+
+
+def _beta_entropy(alpha: jax.Array, beta: jax.Array) -> jax.Array:
+    total = alpha + beta
+    entropy = (
+        jsp.special.betaln(alpha, beta)
+        - (alpha - 1.0) * jsp.special.digamma(alpha)
+        - (beta - 1.0) * jsp.special.digamma(beta)
+        + (total - 2.0) * jsp.special.digamma(total)
+    )
+    return jnp.sum(entropy + jnp.log(jnp.float32(2.0)), axis=-1)
+
+
 def compute_gae(
     rewards: jax.Array,
     values: jax.Array,
@@ -179,10 +271,8 @@ class PPO:
     def __init__(self, env: VSSJumanjiEnv, config: PPOConfig = PPOConfig()) -> None:
         self.env = env
         self.config = config
-        self.model = ActorCritic(
-            action_size=env.action_spec.shape[0],
-            hidden_sizes=config.hidden_sizes,
-        )
+        self.policy_architecture = env.policy_architecture
+        self.model = create_policy_model(self.policy_architecture, config.hidden_sizes)
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(config.max_grad_norm),
             optax.adam(config.learning_rate, eps=1e-5),
@@ -211,6 +301,10 @@ class PPO:
         self._compiled_train_many = jax.jit(
             self._train_many, static_argnames=("num_updates",)
         )
+
+    @property
+    def is_shared_agent_policy(self) -> bool:
+        return self.policy_architecture == "brandao_shared"
 
     def initialize(
         self,
@@ -373,13 +467,21 @@ class PPO:
         deterministic: bool = True,
     ) -> jax.Array:
         """Return bounded wheel actions for evaluation or inference."""
-        mean, log_std, _ = self.model.apply(params, observation)
+        first, second, _ = self.model.apply(params, observation)
+        if self.policy_architecture == "brandao_shared":
+            if deterministic:
+                sample = first / (first + second)
+            else:
+                if key is None:
+                    raise ValueError("key is required for stochastic actions")
+                sample = jax.random.beta(key, first, second)
+            return 2.0 * sample - 1.0
         if deterministic:
-            raw_action = mean
+            raw_action = first
         else:
             if key is None:
                 raise ValueError("key is required for stochastic actions")
-            raw_action = mean + jnp.exp(log_std) * jax.random.normal(key, mean.shape)
+            raw_action = first + jnp.exp(second) * jax.random.normal(key, first.shape)
         return jnp.tanh(raw_action)
 
     def _initialize(self, key: jax.Array) -> RunnerState:
@@ -394,7 +496,12 @@ class PPO:
 
         reset_keys = jax.random.split(reset_key, self.config.num_envs)
         env_state, timestep = self._batched_reset(reset_keys)
-        zeros_float = jnp.zeros(self.config.num_envs, dtype=jnp.float32)
+        return_shape = (
+            (self.config.num_envs, 3)
+            if self.is_shared_agent_policy
+            else (self.config.num_envs,)
+        )
+        zeros_float = jnp.zeros(return_shape, dtype=jnp.float32)
         zeros_int = jnp.zeros(self.config.num_envs, dtype=jnp.int32)
         return RunnerState(
             train_state=train_state,
@@ -463,9 +570,13 @@ class PPO:
     def _sample_policy(
         self, params: dict, observation: jax.Array, key: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        mean, log_std, value = self.model.apply(params, observation)
-        raw_action = mean + jnp.exp(log_std) * jax.random.normal(key, mean.shape)
-        log_prob = _normal_log_prob(raw_action, mean, log_std)
+        first, second, value = self.model.apply(params, observation)
+        if self.policy_architecture == "brandao_shared":
+            sample = jax.random.beta(key, first, second)
+            log_prob = _beta_log_prob(sample, first, second)
+            return 2.0 * sample - 1.0, sample, log_prob, value
+        raw_action = first + jnp.exp(second) * jax.random.normal(key, first.shape)
+        log_prob = _normal_log_prob(raw_action, first, second)
         return jnp.tanh(raw_action), raw_action, log_prob, value
 
     def _maybe_reset(
@@ -533,13 +644,17 @@ class PPO:
                 stepped_state, timestep = self._batched_step(carry.env_state, action)
             else:
                 opponent_observation = self._batched_opponent_observation(carry.env_state)
-                mean, log_std, _ = jax.vmap(self.model.apply)(
+                first, second, _ = jax.vmap(self.model.apply)(
                     carry.opponent_params, opponent_observation
                 )
-                opponent_raw_action = mean + jnp.exp(log_std) * jax.random.normal(
-                    opponent_key, mean.shape
-                )
-                opponent_action = jnp.tanh(opponent_raw_action)
+                if self.policy_architecture == "brandao_shared":
+                    opponent_sample = jax.random.beta(opponent_key, first, second)
+                    opponent_action = 2.0 * opponent_sample - 1.0
+                else:
+                    opponent_raw_action = first + jnp.exp(second) * jax.random.normal(
+                        opponent_key, first.shape
+                    )
+                    opponent_action = jnp.tanh(opponent_raw_action)
                 stepped_state, timestep = self._batched_step_with_opponent(
                     carry.env_state,
                     action,
@@ -555,7 +670,12 @@ class PPO:
             episode_end = timestep.last()
             running_return = carry.episode_return + timestep.reward
             running_length = carry.episode_length + jnp.int32(1)
-            completed_return = jnp.where(episode_end, running_return, 0.0)
+            return_episode_end = (
+                episode_end[..., None]
+                if self.is_shared_agent_policy
+                else episode_end
+            )
+            completed_return = jnp.where(return_episode_end, running_return, 0.0)
             completed_length = jnp.where(episode_end, running_length, 0)
 
             reset_keys = jax.random.split(reset_key, self.config.num_envs)
@@ -609,7 +729,7 @@ class PPO:
                 env_state=next_env_state,
                 observation=next_observation,
                 key=next_key,
-                episode_return=jnp.where(episode_end, 0.0, running_return),
+                episode_return=jnp.where(return_episode_end, 0.0, running_return),
                 episode_length=jnp.where(episode_end, 0, running_length),
                 env_steps=carry.env_steps + jnp.int32(self.config.num_envs),
                 opponent_params=next_opponent_params,
@@ -663,8 +783,13 @@ class PPO:
     def _loss(
         self, params: dict, batch: _TrainingBatch
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
-        mean, log_std, value = self.model.apply(params, batch.observation)
-        log_prob = _normal_log_prob(batch.raw_action, mean, log_std)
+        first, second, value = self.model.apply(params, batch.observation)
+        if self.policy_architecture == "brandao_shared":
+            log_prob = _beta_log_prob(batch.raw_action, first, second)
+            entropy = jnp.mean(_beta_entropy(first, second))
+        else:
+            log_prob = _normal_log_prob(batch.raw_action, first, second)
+            entropy = jnp.mean(_normal_entropy(second))
         log_ratio = log_prob - batch.old_log_prob
         ratio = jnp.exp(log_ratio)
 
@@ -684,7 +809,6 @@ class PPO:
         value_loss = 0.5 * jnp.mean(
             jnp.maximum(jnp.square(value - batch.target), jnp.square(clipped_value - batch.target))
         )
-        entropy = jnp.mean(_normal_entropy(log_std))
         total_loss = (
             policy_loss
             + self.config.value_coefficient * value_loss
@@ -747,12 +871,17 @@ class PPO:
         rollout_runner, trajectory = self._collect_rollout(
             runner, opponent_pool, opponent_probabilities, opponent_generations
         )
+        episode_ends = trajectory.episode_end
+        discounts = trajectory.discount
+        if trajectory.reward.ndim > episode_ends.ndim:
+            episode_ends = episode_ends[..., None]
+            discounts = discounts[..., None]
         advantages, targets = compute_gae(
             rewards=trajectory.reward,
             values=trajectory.old_value,
             bootstrap_values=trajectory.bootstrap_value,
-            discounts=trajectory.discount,
-            episode_ends=trajectory.episode_end,
+            discounts=discounts,
+            episode_ends=episode_ends,
             gamma=self.config.gamma,
             gae_lambda=self.config.gae_lambda,
         )
@@ -778,9 +907,15 @@ class PPO:
         metrics.update(
             {
                 "mean_reward": jnp.mean(trajectory.reward),
+                "agent_transitions": runner.env_steps
+                * (3 if self.is_shared_agent_policy else 1),
                 "episodes": episode_count,
                 "mean_episode_return": jnp.sum(trajectory.completed_return)
-                / safe_episode_count,
+                / (
+                    safe_episode_count * 3
+                    if self.is_shared_agent_policy
+                    else safe_episode_count
+                ),
                 "mean_episode_length": jnp.sum(trajectory.completed_length)
                 / safe_episode_count,
                 "blue_goals": jnp.sum(trajectory.goal == 1),

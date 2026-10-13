@@ -10,14 +10,15 @@ import jax.numpy as jnp
 import numpy as np
 
 from .. import config as sim_config
+from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
 from ..envs.jumanji import VSSJumanjiEnv
-from .ppo import ActorCritic
+from .ppo import create_policy_model, deterministic_policy_action
 from .self_play import ExperimentConfig, SnapshotArchive
 
 
 def _evaluate_batch(
     env: VSSJumanjiEnv,
-    model: ActorCritic,
+    model,
     current_params: dict,
     opponent_params: dict,
     opponent_modes: jax.Array,
@@ -29,13 +30,15 @@ def _evaluate_batch(
 
     def match_step(carry, _):
         states, observation = carry
-        current_means, _, _ = jax.vmap(
-            lambda obs: model.apply(current_params, obs)
-        )(observation)
+        blue_action = deterministic_policy_action(
+            model, current_params, observation, env.policy_architecture
+        )
         opponent_observations = jax.vmap(env.opponent_observation)(states)
-        opponent_means, _, _ = jax.vmap(model.apply)(opponent_params, opponent_observations)
-        blue_action = jnp.tanh(current_means)
-        yellow_action = jnp.tanh(opponent_means)
+        yellow_action = jax.vmap(
+            lambda params, obs: deterministic_policy_action(
+                model, params, obs, env.policy_architecture
+            )
+        )(opponent_params, opponent_observations)
         next_states, timestep = jax.vmap(
             lambda state, action, opponent_action, mode: env.step(
                 state,
@@ -76,7 +79,7 @@ def _summary(scores: np.ndarray) -> dict[str, Any]:
 
 def _evaluate_group(
     env: VSSJumanjiEnv,
-    model: ActorCritic,
+    model,
     current_params: dict,
     opponent_params: list[dict],
     opponent_modes: np.ndarray,
@@ -134,7 +137,8 @@ def evaluate_experiment(
     if any(value < 0 or value >= config.num_lineages for value in lineages):
         raise ValueError("lineage index is outside the configured experiment")
 
-    horizon = int(round(config.evaluation_seconds * sim_config.FPS))
+    policy_hz = 10 if config.policy_architecture == "brandao_shared" else sim_config.FPS
+    horizon = int(round(config.evaluation_seconds * policy_hz))
     # Evaluation is a match-level rollout.  Goals reset the field position
     # while the match score and wall-clock horizon continue, so use the
     # environment's in-match kickoff path instead of episode termination.
@@ -144,9 +148,17 @@ def evaluate_experiment(
         init_mode=config.init_mode,
         terminate_on_goal=False,
         reward_profile=config.reward_profile,
+        policy_architecture=config.policy_architecture,
     )
-    model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
-    template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))
+    model = create_policy_model(config.policy_architecture, config.hidden_sizes)
+    observation_size = (
+        BRANDAO_OBSERVATION_SIZE
+        if config.policy_architecture == "brandao_shared"
+        else 46
+    )
+    template = model.init(
+        jax.random.PRNGKey(0), jnp.zeros((observation_size,), dtype=jnp.float32)
+    )
     output_records = []
 
     for lineage_id in lineages:
@@ -168,6 +180,7 @@ def evaluate_experiment(
             template,
             current_generation,
             expected_hidden_sizes=config.hidden_sizes,
+            expected_policy_architecture=config.policy_architecture,
         )
         historical = [
             item for item in snapshots if item["generation"] < current_generation
@@ -178,7 +191,12 @@ def evaluate_experiment(
             historical = historical[-config.active_pool_limit :]
         historical_generations = [int(item["generation"]) for item in historical]
         historical_params = [
-            archive.load(template, item, expected_hidden_sizes=config.hidden_sizes)
+            archive.load(
+                template,
+                item,
+                expected_hidden_sizes=config.hidden_sizes,
+                expected_policy_architecture=config.policy_architecture,
+            )
             for item in historical_generations
         ]
 
@@ -247,6 +265,7 @@ def evaluate_experiment(
     result = {
         "experiment_name": config.experiment_name,
         "reward_profile": config.reward_profile,
+        "policy_architecture": config.policy_architecture,
         "evaluation_seconds": config.evaluation_seconds,
         "control_steps": horizon,
         "seed": base_seed,
@@ -284,7 +303,8 @@ def evaluate_experiment_exhaustive_history(
     if any(value < 0 or value >= config.num_lineages for value in lineages):
         raise ValueError("lineage index is outside the configured experiment")
 
-    horizon = int(round(config.evaluation_seconds * sim_config.FPS))
+    policy_hz = 10 if config.policy_architecture == "brandao_shared" else sim_config.FPS
+    horizon = int(round(config.evaluation_seconds * policy_hz))
     # Keep the same match-level semantics as the regular evaluator: a goal
     # triggers a kickoff, but does not end the 120-second match rollout.
     env = VSSJumanjiEnv(
@@ -293,9 +313,17 @@ def evaluate_experiment_exhaustive_history(
         init_mode=config.init_mode,
         terminate_on_goal=False,
         reward_profile=config.reward_profile,
+        policy_architecture=config.policy_architecture,
     )
-    model = ActorCritic(action_size=6, hidden_sizes=config.hidden_sizes)
-    template = model.init(jax.random.PRNGKey(0), jnp.zeros((46,), dtype=jnp.float32))
+    model = create_policy_model(config.policy_architecture, config.hidden_sizes)
+    observation_size = (
+        BRANDAO_OBSERVATION_SIZE
+        if config.policy_architecture == "brandao_shared"
+        else 46
+    )
+    template = model.init(
+        jax.random.PRNGKey(0), jnp.zeros((observation_size,), dtype=jnp.float32)
+    )
     output_records = []
 
     for lineage_id in lineages:
@@ -317,6 +345,7 @@ def evaluate_experiment_exhaustive_history(
             template,
             current_generation,
             expected_hidden_sizes=config.hidden_sizes,
+            expected_policy_architecture=config.policy_architecture,
         )
         historical = [
             item for item in snapshots if item["generation"] < current_generation
@@ -327,7 +356,12 @@ def evaluate_experiment_exhaustive_history(
             historical = historical[-config.active_pool_limit :]
         historical_generations = [int(item["generation"]) for item in historical]
         historical_params = [
-            archive.load(template, item, expected_hidden_sizes=config.hidden_sizes)
+            archive.load(
+                template,
+                item,
+                expected_hidden_sizes=config.hidden_sizes,
+                expected_policy_architecture=config.policy_architecture,
+            )
             for item in historical_generations
         ]
 
@@ -364,6 +398,7 @@ def evaluate_experiment_exhaustive_history(
         "experiment_name": config.experiment_name,
         "reward_profile": config.reward_profile,
         "evaluation_mode": "exhaustive_history",
+        "policy_architecture": config.policy_architecture,
         "evaluation_seconds": config.evaluation_seconds,
         "control_steps": horizon,
         "matches_per_snapshot": match_count,

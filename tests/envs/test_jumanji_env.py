@@ -87,6 +87,39 @@ def test_brandao_goal_reward_is_jittable_and_uses_remaining_horizon():
     )
 
 
+def test_brandao_shared_policy_builds_stacked_agent_views_and_exact_10hz_steps():
+    env = VSSJumanjiEnv(
+        max_episode_steps=10,
+        reward_profile="brandao_reward",
+        policy_architecture="brandao_shared",
+        terminate_on_goal=True,
+    )
+    state, first = env.reset(jax.random.PRNGKey(8))
+    assert first.observation.shape == (3, 424)
+    assert env.action_spec.shape == (3, 2)
+    assert state.observation_history.shape == (2, 3, 8, 53)
+
+    action = jnp.asarray([[0.1, -0.2], [0.3, -0.4], [0.5, -0.6]])
+    time_before = state.simulation.t
+    state, first_step = jax.jit(env.step)(state, action)
+    time_after_one_decision = state.simulation.t
+    state, second_step = jax.jit(env.step)(state, action)
+
+    np.testing.assert_allclose(
+        time_after_one_decision - time_before, 0.1, atol=1e-7
+    )
+    np.testing.assert_allclose(
+        state.simulation.t - time_after_one_decision, 0.1, atol=1e-7
+    )
+    assert first_step.reward.shape == (3,)
+    assert second_step.observation.shape == (3, 424)
+    assert env.opponent_observation(state).shape == (3, 424)
+    np.testing.assert_allclose(
+        state.observation_history[config.TEAM_BLUE, 0, -1, 46:52],
+        action.reshape(-1),
+    )
+
+
 def test_only_jax_native_opponents_are_accepted():
     with pytest.raises(ValueError, match="JAX-native"):
         VSSJumanjiEnv(opponent_policy="custom")

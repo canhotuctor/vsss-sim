@@ -54,6 +54,23 @@ def test_brandao_reward_profile_round_trips_and_reaches_environment():
     assert _make_env(restored).reward_profile.value == "brandao_reward"
 
 
+def test_brandao_shared_architecture_selects_paper_style_training_contract():
+    config = ExperimentConfig(
+        experiment_name="brandao-shared",
+        num_generations=1,
+        policy_architecture="brandao_shared",
+    )
+    restored = ExperimentConfig.from_dict(config.to_dict())
+    env = _make_env(restored)
+
+    assert restored.reward_profile == "brandao_reward"
+    assert restored.hidden_sizes == (300, 200, 100)
+    assert restored.max_episode_steps == 400
+    assert restored.terminate_on_goal
+    assert env.observation_spec.shape == (3, 424)
+    assert env.action_spec.shape == (3, 2)
+
+
 def test_experiment_config_rejects_unknown_reward_profile():
     with pytest.raises(ValueError, match="reward_profile"):
         ExperimentConfig(

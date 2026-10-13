@@ -115,8 +115,18 @@ def _default_reward(context: MatchStepInput) -> jax.Array:
     ).astype(jnp.float32)
 
 
-def _brandao_reward(context: MatchStepInput, max_episode_steps: int) -> jax.Array:
-    """Brandão et al. (2022), Eq. (6)-(16), from blue's team perspective."""
+def _brandao_reward(
+    context: MatchStepInput,
+    max_episode_steps: int,
+    individual_agent_rewards: bool = False,
+) -> jax.Array:
+    """Brandão et al. (2022), Eq. (6)-(16), from blue's team perspective.
+
+    The shared decentralized policy receives one reward per robot: universal
+    ball terms and goal outcome are shared, while positioning rewards are
+    assigned to the individual robot. The centralized policy retains its
+    historical scalar team reward.
+    """
     simulation = context.simulation_after_physics
     ball_before = context.simulation_before.ball[:2]
     ball_after = simulation.ball[:2]
@@ -139,12 +149,19 @@ def _brandao_reward(context: MatchStepInput, max_episode_steps: int) -> jax.Arra
         lambda robot: _angle_reward(ball_after, robot, own_goal)
     )(blue_positions)
 
-    continuous_reward = (
-        0.7 * speed_reward
-        + 0.1 * proximity_reward
-        + 0.1 * jnp.mean(offensive_reward)
-        + 0.1 * jnp.mean(defensive_reward)
-    )
+    universal_reward = 0.7 * speed_reward + 0.1 * proximity_reward
+    if individual_agent_rewards:
+        continuous_reward = (
+            universal_reward
+            + 0.1 * offensive_reward
+            + 0.1 * defensive_reward
+        )
+    else:
+        continuous_reward = (
+            universal_reward
+            + 0.1 * jnp.mean(offensive_reward)
+            + 0.1 * jnp.mean(defensive_reward)
+        )
     horizon = jnp.float32(max_episode_steps)
     goal_reward = 10.0 * context.goal.astype(jnp.float32) * (
         1.0 + (horizon - context.step_count.astype(jnp.float32)) / horizon
@@ -163,6 +180,7 @@ class MatchRules:
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         init_mode: InitMode | str = InitMode.KICKOFF,
         kickoff_on_goal: bool = True,
+        individual_agent_rewards: bool = False,
     ) -> None:
         if max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
@@ -170,6 +188,7 @@ class MatchRules:
         self.max_episode_steps = int(max_episode_steps)
         self.init_mode = InitMode(init_mode)
         self.kickoff_on_goal = bool(kickoff_on_goal)
+        self.individual_agent_rewards = bool(individual_agent_rewards)
 
     def observation(self, simulation: physics.SimState) -> jax.Array:
         return build_observation(simulation)
@@ -181,7 +200,11 @@ class MatchRules:
         The returned observation always describes the state carried forward.
         """
         if self.reward_profile is RewardProfile.BRANDAO_REWARD:
-            reward = _brandao_reward(context, self.max_episode_steps)
+            reward = _brandao_reward(
+                context,
+                self.max_episode_steps,
+                individual_agent_rewards=self.individual_agent_rewards,
+            )
         else:
             reward = _default_reward(context)
 

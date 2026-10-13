@@ -92,6 +92,41 @@ def test_one_compiled_update_changes_parameters_and_counts_steps():
     assert all(np.isfinite(np.asarray(value)).all() for value in metrics.values())
 
 
+def test_brandao_shared_ppo_updates_from_three_local_transitions_per_tick():
+    env = VSSJumanjiEnv(
+        max_episode_steps=3,
+        reward_profile="brandao_reward",
+        policy_architecture="brandao_shared",
+        terminate_on_goal=True,
+    )
+    config = PPOConfig(
+        num_envs=1,
+        rollout_length=2,
+        update_epochs=1,
+        num_minibatches=1,
+    )
+    trainer = PPO(env, config)
+    runner = trainer.initialize(jax.random.PRNGKey(17))
+    params_before = runner.train_state.params
+
+    runner, metrics = trainer.update(runner)
+    jax.block_until_ready((runner, metrics))
+
+    changed = [
+        not np.array_equal(np.asarray(before), np.asarray(after))
+        for before, after in zip(
+            jax.tree_util.tree_leaves(params_before),
+            jax.tree_util.tree_leaves(runner.train_state.params),
+            strict=True,
+        )
+    ]
+    assert any(changed)
+    assert runner.observation.shape == (1, 3, 424)
+    assert int(metrics["env_steps"]) == 2
+    assert int(metrics["agent_transitions"]) == 6
+    assert all(np.isfinite(np.asarray(value)).all() for value in metrics.values())
+
+
 def test_multiple_generations_run_inside_compiled_scan():
     env = VSSJumanjiEnv(max_episode_steps=3)
     config = PPOConfig(

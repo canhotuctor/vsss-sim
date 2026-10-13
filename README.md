@@ -153,7 +153,9 @@ in an experiment JSON. The same profile option is available on `VSSEnv`,
 The included long-run configuration can be started with
 `python scripts/train_jax.py --xp experiment26_brandao_reward`.
 See [the profile notes](docs/brandao-reward-profile.md) for the terms and the
-team-reward adaptation.
+team-reward adaptation. A paper-style per-robot shared policy is available as
+`policy_architecture: "brandao_shared"`; the paper-scale configuration is
+`configs/experiments/experiment26_brandao_shared_160m.json`.
 
 ---
 

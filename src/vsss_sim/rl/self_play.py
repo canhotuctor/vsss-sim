@@ -16,10 +16,12 @@ from flax import serialization
 
 from ..config import InitMode, RewardProfile
 from ..envs.jumanji import VSSJumanjiEnv
+from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
 from .ppo import PPO, PPOConfig
 
 _SNAPSHOT_SCHEMA_VERSION = 1
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_POLICY_ARCHITECTURES = ("joint", "brandao_shared")
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,9 @@ class ExperimentConfig:
     num_envs_per_lineage: int = 256
     rollout_length: int = 128
     learning_rate: float = 3e-4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.2
     update_epochs: int = 4
     num_minibatches: int = 8
     hidden_sizes: tuple[int, ...] = (64, 64)
@@ -92,6 +97,8 @@ class ExperimentConfig:
     terminate_on_goal: bool = False
     init_mode: str = "kickoff"
     reward_profile: str = RewardProfile.DEFAULT.value
+    policy_architecture: str = "joint"
+    opponent_update_threshold: float = 0.6
     output_root: str = "output/experiments"
     evaluation_matches: int = 100
     evaluation_seconds: int = 120
@@ -118,8 +125,35 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be at least 1")
         if self.active_pool_limit is not None and self.active_pool_limit < 1:
             raise ValueError("active_pool_limit must be at least 1 when provided")
+        if self.opponent_update_threshold < 0.0:
+            raise ValueError("opponent_update_threshold must be non-negative")
         if self.init_mode not in ("kickoff", "random"):
             raise ValueError("init_mode must be 'kickoff' or 'random'")
+        if self.policy_architecture not in _POLICY_ARCHITECTURES:
+            raise ValueError(
+                "policy_architecture must be 'joint' or 'brandao_shared'"
+            )
+        if self.policy_architecture == "brandao_shared":
+            if self.reward_profile == RewardProfile.DEFAULT.value:
+                object.__setattr__(
+                    self, "reward_profile", RewardProfile.BRANDAO_REWARD.value
+                )
+            if self.reward_profile != RewardProfile.BRANDAO_REWARD.value:
+                raise ValueError(
+                    "brandao_shared requires the brandao_reward profile"
+                )
+            if self.hidden_sizes == (64, 64):
+                object.__setattr__(self, "hidden_sizes", (300, 200, 100))
+            elif self.hidden_sizes != (300, 200, 100):
+                raise ValueError(
+                    "brandao_shared uses the paper's 300/200/100 actor layers"
+                )
+            # Brandão's policy runs at 10 Hz and training episodes end at a
+            # goal or after 40 seconds.
+            if self.max_episode_steps == 300:
+                object.__setattr__(self, "max_episode_steps", 400)
+            if not self.terminate_on_goal:
+                object.__setattr__(self, "terminate_on_goal", True)
         try:
             profile = RewardProfile(self.reward_profile)
         except ValueError as error:
@@ -134,6 +168,9 @@ class ExperimentConfig:
             num_envs=self.num_envs_per_lineage,
             rollout_length=self.rollout_length,
             learning_rate=self.learning_rate,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            clip_epsilon=self.clip_epsilon,
             update_epochs=self.update_epochs,
             num_minibatches=self.num_minibatches,
             hidden_sizes=self.hidden_sizes,
@@ -181,8 +218,9 @@ class SnapshotArchive:
         generation: int,
         seed: int,
         hidden_sizes: tuple[int, ...],
-        observation_size: int = 46,
-        action_size: int = 6,
+        observation_size: int | None = None,
+        action_size: int | None = None,
+        policy_architecture: str = "joint",
     ) -> Path:
         if generation < 0:
             raise ValueError("generation must be non-negative")
@@ -192,6 +230,14 @@ class SnapshotArchive:
         metadata_path = self.directory / f"{stem}.json"
         if payload_path.exists() or metadata_path.exists():
             raise FileExistsError(f"snapshot for generation {generation} already exists")
+        if policy_architecture not in _POLICY_ARCHITECTURES:
+            raise ValueError(f"unknown policy architecture: {policy_architecture}")
+        if policy_architecture == "brandao_shared":
+            observation_size = 424 if observation_size is None else observation_size
+            action_size = 2 if action_size is None else action_size
+        else:
+            observation_size = 46 if observation_size is None else observation_size
+            action_size = 6 if action_size is None else action_size
 
         metadata = {
             "schema_version": _SNAPSHOT_SCHEMA_VERSION,
@@ -202,6 +248,7 @@ class SnapshotArchive:
             "hidden_sizes": list(hidden_sizes),
             "observation_size": int(observation_size),
             "action_size": int(action_size),
+            "policy_architecture": policy_architecture,
             "artifact": payload_path.name,
         }
         payload = serialization.to_bytes(jax.device_get(params))
@@ -241,11 +288,18 @@ class SnapshotArchive:
         template: dict,
         generation: int,
         expected_hidden_sizes: tuple[int, ...] | None = None,
+        expected_policy_architecture: str | None = None,
     ) -> dict:
         matches = [item for item in self.list_snapshots() if item["generation"] == generation]
         if not matches:
             raise FileNotFoundError(f"no snapshot for generation {generation} in {self.directory}")
         metadata = matches[0]
+        stored_architecture = metadata.get("policy_architecture", "joint")
+        if (
+            expected_policy_architecture is not None
+            and stored_architecture != expected_policy_architecture
+        ):
+            raise ValueError("snapshot policy architecture does not match experiment")
         if expected_hidden_sizes is not None and tuple(metadata["hidden_sizes"]) != tuple(
             expected_hidden_sizes
         ):
@@ -259,6 +313,7 @@ class SnapshotArchive:
         template: dict,
         active_limit: int | None = None,
         expected_hidden_sizes: tuple[int, ...] | None = None,
+        expected_policy_architecture: str | None = None,
     ) -> tuple[dict, tuple[int, ...]]:
         snapshots = self.list_snapshots()
         if active_limit is not None:
@@ -267,7 +322,12 @@ class SnapshotArchive:
             raise ValueError(f"historical pool is empty: {self.directory}")
         generations = tuple(item["generation"] for item in snapshots)
         params = [
-            self.load(template, generation, expected_hidden_sizes)
+            self.load(
+                template,
+                generation,
+                expected_hidden_sizes,
+                expected_policy_architecture,
+            )
             for generation in generations
         ]
         stacked = jax.tree_util.tree_map(lambda *values: jnp.stack(values), *params)
@@ -289,6 +349,7 @@ def _make_env(config: ExperimentConfig) -> Any:
         init_mode=InitMode(config.init_mode),
         terminate_on_goal=config.terminate_on_goal,
         reward_profile=config.reward_profile,
+        policy_architecture=config.policy_architecture,
     )
 
 
@@ -303,6 +364,7 @@ def _active_pools(
             template_params,
             active_limit=config.active_pool_limit,
             expected_hidden_sizes=config.hidden_sizes,
+            expected_policy_architecture=config.policy_architecture,
         )
         pools.append(pool)
         probabilities.append(config.opponent_weights.category_probabilities())
@@ -313,6 +375,35 @@ def _active_pools(
         jnp.asarray(np.stack(probabilities)),
         jnp.stack(generation_ids),
         tuple(pool_generations),
+    )
+
+
+def _brandao_opponent_pools(
+    archives: list[SnapshotArchive],
+    template_params: dict,
+    config: ExperimentConfig,
+    selected_generations: list[int],
+) -> tuple[dict, jax.Array, jax.Array, tuple[tuple[int, ...], ...]]:
+    """Build one fixed historical opponent per lineage for Brandão self-play."""
+    pools = []
+    for archive, generation in zip(archives, selected_generations, strict=True):
+        params = archive.load(
+            template_params,
+            generation,
+            expected_hidden_sizes=config.hidden_sizes,
+            expected_policy_architecture=config.policy_architecture,
+        )
+        pools.append(jax.tree_util.tree_map(lambda value: value[None, ...], params))
+    probabilities = jnp.tile(
+        jnp.asarray([[0.0, 0.0, 1.0, 0.0, 0.0]], dtype=jnp.float32),
+        (config.num_lineages, 1),
+    )
+    generation_ids = jnp.asarray(selected_generations, dtype=jnp.int32)[:, None]
+    return (
+        _stack_lineages(pools),
+        probabilities,
+        generation_ids,
+        tuple((generation,) for generation in selected_generations),
     )
 
 
@@ -365,12 +456,29 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             generation=0,
             seed=config.seed,
             hidden_sizes=config.hidden_sizes,
+            observation_size=(
+                BRANDAO_OBSERVATION_SIZE
+                if config.policy_architecture == "brandao_shared"
+                else 46
+            ),
+            action_size=2 if config.policy_architecture == "brandao_shared" else 6,
+            policy_architecture=config.policy_architecture,
         )
 
     pool_load_started = time.perf_counter()
-    pools, probabilities, generation_ids, pool_generations = _active_pools(
-        archives, _extract_lineage(initial_runners.train_state.params, 0), config
-    )
+    if config.policy_architecture == "brandao_shared":
+        selected_opponent_generations = [0] * config.num_lineages
+        pools, probabilities, generation_ids, pool_generations = _brandao_opponent_pools(
+            archives,
+            _extract_lineage(initial_runners.train_state.params, 0),
+            config,
+            selected_opponent_generations,
+        )
+    else:
+        selected_opponent_generations = []
+        pools, probabilities, generation_ids, pool_generations = _active_pools(
+            archives, _extract_lineage(initial_runners.train_state.params, 0), config
+        )
     initial_pool_load_seconds = time.perf_counter() - pool_load_started
     runners = trainer.initialize_lineages(keys, pools, probabilities, generation_ids)
     jax.block_until_ready(runners)
@@ -384,10 +492,16 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             "generation": 0,
             "seconds": initial_pool_load_seconds,
             "active_snapshots_per_lineage": len(pool_generations[0]),
+            "opponent_update_threshold": (
+                config.opponent_update_threshold
+                if config.policy_architecture == "brandao_shared"
+                else None
+            ),
         },
     )
     completed = 0
     steps_per_generation = config.ppo_config().batch_size
+    transitions_per_step = 3 if config.policy_architecture == "brandao_shared" else 1
     print(f"JAX devices          : {jax.devices()}")
     print(f"Lineages             : {config.num_lineages}")
     print(f"Environments/lineage : {config.num_envs_per_lineage}")
@@ -414,8 +528,21 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                 "generation_end": completed + chunk_size,
                 "seconds": elapsed,
                 "env_steps": chunk_size * steps_per_generation * config.num_lineages,
+                "agent_transitions": (
+                    chunk_size
+                    * steps_per_generation
+                    * config.num_lineages
+                    * transitions_per_step
+                ),
                 "env_steps_per_second": (
                     chunk_size * steps_per_generation * config.num_lineages
+                )
+                / max(elapsed, 1e-9),
+                "agent_transitions_per_second": (
+                    chunk_size
+                    * steps_per_generation
+                    * config.num_lineages
+                    * transitions_per_step
                 )
                 / max(elapsed, 1e-9),
             },
@@ -430,6 +557,10 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     "training_chunk_seconds": elapsed,
                     "chunk_generations": chunk_size,
                     "env_steps": int(host_history["env_steps"][update_in_chunk, lineage]),
+                    "agent_transitions": int(
+                        host_history["env_steps"][update_in_chunk, lineage]
+                    )
+                    * transitions_per_step,
                     "loss": float(host_history["loss"][update_in_chunk, lineage]),
                     "mean_episode_return": float(
                         host_history["mean_episode_return"][update_in_chunk, lineage]
@@ -480,6 +611,13 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     generation=completed,
                     seed=config.seed + lineage,
                     hidden_sizes=config.hidden_sizes,
+                    observation_size=(
+                        BRANDAO_OBSERVATION_SIZE
+                        if config.policy_architecture == "brandao_shared"
+                        else 46
+                    ),
+                    action_size=2 if config.policy_architecture == "brandao_shared" else 6,
+                    policy_architecture=config.policy_architecture,
                 )
             snapshot_seconds = time.perf_counter() - snapshot_started
             _write_json_line(
@@ -492,11 +630,52 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             )
             if not is_final:
                 pool_load_started = time.perf_counter()
-                pools, probabilities, generation_ids, pool_generations = _active_pools(
-                    archives,
-                    _extract_lineage(runners.train_state.params, 0),
-                    config,
-                )
+                if config.policy_architecture == "brandao_shared":
+                    episodes = np.asarray(host_history["episodes"], dtype=np.float64).sum(
+                        axis=0
+                    )
+                    goal_difference = (
+                        np.asarray(host_history["blue_goals"], dtype=np.float64).sum(
+                            axis=0
+                        )
+                        - np.asarray(
+                            host_history["yellow_goals"], dtype=np.float64
+                        ).sum(axis=0)
+                    )
+                    score_by_lineage = goal_difference / np.maximum(episodes, 1.0)
+                    for lineage, score in enumerate(score_by_lineage):
+                        if score >= config.opponent_update_threshold:
+                            selected_opponent_generations[lineage] = completed
+                    pools, probabilities, generation_ids, pool_generations = (
+                        _brandao_opponent_pools(
+                            archives,
+                            _extract_lineage(runners.train_state.params, 0),
+                            config,
+                            selected_opponent_generations,
+                        )
+                    )
+                    _write_json_line(
+                        performance_path,
+                        {
+                            "event": "brandao_opponent_selection",
+                            "generation": completed,
+                            "goal_difference_per_episode": [
+                                float(value) for value in score_by_lineage
+                            ],
+                            "update_threshold": config.opponent_update_threshold,
+                            "selected_opponent_generations": list(
+                                selected_opponent_generations
+                            ),
+                        },
+                    )
+                else:
+                    pools, probabilities, generation_ids, pool_generations = (
+                        _active_pools(
+                            archives,
+                            _extract_lineage(runners.train_state.params, 0),
+                            config,
+                        )
+                    )
                 pool_load_seconds = time.perf_counter() - pool_load_started
                 _write_json_line(
                     performance_path,

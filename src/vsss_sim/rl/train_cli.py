@@ -28,6 +28,12 @@ def _resolve_experiment_config(value: str) -> Path:
 
 
 def _legacy_train(args: argparse.Namespace) -> None:
+    policy_architecture = args.policy_architecture or "joint"
+    reward_profile = args.reward_profile or (
+        RewardProfile.BRANDAO_REWARD.value
+        if policy_architecture == "brandao_shared"
+        else RewardProfile.DEFAULT.value
+    )
     config = PPOConfig(
         num_envs=args.num_envs,
         rollout_length=args.rollout_length,
@@ -46,8 +52,15 @@ def _legacy_train(args: argparse.Namespace) -> None:
 
     env = VSSJumanjiEnv(
         opponent_policy=args.opponent,
+        max_episode_steps=(
+            args.max_episode_steps
+            if args.max_episode_steps is not None
+            else (400 if policy_architecture == "brandao_shared" else 300)
+        ),
         init_mode=args.init_mode,
-        reward_profile=args.reward_profile or RewardProfile.DEFAULT.value,
+        terminate_on_goal=policy_architecture == "brandao_shared",
+        reward_profile=reward_profile,
+        policy_architecture=policy_architecture,
     )
     trainer = PPO(env, config)
 
@@ -101,6 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--update-epochs", type=int, default=4)
     parser.add_argument("--num-minibatches", type=int, default=8)
+    parser.add_argument(
+        "--policy-architecture",
+        choices=("joint", "brandao_shared"),
+        help="Shared per-robot Brandão policy or centralized joint policy.",
+    )
+    parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--opponent", choices=("stationary", "random"), default="stationary")
     parser.add_argument("--init-mode", choices=("kickoff", "random"), default="kickoff")
     parser.add_argument(
@@ -129,6 +148,8 @@ def main() -> None:
         overrides["num_envs_per_lineage"] = args.num_envs_per_lineage
     if args.reward_profile is not None:
         overrides["reward_profile"] = args.reward_profile
+    if args.policy_architecture is not None:
+        overrides["policy_architecture"] = args.policy_architecture
     if overrides:
         config = replace(config, **overrides)
     run_experiment(config, config_source=config_path)

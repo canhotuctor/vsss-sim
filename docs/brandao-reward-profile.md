@@ -27,9 +27,9 @@ the field.
 
 ## Team reward adaptation
 
-The paper gives each robot separate positioning rewards, while this simulator
-trains the blue team with one shared scalar reward. The offensive and defensive
-angle terms are therefore averaged over the three blue robots:
+With the existing `joint` architecture, the blue team receives one scalar
+reward. The paper's separate positioning terms are therefore averaged over the
+three blue robots in that mode:
 
 ```text
 r = 0.7 * r_speed + 0.1 * r_dist
@@ -51,3 +51,41 @@ step, including a post-goal kickoff when that environment uses in-match goals.
 The simulator does not yet detect fouls, so this profile cannot emit the
 paper's foul penalty. A future referee event can be added to the shared match
 step facts and consumed by the reward profile when foul detection exists.
+
+## Shared per-robot policy
+
+`policy_architecture: "brandao_shared"` is available alongside the existing
+`"joint"` policy. One actor-critic is shared across the three robots; it is
+called once with each robot's local observation and returns that robot's two
+wheel commands. Each robot gets its own offensive and defensive angle terms,
+while the ball-progress, nearest-robot proximity, and goal terms are shared.
+The action is held for exactly 0.1 seconds per decision.
+
+The local observation follows the paper's listed inputs: normalized positions
+of all robots and the ball; sine, cosine, and normalized arctangent for the
+agent heading and seven specified bearings; eight distances; the team's six
+previous wheel commands; and remaining episode time. It stacks eight readings,
+each formed at 10 Hz, and applies the paper's stated position and heading
+measurement noise. The actor uses 300/200/100 tanh layers and Beta wheel-speed
+outputs; the critic uses 256/128/64 tanh layers. Training episodes end at the
+first goal or after 40 seconds. At each snapshot checkpoint, a frozen opponent
+snapshot is replaced when the current policy's goal difference per completed
+game reaches 0.6.
+
+The paper-scale configuration is
+`configs/experiments/experiment26_brandao_shared_160m.json`. It uses 200
+environments × 214 policy decisions × 3 robot transitions per update, and 1,246
+updates, for **159,986,400 agent transitions** (just under the paper's 160
+million). Train it and evaluate the final snapshot separately:
+
+```bash
+python scripts/train_jax.py --xp experiment26_brandao_shared_160m
+python scripts/evaluate_jax.py --xp experiment26_brandao_shared_160m --lineage 0 --opponents all --matches 100
+```
+
+This is a close implementation of the paper's policy, reward, transition
+counting, update size, and self-play opponent rule. It is not a simulator-level
+reproduction: this repository's JAX physics, field/referee rules, actuator
+model, and available evaluation opponents differ from the paper's MuJoCo and
+Pequi Mecânico setup. The simulator also has no foul event, so the paper's
+foul penalty is unavailable.
