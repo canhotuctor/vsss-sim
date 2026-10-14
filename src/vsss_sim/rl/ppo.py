@@ -16,6 +16,7 @@ import optax
 from flax import linen as nn
 from flax.training.train_state import TrainState
 
+from ..envs.brandao_observation import mirror_x_axis_observation
 from ..envs.jumanji import State as EnvState
 from ..envs.jumanji import VSSJumanjiEnv
 
@@ -38,6 +39,7 @@ class PPOConfig:
     entropy_coefficient: float = 0.01
     max_grad_norm: float = 0.5
     hidden_sizes: tuple[int, ...] = (64, 64)
+    mirror_augmentation: bool = False
 
     def __post_init__(self) -> None:
         batch_size = self.num_envs * self.rollout_length
@@ -122,6 +124,107 @@ class BrandaoSharedActorCritic(nn.Module):
         return alpha, beta, jnp.squeeze(value, axis=-1)
 
 
+class BrandaoSetActorCritic(nn.Module):
+    """Shared per-robot policy with separate invariant ally and opponent sets."""
+
+    hidden_sizes: tuple[int, ...] = (300, 200, 100)
+
+    @nn.compact
+    def __call__(
+        self, observation: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # Every frame has fixed semantic slots: self, two allies, three
+        # opponents, ball, heading, bearings, distances, previous actions, time.
+        frames = observation.reshape(observation.shape[:-1] + (8, 53))
+        positions = frames[..., :14].reshape(frames.shape[:-1] + (7, 2))
+        self_position = positions[..., 0, :]
+        ally_positions = positions[..., 1:3, :]
+        opponent_positions = positions[..., 3:6, :]
+        ball_position = positions[..., 6, :]
+
+        heading = frames[..., 14:17]
+        bearings = frames[..., 17:38].reshape(frames.shape[:-1] + (7, 3))
+        ally_bearings = bearings[..., :2, :]
+        opponent_bearings = bearings[..., 2:5, :]
+        goal_bearings = bearings[..., 5:7, :].reshape(bearings.shape[:-2] + (6,))
+        distances = frames[..., 38:46]
+        ally_distances = distances[..., :2, None]
+        opponent_distances = distances[..., 2:5, None]
+        ball_and_goal_distances = distances[..., 5:8]
+        previous_actions = frames[..., 46:52].reshape(frames.shape[:-1] + (3, 2))
+
+        ally_features = jnp.concatenate(
+            [
+                ally_positions,
+                ally_bearings,
+                ally_distances,
+                previous_actions[..., 1:3, :],
+            ],
+            axis=-1,
+        )
+        opponent_features = jnp.concatenate(
+            [opponent_positions, opponent_bearings, opponent_distances], axis=-1
+        )
+
+        # Each Dense module is applied with shared weights across all members
+        # and all eight frames. Sum pooling is invariant to entity order.
+        ally_hidden = nn.tanh(nn.Dense(32, name="ally_encoder_hidden")(ally_features))
+        ally_embeddings = nn.Dense(16, name="ally_encoder_embedding")(ally_hidden)
+        ally_summary = jnp.sum(ally_embeddings, axis=-2)
+        opponent_hidden = nn.tanh(
+            nn.Dense(32, name="opponent_encoder_hidden")(opponent_features)
+        )
+        opponent_embeddings = nn.Dense(16, name="opponent_encoder_embedding")(
+            opponent_hidden
+        )
+        opponent_summary = jnp.sum(opponent_embeddings, axis=-2)
+
+        self_features = jnp.concatenate(
+            [
+                self_position,
+                heading,
+                goal_bearings,
+                ball_position,
+                ball_and_goal_distances,
+                previous_actions[..., 0, :],
+                frames[..., 52:53],
+            ],
+            axis=-1,
+        )
+        encoded_frames = jnp.concatenate(
+            [self_features, ally_summary, opponent_summary], axis=-1
+        )
+        encoded = encoded_frames.reshape(encoded_frames.shape[:-2] + (8 * 51,))
+
+        actor = encoded
+        for size in self.hidden_sizes:
+            actor = nn.tanh(
+                nn.Dense(size, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(
+                    actor
+                )
+            )
+        alpha = nn.softplus(
+            nn.Dense(2, kernel_init=nn.initializers.orthogonal(0.01), name="alpha")(
+                actor
+            )
+        ) + 1.0
+        beta = nn.softplus(
+            nn.Dense(2, kernel_init=nn.initializers.orthogonal(0.01), name="beta")(
+                actor
+            )
+        ) + 1.0
+
+        critic = encoded
+        for size in self.hidden_sizes:
+            critic = nn.tanh(
+                nn.Dense(size, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2.0)))(
+                    critic
+                )
+            )
+        value = nn.Dense(1, kernel_init=nn.initializers.orthogonal(1.0))(critic)
+        return alpha, beta, jnp.squeeze(value, axis=-1)
+
+
 def create_policy_model(
     policy_architecture: str, hidden_sizes: tuple[int, ...] = (64, 64)
 ) -> nn.Module:
@@ -130,8 +233,10 @@ def create_policy_model(
         return ActorCritic(action_size=6, hidden_sizes=hidden_sizes)
     if policy_architecture == "brandao_shared":
         return BrandaoSharedActorCritic()
+    if policy_architecture == "brandao_sets":
+        return BrandaoSetActorCritic(hidden_sizes=hidden_sizes)
     raise ValueError(
-        "policy_architecture must be 'joint' or 'brandao_shared'"
+        "policy_architecture must be 'joint', 'brandao_shared', or 'brandao_sets'"
     )
 
 
@@ -143,7 +248,7 @@ def deterministic_policy_action(
 ) -> jax.Array:
     """Map observations to the selected policy's deterministic wheel speeds."""
     first, second, _ = model.apply(params, observation)
-    if policy_architecture == "brandao_shared":
+    if policy_architecture in ("brandao_shared", "brandao_sets"):
         return 2.0 * first / (first + second) - 1.0
     return jnp.tanh(first)
 
@@ -181,6 +286,9 @@ class _Transition(NamedTuple):
     opponent_mode: jax.Array
     opponent_category: jax.Array
     opponent_generation: jax.Array
+    mirrored_old_log_prob: jax.Array | None = None
+    mirrored_old_value: jax.Array | None = None
+    mirrored_bootstrap_value: jax.Array | None = None
 
 
 class _TrainingBatch(NamedTuple):
@@ -190,6 +298,10 @@ class _TrainingBatch(NamedTuple):
     old_value: jax.Array
     advantage: jax.Array
     target: jax.Array
+    mirrored_old_log_prob: jax.Array | None = None
+    mirrored_old_value: jax.Array | None = None
+    mirrored_advantage: jax.Array | None = None
+    mirrored_target: jax.Array | None = None
 
 
 def _normal_log_prob(
@@ -272,6 +384,11 @@ class PPO:
         self.env = env
         self.config = config
         self.policy_architecture = env.policy_architecture
+        if config.mirror_augmentation and self.policy_architecture not in (
+            "brandao_shared",
+            "brandao_sets",
+        ):
+            raise ValueError("x-axis mirror augmentation requires a Brandao observation")
         self.model = create_policy_model(self.policy_architecture, config.hidden_sizes)
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(config.max_grad_norm),
@@ -304,7 +421,7 @@ class PPO:
 
     @property
     def is_shared_agent_policy(self) -> bool:
-        return self.policy_architecture == "brandao_shared"
+        return self.policy_architecture in ("brandao_shared", "brandao_sets")
 
     def initialize(
         self,
@@ -468,7 +585,7 @@ class PPO:
     ) -> jax.Array:
         """Return bounded wheel actions for evaluation or inference."""
         first, second, _ = self.model.apply(params, observation)
-        if self.policy_architecture == "brandao_shared":
+        if self.policy_architecture in ("brandao_shared", "brandao_sets"):
             if deterministic:
                 sample = first / (first + second)
             else:
@@ -571,7 +688,7 @@ class PPO:
         self, params: dict, observation: jax.Array, key: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         first, second, value = self.model.apply(params, observation)
-        if self.policy_architecture == "brandao_shared":
+        if self.policy_architecture in ("brandao_shared", "brandao_sets"):
             sample = jax.random.beta(key, first, second)
             log_prob = _beta_log_prob(sample, first, second)
             return 2.0 * sample - 1.0, sample, log_prob, value
@@ -640,6 +757,17 @@ class PPO:
             action, raw_action, log_prob, value = self._sample_policy(
                 carry.train_state.params, carry.observation, policy_key
             )
+            if self.config.mirror_augmentation:
+                mirrored_observation = mirror_x_axis_observation(carry.observation)
+                mirrored_first, mirrored_second, mirrored_value = self.model.apply(
+                    carry.train_state.params, mirrored_observation
+                )
+                mirrored_log_prob = _beta_log_prob(
+                    raw_action[..., ::-1], mirrored_first, mirrored_second
+                )
+            else:
+                mirrored_log_prob = None
+                mirrored_value = None
             if opponent_pool is None:
                 stepped_state, timestep = self._batched_step(carry.env_state, action)
             else:
@@ -647,7 +775,7 @@ class PPO:
                 first, second, _ = jax.vmap(self.model.apply)(
                     carry.opponent_params, opponent_observation
                 )
-                if self.policy_architecture == "brandao_shared":
+                if self.policy_architecture in ("brandao_shared", "brandao_sets"):
                     opponent_sample = jax.random.beta(opponent_key, first, second)
                     opponent_action = 2.0 * opponent_sample - 1.0
                 else:
@@ -667,6 +795,13 @@ class PPO:
             _, _, bootstrap_value = self.model.apply(
                 carry.train_state.params, timestep.observation
             )
+            if self.config.mirror_augmentation:
+                _, _, mirrored_bootstrap_value = self.model.apply(
+                    carry.train_state.params,
+                    mirror_x_axis_observation(timestep.observation),
+                )
+            else:
+                mirrored_bootstrap_value = None
             episode_end = timestep.last()
             running_return = carry.episode_return + timestep.reward
             running_length = carry.episode_length + jnp.int32(1)
@@ -754,6 +889,9 @@ class PPO:
                 opponent_mode=carry.opponent_modes,
                 opponent_category=carry.opponent_categories,
                 opponent_generation=carry.opponent_generations,
+                mirrored_old_log_prob=mirrored_log_prob,
+                mirrored_old_value=mirrored_value,
+                mirrored_bootstrap_value=mirrored_bootstrap_value,
             )
             return next_runner, transition_data
 
@@ -784,13 +922,16 @@ class PPO:
         self, params: dict, batch: _TrainingBatch
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         first, second, value = self.model.apply(params, batch.observation)
-        if self.policy_architecture == "brandao_shared":
+        if self.policy_architecture in ("brandao_shared", "brandao_sets"):
             log_prob = _beta_log_prob(batch.raw_action, first, second)
             entropy = jnp.mean(_beta_entropy(first, second))
         else:
             log_prob = _normal_log_prob(batch.raw_action, first, second)
             entropy = jnp.mean(_normal_entropy(second))
-        log_ratio = log_prob - batch.old_log_prob
+        raw_log_ratio = log_prob - batch.old_log_prob
+        # Very large density ratios can overflow float32 before PPO clipping
+        # applies. Bound only the numerical tail; ordinary ratios are unchanged.
+        log_ratio = jnp.clip(raw_log_ratio, -20.0, 20.0)
         ratio = jnp.exp(log_ratio)
 
         unclipped_policy = -batch.advantage * ratio
@@ -823,6 +964,9 @@ class PPO:
             "clip_fraction": jnp.mean(
                 (jnp.abs(ratio - 1.0) > self.config.clip_epsilon).astype(jnp.float32)
             ),
+            "ratio_log_clipped_fraction": jnp.mean(
+                (jnp.abs(raw_log_ratio) > 20.0).astype(jnp.float32)
+            ),
         }
         return total_loss, metrics
 
@@ -836,16 +980,42 @@ class PPO:
             (_, metrics), grads = jax.value_and_grad(self._loss, has_aux=True)(
                 state.params, minibatch
             )
+            if self.config.mirror_augmentation:
+                mirrored_observation = mirror_x_axis_observation(minibatch.observation)
+                mirrored_action = jnp.flip(minibatch.raw_action, axis=-1)
+                mirrored_batch = _TrainingBatch(
+                    observation=mirrored_observation,
+                    raw_action=mirrored_action,
+                    old_log_prob=minibatch.mirrored_old_log_prob,
+                    old_value=minibatch.mirrored_old_value,
+                    advantage=minibatch.mirrored_advantage,
+                    target=minibatch.mirrored_target,
+                )
+                (_, mirrored_metrics), mirrored_grads = jax.value_and_grad(
+                    self._loss, has_aux=True
+                )(state.params, mirrored_batch)
+                grads = jax.tree_util.tree_map(
+                    lambda original, reflected: (original + reflected) * 0.5,
+                    grads,
+                    mirrored_grads,
+                )
+                metrics = jax.tree_util.tree_map(
+                    lambda original, reflected: (original + reflected) * 0.5,
+                    metrics,
+                    mirrored_metrics,
+                )
             return state.apply_gradients(grads=grads), metrics
 
         def epoch_step(carry: tuple[TrainState, jax.Array], _: None):
             state, epoch_key = carry
             epoch_key, permutation_key = jax.random.split(epoch_key)
-            permutation = jax.random.permutation(permutation_key, self.config.batch_size)
+            batch_size = batch.observation.shape[0]
+            minibatch_size = batch_size // self.config.num_minibatches
+            permutation = jax.random.permutation(permutation_key, batch_size)
             shuffled = jax.tree_util.tree_map(lambda x: x[permutation], batch)
             minibatches = jax.tree_util.tree_map(
                 lambda x: x.reshape(
-                    (self.config.num_minibatches, self.config.minibatch_size) + x.shape[1:]
+                    (self.config.num_minibatches, minibatch_size) + x.shape[1:]
                 ),
                 shuffled,
             )
@@ -885,7 +1055,34 @@ class PPO:
             gamma=self.config.gamma,
             gae_lambda=self.config.gae_lambda,
         )
-        advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-8)
+        if self.config.mirror_augmentation:
+            mirrored_advantages, mirrored_targets = compute_gae(
+                rewards=trajectory.reward,
+                values=trajectory.mirrored_old_value,
+                bootstrap_values=trajectory.mirrored_bootstrap_value,
+                discounts=discounts,
+                episode_ends=episode_ends,
+                gamma=self.config.gamma,
+                gae_lambda=self.config.gae_lambda,
+            )
+            combined_mean = 0.5 * (
+                jnp.mean(advantages) + jnp.mean(mirrored_advantages)
+            )
+            combined_variance = 0.5 * (
+                jnp.mean(jnp.square(advantages - combined_mean))
+                + jnp.mean(jnp.square(mirrored_advantages - combined_mean))
+            )
+            combined_std = jnp.sqrt(combined_variance + 1e-8)
+            advantages = (advantages - combined_mean) / combined_std
+            mirrored_advantages = (
+                mirrored_advantages - combined_mean
+            ) / combined_std
+        else:
+            advantages = (advantages - jnp.mean(advantages)) / (
+                jnp.std(advantages) + 1e-8
+            )
+            mirrored_advantages = None
+            mirrored_targets = None
         batch = _TrainingBatch(
             observation=trajectory.observation,
             raw_action=trajectory.raw_action,
@@ -893,12 +1090,18 @@ class PPO:
             old_value=trajectory.old_value,
             advantage=advantages,
             target=targets,
+            mirrored_old_log_prob=trajectory.mirrored_old_log_prob,
+            mirrored_old_value=trajectory.mirrored_old_value,
+            mirrored_advantage=mirrored_advantages,
+            mirrored_target=mirrored_targets,
         )
         batch = jax.tree_util.tree_map(
             lambda x: x.reshape((self.config.batch_size,) + x.shape[2:]), batch
         )
         train_state, metrics, key = self._optimize(
-            rollout_runner.train_state, batch, rollout_runner.key
+            rollout_runner.train_state,
+            batch,
+            rollout_runner.key,
         )
         runner = rollout_runner._replace(train_state=train_state, key=key)
 

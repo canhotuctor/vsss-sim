@@ -29,9 +29,14 @@ def _resolve_experiment_config(value: str) -> Path:
 
 def _legacy_train(args: argparse.Namespace) -> None:
     policy_architecture = args.policy_architecture or "joint"
+    mirror_augmentation = (
+        args.mirror_augmentation
+        if args.mirror_augmentation is not None
+        else policy_architecture == "brandao_sets"
+    )
     reward_profile = args.reward_profile or (
         RewardProfile.BRANDAO_REWARD.value
-        if policy_architecture == "brandao_shared"
+        if policy_architecture in ("brandao_shared", "brandao_sets")
         else RewardProfile.DEFAULT.value
     )
     config = PPOConfig(
@@ -40,6 +45,7 @@ def _legacy_train(args: argparse.Namespace) -> None:
         learning_rate=args.learning_rate,
         update_epochs=args.update_epochs,
         num_minibatches=args.num_minibatches,
+        mirror_augmentation=mirror_augmentation,
     )
     steps_per_update = config.batch_size
     num_updates = (
@@ -55,10 +61,10 @@ def _legacy_train(args: argparse.Namespace) -> None:
         max_episode_steps=(
             args.max_episode_steps
             if args.max_episode_steps is not None
-            else (400 if policy_architecture == "brandao_shared" else 300)
+            else (400 if policy_architecture in ("brandao_shared", "brandao_sets") else 300)
         ),
         init_mode=args.init_mode,
-        terminate_on_goal=policy_architecture == "brandao_shared",
+        terminate_on_goal=policy_architecture in ("brandao_shared", "brandao_sets"),
         reward_profile=reward_profile,
         policy_architecture=policy_architecture,
     )
@@ -116,8 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-minibatches", type=int, default=8)
     parser.add_argument(
         "--policy-architecture",
-        choices=("joint", "brandao_shared"),
-        help="Shared per-robot Brandão policy or centralized joint policy.",
+        choices=("joint", "brandao_shared", "brandao_sets"),
+        help="Centralized joint, shared Brandão MLP, or permutation-invariant set policy.",
+    )
+    parser.add_argument(
+        "--mirror-augmentation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use x-axis reflection augmentation (enabled by default for brandao_sets).",
     )
     parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--opponent", choices=("stationary", "random"), default="stationary")
@@ -150,6 +162,12 @@ def main() -> None:
         overrides["reward_profile"] = args.reward_profile
     if args.policy_architecture is not None:
         overrides["policy_architecture"] = args.policy_architecture
+        if args.mirror_augmentation is None:
+            overrides["mirror_augmentation"] = (
+                args.policy_architecture == "brandao_sets"
+            )
+    if args.mirror_augmentation is not None:
+        overrides["mirror_augmentation"] = args.mirror_augmentation
     if overrides:
         config = replace(config, **overrides)
     run_experiment(config, config_source=config_path)

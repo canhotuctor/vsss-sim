@@ -8,6 +8,7 @@ import pytest
 jumanji = pytest.importorskip("jumanji")
 
 from vsss_sim import config  # noqa: E402
+from vsss_sim.envs.brandao_observation import build_agent_features  # noqa: E402
 from vsss_sim.envs.jumanji import VSSJumanjiEnv  # noqa: E402
 
 
@@ -118,6 +119,30 @@ def test_brandao_shared_policy_builds_stacked_agent_views_and_exact_10hz_steps()
         state.observation_history[config.TEAM_BLUE, 0, -1, 46:52],
         action.reshape(-1),
     )
+
+
+def test_brandao_set_observation_keeps_each_ally_action_with_its_entity():
+    env = VSSJumanjiEnv(
+        reward_profile="brandao_reward",
+        policy_architecture="brandao_sets",
+    )
+    state, timestep = env.reset(jax.random.PRNGKey(18))
+    previous_actions = jnp.arange(12, dtype=jnp.float32).reshape((2, 3, 2)) / 10.0
+    features = build_agent_features(
+        state.simulation,
+        previous_actions,
+        jnp.float32(1.0),
+        jax.random.PRNGKey(19),
+        entity_ordered_actions=True,
+    )
+
+    assert timestep.observation.shape == (3, 424)
+    for robot in range(config.N_ROBOTS):
+        allies = [index for index in range(config.N_ROBOTS) if index != robot]
+        expected = previous_actions[config.TEAM_BLUE, [robot, *allies]].reshape(-1)
+        np.testing.assert_array_equal(
+            features[config.TEAM_BLUE, robot, 46:52], expected
+        )
 
 
 def test_only_jax_native_opponents_are_accepted():

@@ -22,6 +22,7 @@ def build_agent_features(
     previous_actions: jax.Array,
     time_remaining: jax.Array,
     noise_key: jax.Array,
+    entity_ordered_actions: bool = False,
 ) -> jax.Array:
     """Return ``[team, robot, 53]`` paper-style features for both teams.
 
@@ -104,7 +105,11 @@ def build_agent_features(
                     ),
                 ]
             ) / _MAX_DISTANCE
-            previous_team_actions = own_actions.reshape(-1)
+            if entity_ordered_actions:
+                action_order = jnp.concatenate([jnp.asarray([robot]), teammates])
+                previous_team_actions = own_actions[action_order].reshape(-1)
+            else:
+                previous_team_actions = own_actions.reshape(-1)
             features = jnp.concatenate(
                 [
                     normalized_positions.reshape(-1),
@@ -140,3 +145,33 @@ def advance_history(
 def flatten_history(history: jax.Array, team: int) -> jax.Array:
     """Return a team's three stacked observations for policy inference."""
     return history[team].reshape((config.N_ROBOTS, OBSERVATION_SIZE))
+
+
+def mirror_x_axis_observation(observation: jax.Array) -> jax.Array:
+    """Reflect a stacked Brandao observation across the field's x-axis.
+
+    Entity order is retained. Coordinates and signed angular components are
+    reflected, while each robot's previous left/right wheel commands are
+    swapped to preserve the mirrored differential-drive motion.
+    """
+    frames = observation.reshape(observation.shape[:-1] + (HISTORY_LENGTH, FRAME_FEATURES))
+    positions = frames[..., :14].reshape(frames.shape[:-1] + (7, 2))
+    positions = positions.at[..., 1].multiply(-1.0)
+
+    heading = frames[..., 14:17].at[..., 0].multiply(-1.0)
+    heading = heading.at[..., 2].multiply(-1.0)
+    bearings = frames[..., 17:38].reshape(frames.shape[:-1] + (7, 3))
+    bearings = bearings.at[..., 0].multiply(-1.0)
+    bearings = bearings.at[..., 2].multiply(-1.0)
+    previous_actions = frames[..., 46:52].reshape(frames.shape[:-1] + (3, 2))
+    previous_actions = jnp.flip(previous_actions, axis=-1)
+
+    reflected = frames.at[..., :14].set(positions.reshape(frames.shape[:-1] + (14,)))
+    reflected = reflected.at[..., 14:17].set(heading)
+    reflected = reflected.at[..., 17:38].set(
+        bearings.reshape(frames.shape[:-1] + (21,))
+    )
+    reflected = reflected.at[..., 46:52].set(
+        previous_actions.reshape(frames.shape[:-1] + (6,))
+    )
+    return reflected.reshape(observation.shape)

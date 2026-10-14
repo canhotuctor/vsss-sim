@@ -137,7 +137,11 @@ def evaluate_experiment(
     if any(value < 0 or value >= config.num_lineages for value in lineages):
         raise ValueError("lineage index is outside the configured experiment")
 
-    policy_hz = 10 if config.policy_architecture == "brandao_shared" else sim_config.FPS
+    policy_hz = (
+        10
+        if config.policy_architecture in ("brandao_shared", "brandao_sets")
+        else sim_config.FPS
+    )
     horizon = int(round(config.evaluation_seconds * policy_hz))
     # Evaluation is a match-level rollout.  Goals reset the field position
     # while the match score and wall-clock horizon continue, so use the
@@ -153,7 +157,7 @@ def evaluate_experiment(
     model = create_policy_model(config.policy_architecture, config.hidden_sizes)
     observation_size = (
         BRANDAO_OBSERVATION_SIZE
-        if config.policy_architecture == "brandao_shared"
+        if config.policy_architecture in ("brandao_shared", "brandao_sets")
         else 46
     )
     template = model.init(
@@ -303,7 +307,11 @@ def evaluate_experiment_exhaustive_history(
     if any(value < 0 or value >= config.num_lineages for value in lineages):
         raise ValueError("lineage index is outside the configured experiment")
 
-    policy_hz = 10 if config.policy_architecture == "brandao_shared" else sim_config.FPS
+    policy_hz = (
+        10
+        if config.policy_architecture in ("brandao_shared", "brandao_sets")
+        else sim_config.FPS
+    )
     horizon = int(round(config.evaluation_seconds * policy_hz))
     # Keep the same match-level semantics as the regular evaluator: a goal
     # triggers a kickoff, but does not end the 120-second match rollout.
@@ -318,7 +326,7 @@ def evaluate_experiment_exhaustive_history(
     model = create_policy_model(config.policy_architecture, config.hidden_sizes)
     observation_size = (
         BRANDAO_OBSERVATION_SIZE
-        if config.policy_architecture == "brandao_shared"
+        if config.policy_architecture in ("brandao_shared", "brandao_sets")
         else 46
     )
     template = model.init(

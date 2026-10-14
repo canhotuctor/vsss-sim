@@ -71,6 +71,22 @@ def test_brandao_shared_architecture_selects_paper_style_training_contract():
     assert env.action_spec.shape == (3, 2)
 
 
+def test_brandao_set_architecture_enables_invariant_encoder_and_mirror_augmentation():
+    config = ExperimentConfig(
+        experiment_name="brandao-sets",
+        num_generations=1,
+        policy_architecture="brandao_sets",
+    )
+    env = _make_env(config)
+
+    assert config.reward_profile == "brandao_reward"
+    assert config.mirror_augmentation is True
+    assert config.ppo_config().mirror_augmentation is True
+    assert env.policy_architecture == "brandao_sets"
+    assert env.observation_spec.shape == (3, 424)
+    assert env.action_spec.shape == (3, 2)
+
+
 def test_experiment_config_rejects_unknown_reward_profile():
     with pytest.raises(ValueError, match="reward_profile"):
         ExperimentConfig(

@@ -15,13 +15,14 @@ import numpy as np
 from flax import serialization
 
 from ..config import InitMode, RewardProfile
-from ..envs.jumanji import VSSJumanjiEnv
 from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
+from ..envs.jumanji import VSSJumanjiEnv
 from .ppo import PPO, PPOConfig
 
 _SNAPSHOT_SCHEMA_VERSION = 1
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-_POLICY_ARCHITECTURES = ("joint", "brandao_shared")
+_POLICY_ARCHITECTURES = ("joint", "brandao_shared", "brandao_sets")
+_BRANDAO_POLICY_ARCHITECTURES = ("brandao_shared", "brandao_sets")
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class ExperimentConfig:
     init_mode: str = "kickoff"
     reward_profile: str = RewardProfile.DEFAULT.value
     policy_architecture: str = "joint"
+    mirror_augmentation: bool | None = None
     opponent_update_threshold: float = 0.6
     output_root: str = "output/experiments"
     evaluation_matches: int = 100
@@ -131,22 +133,22 @@ class ExperimentConfig:
             raise ValueError("init_mode must be 'kickoff' or 'random'")
         if self.policy_architecture not in _POLICY_ARCHITECTURES:
             raise ValueError(
-                "policy_architecture must be 'joint' or 'brandao_shared'"
+                "policy_architecture must be 'joint', 'brandao_shared', or 'brandao_sets'"
             )
-        if self.policy_architecture == "brandao_shared":
+        if self.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
             if self.reward_profile == RewardProfile.DEFAULT.value:
                 object.__setattr__(
                     self, "reward_profile", RewardProfile.BRANDAO_REWARD.value
                 )
             if self.reward_profile != RewardProfile.BRANDAO_REWARD.value:
                 raise ValueError(
-                    "brandao_shared requires the brandao_reward profile"
+                    "Brandao per-robot policies require the brandao_reward profile"
                 )
             if self.hidden_sizes == (64, 64):
                 object.__setattr__(self, "hidden_sizes", (300, 200, 100))
             elif self.hidden_sizes != (300, 200, 100):
                 raise ValueError(
-                    "brandao_shared uses the paper's 300/200/100 actor layers"
+                    "Brandao per-robot policies use the paper's 300/200/100 actor layers"
                 )
             # Brandão's policy runs at 10 Hz and training episodes end at a
             # goal or after 40 seconds.
@@ -154,6 +156,17 @@ class ExperimentConfig:
                 object.__setattr__(self, "max_episode_steps", 400)
             if not self.terminate_on_goal:
                 object.__setattr__(self, "terminate_on_goal", True)
+        if self.mirror_augmentation is None:
+            object.__setattr__(
+                self,
+                "mirror_augmentation",
+                self.policy_architecture == "brandao_sets",
+            )
+        if self.mirror_augmentation and self.policy_architecture not in (
+            "brandao_shared",
+            "brandao_sets",
+        ):
+            raise ValueError("x-axis mirror augmentation requires a Brandao policy")
         try:
             profile = RewardProfile(self.reward_profile)
         except ValueError as error:
@@ -174,6 +187,7 @@ class ExperimentConfig:
             update_epochs=self.update_epochs,
             num_minibatches=self.num_minibatches,
             hidden_sizes=self.hidden_sizes,
+            mirror_augmentation=bool(self.mirror_augmentation),
         )
 
     @classmethod
@@ -232,7 +246,7 @@ class SnapshotArchive:
             raise FileExistsError(f"snapshot for generation {generation} already exists")
         if policy_architecture not in _POLICY_ARCHITECTURES:
             raise ValueError(f"unknown policy architecture: {policy_architecture}")
-        if policy_architecture == "brandao_shared":
+        if policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
             observation_size = 424 if observation_size is None else observation_size
             action_size = 2 if action_size is None else action_size
         else:
@@ -458,15 +472,15 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             hidden_sizes=config.hidden_sizes,
             observation_size=(
                 BRANDAO_OBSERVATION_SIZE
-                if config.policy_architecture == "brandao_shared"
+                if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
                 else 46
             ),
-            action_size=2 if config.policy_architecture == "brandao_shared" else 6,
+            action_size=2 if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES else 6,
             policy_architecture=config.policy_architecture,
         )
 
     pool_load_started = time.perf_counter()
-    if config.policy_architecture == "brandao_shared":
+    if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
         selected_opponent_generations = [0] * config.num_lineages
         pools, probabilities, generation_ids, pool_generations = _brandao_opponent_pools(
             archives,
@@ -494,14 +508,16 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             "active_snapshots_per_lineage": len(pool_generations[0]),
             "opponent_update_threshold": (
                 config.opponent_update_threshold
-                if config.policy_architecture == "brandao_shared"
+                if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
                 else None
             ),
         },
     )
     completed = 0
     steps_per_generation = config.ppo_config().batch_size
-    transitions_per_step = 3 if config.policy_architecture == "brandao_shared" else 1
+    transitions_per_step = (
+        3 if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES else 1
+    )
     print(f"JAX devices          : {jax.devices()}")
     print(f"Lineages             : {config.num_lineages}")
     print(f"Environments/lineage : {config.num_envs_per_lineage}")
@@ -562,6 +578,24 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     )
                     * transitions_per_step,
                     "loss": float(host_history["loss"][update_in_chunk, lineage]),
+                    "policy_loss": float(
+                        host_history["policy_loss"][update_in_chunk, lineage]
+                    ),
+                    "value_loss": float(
+                        host_history["value_loss"][update_in_chunk, lineage]
+                    ),
+                    "entropy": float(host_history["entropy"][update_in_chunk, lineage]),
+                    "approx_kl": float(
+                        host_history["approx_kl"][update_in_chunk, lineage]
+                    ),
+                    "clip_fraction": float(
+                        host_history["clip_fraction"][update_in_chunk, lineage]
+                    ),
+                    "ratio_log_clipped_fraction": float(
+                        host_history["ratio_log_clipped_fraction"][
+                            update_in_chunk, lineage
+                        ]
+                    ),
                     "mean_episode_return": float(
                         host_history["mean_episode_return"][update_in_chunk, lineage]
                     ),
@@ -613,10 +647,10 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     hidden_sizes=config.hidden_sizes,
                     observation_size=(
                         BRANDAO_OBSERVATION_SIZE
-                        if config.policy_architecture == "brandao_shared"
+                        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
                         else 46
                     ),
-                    action_size=2 if config.policy_architecture == "brandao_shared" else 6,
+                    action_size=2 if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES else 6,
                     policy_architecture=config.policy_architecture,
                 )
             snapshot_seconds = time.perf_counter() - snapshot_started
@@ -630,7 +664,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             )
             if not is_final:
                 pool_load_started = time.perf_counter()
-                if config.policy_architecture == "brandao_shared":
+                if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
                     episodes = np.asarray(host_history["episodes"], dtype=np.float64).sum(
                         axis=0
                     )

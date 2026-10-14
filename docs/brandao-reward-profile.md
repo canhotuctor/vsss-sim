@@ -89,3 +89,33 @@ reproduction: this repository's JAX physics, field/referee rules, actuator
 model, and available evaluation opponents differ from the paper's MuJoCo and
 Pequi Mecânico setup. The simulator also has no foul event, so the paper's
 foul penalty is unavailable.
+
+## Permutation-invariant set policy
+
+`policy_architecture: "brandao_sets"` keeps the same per-robot decisions,
+reward, timing, and Beta wheel outputs. It encodes the two allies and three
+opponents as separate sets: one shared entity MLP processes every member, and
+sum pooling produces one fixed-size summary per set. Those summaries are
+combined with the focal robot, ball, goals, and time before the actor and critic
+MLPs. The ally entity record includes that ally's previous wheel commands, so
+permuting an ally also permutes its commands. This removes the need to store or
+train on the 2! × 3! slot permutations. The symmetry is structural; floating
+point summation can still vary by a few rounding bits when the input order is
+changed.
+
+The mode enables x-axis mirror augmentation by default. It reflects y
+coordinates and signed angles, swaps left/right wheel commands, and averages
+the PPO gradients from the original and reflected minibatches. Reflected
+examples are produced during each update, so rollout storage and minibatch size
+stay unchanged; gradient work is roughly doubled, with one extra old-policy
+forward pass per minibatch. The encoder weights remain trainable and are updated
+with the policy.
+
+Run a one-generation smoke experiment with:
+
+```bash
+python scripts/train_jax.py --xp experiment26_brandao_sets_smoke_gpu_20261014
+```
+
+The config is intentionally small; use a separate long-run config for learning
+comparisons.

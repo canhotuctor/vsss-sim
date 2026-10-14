@@ -23,11 +23,13 @@ from ..physics import jax_backend as physics
 from .brandao_observation import (
     FRAME_FEATURES,
     HISTORY_LENGTH,
-    OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE,
     advance_history,
     build_agent_features,
     flatten_history,
     initialize_history,
+)
+from .brandao_observation import (
+    OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE,
 )
 from .match_rules import MatchRules, MatchStepInput, build_observation
 
@@ -72,27 +74,32 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         if max_episode_steps is None:
             max_episode_steps = (
                 400
-                if policy_architecture == "brandao_shared"
+                if policy_architecture in ("brandao_shared", "brandao_sets")
                 else config.MAX_EPISODE_STEPS
             )
         if max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
-        if policy_architecture not in ("joint", "brandao_shared"):
-            raise ValueError("policy_architecture must be 'joint' or 'brandao_shared'")
+        if policy_architecture not in ("joint", "brandao_shared", "brandao_sets"):
+            raise ValueError(
+                "policy_architecture must be 'joint', 'brandao_shared', or 'brandao_sets'"
+            )
         self.policy_architecture = policy_architecture
-        self.individual_agent_rewards = policy_architecture == "brandao_shared"
+        self.individual_agent_rewards = policy_architecture in (
+            "brandao_shared",
+            "brandao_sets",
+        )
         self.reward_profile = RewardProfile(reward_profile)
         if (
             self.individual_agent_rewards
             and self.reward_profile is not RewardProfile.BRANDAO_REWARD
         ):
-            raise ValueError("brandao_shared requires the brandao_reward profile")
+            raise ValueError("Brandao per-robot policies require the brandao_reward profile")
 
         self.opponent_policy = opponent_policy
         self.max_episode_steps = int(max_episode_steps)
         self.init_mode = InitMode(init_mode)
         self.terminate_on_goal = (
-            policy_architecture == "brandao_shared"
+            policy_architecture in ("brandao_shared", "brandao_sets")
             if terminate_on_goal is None
             else bool(terminate_on_goal)
         )
@@ -146,7 +153,11 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         )
         if self.individual_agent_rewards:
             features = build_agent_features(
-                simulation, previous_actions, jnp.float32(1.0), observation_key
+                simulation,
+                previous_actions,
+                jnp.float32(1.0),
+                observation_key,
+                entity_ordered_actions=self.policy_architecture == "brandao_sets",
             )
             observation_history = initialize_history(features)
             observation = flatten_history(observation_history, config.TEAM_BLUE)
@@ -242,7 +253,11 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
                 1.0,
             )
             features = build_agent_features(
-                simulation, previous_actions, time_remaining, observation_key
+                simulation,
+                previous_actions,
+                time_remaining,
+                observation_key,
+                entity_ordered_actions=self.policy_architecture == "brandao_sets",
             )
             observation_history = advance_history(
                 state.observation_history, features, jnp.asarray(True)
