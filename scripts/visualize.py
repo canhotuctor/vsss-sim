@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import jax
@@ -55,6 +56,52 @@ def load_snapshot(snapshot_path: Path):
     return model, params, metadata, experiment_config
 
 
+def resolve_simulation_timing(
+    experiment_config: dict, policy_architecture: str
+) -> tuple[float, int]:
+    """Resolve the archived control cadence, including legacy config defaults."""
+    is_brandao = policy_architecture in ("brandao_shared", "brandao_sets")
+    default_rate_hz = 10.0 if is_brandao else config.FPS
+    default_substeps = 6 if is_brandao else config.SUB_STEPS
+
+    if experiment_config.get("control_rate_hz") is not None:
+        control_rate_hz = experiment_config["control_rate_hz"]
+    elif experiment_config.get("control_fps") is not None:
+        control_rate_hz = experiment_config["control_fps"]
+    elif experiment_config.get("control_dt") is not None:
+        control_dt = experiment_config["control_dt"]
+        if (
+            isinstance(control_dt, bool)
+            or not isinstance(control_dt, (int, float))
+            or not math.isfinite(control_dt)
+            or control_dt <= 0
+        ):
+            raise ValueError("experiment control_dt must be a positive number")
+        control_rate_hz = 1.0 / control_dt
+    else:
+        control_rate_hz = default_rate_hz
+
+    physics_substeps = experiment_config.get("physics_substeps")
+    if physics_substeps is None:
+        physics_substeps = experiment_config.get("sub_steps", default_substeps)
+    if (
+        isinstance(control_rate_hz, bool)
+        or not isinstance(control_rate_hz, (int, float))
+        or not math.isfinite(control_rate_hz)
+        or control_rate_hz <= 0
+    ):
+        raise ValueError("experiment control_rate_hz must be a positive finite number")
+    if (
+        isinstance(physics_substeps, bool)
+        or not isinstance(physics_substeps, (int, float))
+        or not math.isfinite(physics_substeps)
+        or int(physics_substeps) != physics_substeps
+        or physics_substeps < 1
+    ):
+        raise ValueError("experiment physics_substeps must be a positive integer")
+    return float(control_rate_hz), int(physics_substeps)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -64,10 +111,10 @@ def main() -> None:
     )
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument(
-        "--fps",
+        "--speedup-rate",
         type=float,
-        default=config.FPS,
-        help=f"Render FPS cap (default: {config.FPS:g}; pass 0 for uncapped).",
+        default=1.0,
+        help="Maximum playback speed relative to real time (default: 1.0x).",
     )
     parser.add_argument(
         "--opponent", choices=("stationary", "random"), default="stationary"
@@ -84,6 +131,8 @@ def main() -> None:
         parser.error("episodes must be positive")
     if args.max_episode_steps is not None and args.max_episode_steps < 1:
         parser.error("max-episode-steps must be positive")
+    if not math.isfinite(args.speedup_rate) or args.speedup_rate <= 0.0:
+        parser.error("speedup-rate must be a positive finite number")
 
     model, params, metadata, experiment_config = load_snapshot(args.snapshot)
     max_episode_steps = (
@@ -92,22 +141,24 @@ def main() -> None:
         else experiment_config.get("max_episode_steps", config.MAX_EPISODE_STEPS)
     )
     policy_architecture = metadata.get("policy_architecture", "joint")
+    try:
+        control_rate_hz, physics_substeps = resolve_simulation_timing(
+            experiment_config, policy_architecture
+        )
+    except ValueError as error:
+        parser.error(str(error))
     policy_episode_steps = max_episode_steps
-    environment_episode_steps = (
-        (3 * policy_episode_steps + 1) // 2
-        if policy_architecture in ("brandao_shared", "brandao_sets")
-        else max_episode_steps
-    )
     init_mode = args.init_mode or experiment_config.get("init_mode", InitMode.KICKOFF.value)
     reward_profile = args.reward_profile or experiment_config.get(
         "reward_profile", RewardProfile.DEFAULT.value
     )
-    fps = None if args.fps == 0 else args.fps
     env = VSSEnv(
         opponent_policy=args.opponent,
         render_mode="human",
-        render_fps=fps,
-        max_episode_steps=environment_episode_steps,
+        control_rate_hz=control_rate_hz,
+        physics_substeps=physics_substeps,
+        speedup_rate=args.speedup_rate,
+        max_episode_steps=max_episode_steps,
         init_mode=init_mode,
         reward_profile=reward_profile,
     )
@@ -136,7 +187,9 @@ def main() -> None:
     print(
         f"snapshot generation={metadata['generation']} lineage={metadata['lineage']} "
         f"— architecture={policy_architecture}, opponent={args.opponent}, "
-        f"init={init_mode}, stochastic={args.stochastic}"
+        f"control={control_rate_hz:g} Hz × {physics_substeps} substeps, "
+        f"speedup cap={args.speedup_rate:g}x, init={init_mode}, "
+        f"stochastic={args.stochastic}"
     )
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
@@ -162,22 +215,17 @@ def main() -> None:
                 while policy_steps < policy_episode_steps and not done:
                     robot_observation = flatten_history(history, config.TEAM_BLUE)
                     blue_action = action_for(robot_observation)
-                    physics_frames = 1 + (policy_steps % 2)
-                    goal = 0
-                    for _ in range(physics_frames):
-                        observation, reward, terminated, truncated, info = env.step(
-                            blue_action.reshape(-1)
-                        )
-                        reward_total += float(reward)
-                        goal = int(info.get("goal", 0))
-                        if goal:
-                            goals_blue += goal == 1
-                            goals_yellow += goal == -1
-                        score_blue = int(info["score_blue"])
-                        score_yellow = int(info["score_yellow"])
-                        if goal or terminated or truncated:
-                            done = True
-                            break
+                    observation, reward, terminated, truncated, info = env.step(
+                        blue_action.reshape(-1)
+                    )
+                    reward_total += float(reward)
+                    goal = int(info.get("goal", 0))
+                    if goal:
+                        goals_blue += goal == 1
+                        goals_yellow += goal == -1
+                    score_blue = int(info["score_blue"])
+                    score_yellow = int(info["score_yellow"])
+                    done = bool(goal or terminated or truncated)
                     previous_actions = previous_actions.at[config.TEAM_BLUE].set(
                         blue_action
                     )

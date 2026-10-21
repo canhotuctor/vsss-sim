@@ -1,9 +1,10 @@
-"""Shared, JAX-compatible match rules for observations and rewards.
+"""Shared, JAX-compatible match transitions for referee rules and rewards.
 
 Framework adapters keep their own reset, rendering, and timestep contracts.
-This module owns the rules applied to a completed physics step so scalar,
-batched, and Jumanji matches use the same observation and reward semantics.
+This module coordinates scoring, referee decisions, observations, and rewards
+so scalar, batched, and Jumanji matches share match semantics.
 """
+
 from __future__ import annotations
 
 from typing import NamedTuple
@@ -13,6 +14,15 @@ import jax.numpy as jnp
 
 from .. import config, physics
 from ..config import InitMode, RewardProfile
+from .match_referee import (
+    MatchPhase,
+    RefereeEvent,
+    RefereeState,
+    RestartType,
+    _resolve_referee,
+    initial_referee_state,
+)
+from .match_restarts import _restart_positions
 
 _NORM_POS_X = config.FIELD_LENGTH / 2.0
 _NORM_POS_Y = config.FIELD_WIDTH / 2.0
@@ -21,13 +31,20 @@ _NORM_OMEGA = _NORM_VEL / (config.ROBOT_WHEELBASE / 2.0)
 
 
 class MatchStepInput(NamedTuple):
-    """Facts needed to resolve one completed control step."""
+    """Facts needed to resolve one completed control step.
+
+    Pass ``referee_state`` from the previous result to retain referee timers,
+    pending goal-area violations, and restart phase. ``dt`` is the control
+    interval used by those timers. Omitting either supports one-off transitions.
+    """
 
     simulation_before: physics.SimState
     simulation_after_physics: physics.SimState
     goal: jax.Array
     step_count: jax.Array
     kickoff_key: jax.Array
+    referee_state: RefereeState | None = None
+    dt: jax.Array | None = None
 
 
 class MatchStepResult(NamedTuple):
@@ -36,6 +53,12 @@ class MatchStepResult(NamedTuple):
     simulation: physics.SimState
     observation: jax.Array
     reward: jax.Array
+    referee_state: RefereeState
+    event: jax.Array
+    offending_team: jax.Array
+    restart: jax.Array
+    restart_team: jax.Array
+    quadrant: jax.Array
 
 
 def build_observation(simulation: physics.SimState) -> jax.Array:
@@ -194,28 +217,71 @@ class MatchRules:
         return build_observation(simulation)
 
     def step(self, context: MatchStepInput) -> MatchStepResult:
-        """Apply reward, scoring, kickoff, and observation rules in one place.
-
-        Reward always observes the post-physics state before a goal kickoff.
-        The returned observation always describes the state carried forward.
-        """
+        """Apply reward, scoring, referee events, restarts, and observations."""
+        referee_state = (
+            initial_referee_state() if context.referee_state is None else context.referee_state
+        )
+        resuming = referee_state.phase == MatchPhase.STOPPED
+        effective_goal = jnp.where(resuming, jnp.int32(0), context.goal)
+        reward_context = context._replace(goal=effective_goal)
         if self.reward_profile is RewardProfile.BRANDAO_REWARD:
             reward = _brandao_reward(
-                context,
+                reward_context,
                 self.max_episode_steps,
                 individual_agent_rewards=self.individual_agent_rewards,
             )
         else:
-            reward = _default_reward(context)
+            reward = _default_reward(reward_context)
+
+        decision = _resolve_referee(
+            reward_context.simulation_before,
+            reward_context.simulation_after_physics,
+            referee_state,
+            effective_goal,
+            reward_context.dt,
+        )
+        event = jnp.where(resuming, jnp.int32(RefereeEvent.NONE), decision.event).astype(jnp.int32)
+        offending_team = jnp.where(resuming, jnp.int32(-1), decision.offending_team)
+        restart = jnp.where(resuming, jnp.int32(RestartType.NONE), decision.restart)
+        if not self.kickoff_on_goal:
+            restart = jnp.where(
+                event == RefereeEvent.GOAL,
+                jnp.int32(RestartType.NONE),
+                restart,
+            )
+        restart_team = jnp.where(resuming, jnp.int32(-1), decision.restart_team)
+        quadrant = jnp.where(resuming, jnp.int32(-1), decision.quadrant)
+
+        if self.reward_profile is RewardProfile.BRANDAO_REWARD:
+            foul_event = (
+                (event == RefereeEvent.ATTACKER_GOAL_AREA)
+                | (event == RefereeEvent.DEFENDER_GOAL_AREA)
+                | (event == RefereeEvent.GOALKEEPER_TIMEOUT)
+                | (event == RefereeEvent.PERSONAL_FOUL)
+                | (event == RefereeEvent.GOALKEEPER_BLOCK)
+            )
+            foul_reward = jnp.where(offending_team == config.TEAM_BLUE, -1.0, 1.0).astype(
+                jnp.float32
+            )
+            reward = jnp.where(foul_event, foul_reward, reward)
+        else:
+            penalty_reward = jnp.where(
+                restart == RestartType.PENALTY_KICK,
+                jnp.where(offending_team == config.TEAM_BLUE, -1.0, 1.0),
+                0.0,
+            ).astype(jnp.float32)
+            reward = reward + penalty_reward
+        reward = jnp.where(resuming, jnp.zeros_like(reward), reward)
 
         score_delta = jnp.asarray(
-            [context.goal == 1, context.goal == -1], dtype=jnp.int32
+            [effective_goal == 1, effective_goal == -1], dtype=jnp.int32
         )
         scored_simulation = context.simulation_after_physics._replace(
             score=context.simulation_after_physics.score + score_delta
         )
 
         if self.kickoff_on_goal:
+
             def kickoff(simulation: physics.SimState) -> physics.SimState:
                 if self.init_mode is InitMode.RANDOM:
                     fresh = physics.reset_random(context.kickoff_key)
@@ -224,7 +290,7 @@ class MatchRules:
                 return fresh._replace(score=simulation.score, t=simulation.t)
 
             simulation = jax.lax.cond(
-                context.goal != 0,
+                effective_goal != 0,
                 kickoff,
                 lambda state: state,
                 scored_simulation,
@@ -232,8 +298,39 @@ class MatchRules:
         else:
             simulation = scored_simulation
 
+        whistle = ~resuming & (restart != RestartType.NONE) & (event != RefereeEvent.GOAL)
+        simulation = jax.lax.cond(
+            whistle,
+            lambda state: _restart_positions(state, restart, restart_team, quadrant),
+            lambda state: state,
+            simulation,
+        )
+
+        def resume_frame(_: None) -> physics.SimState:
+            return context.simulation_before._replace(t=context.simulation_after_physics.t)
+
+        simulation = jax.lax.cond(resuming, resume_frame, lambda _: simulation, operand=None)
+        next_referee_state = jax.lax.cond(
+            (effective_goal != 0) & self.kickoff_on_goal,
+            lambda _: initial_referee_state(),
+            lambda _: decision.state,
+            operand=None,
+        )
+        next_referee_state = jax.lax.cond(
+            resuming,
+            lambda _: referee_state._replace(phase=jnp.int32(MatchPhase.PLAYING)),
+            lambda _: next_referee_state,
+            operand=None,
+        )
+
         return MatchStepResult(
             simulation=simulation,
             observation=build_observation(simulation),
             reward=reward,
+            referee_state=next_referee_state,
+            event=event,
+            offending_team=offending_team.astype(jnp.int32),
+            restart=restart.astype(jnp.int32),
+            restart_team=restart_team.astype(jnp.int32),
+            quadrant=quadrant.astype(jnp.int32),
         )

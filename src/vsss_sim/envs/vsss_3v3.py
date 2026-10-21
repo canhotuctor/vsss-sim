@@ -1,22 +1,8 @@
-"""
-IEEE VSSS 3 v 3 Gymnasium environment.
-
-Observation space (46-dimensional ``Box``):
-    [ ball_x/norm, ball_y/norm, ball_vx/norm, ball_vy/norm,          # 4
-      (per robot × 6 robots):                                         # 6×7 = 42
-          x/norm, y/norm, sin θ, cos θ, vx/norm, vy/norm, ω/norm ]
-
-Action space for the controlled team (``Box`` shape ``(6,)``):
-    [ vl_0, vr_0, vl_1, vr_1, vl_2, vr_2 ]  in [-1, 1]
-
-The **controlled team** is ``config.TEAM_BLUE`` by default.
-The **opponent** follows a pluggable policy (default: stationary zeros).
-
-Physics runs through the project's pure-functional JAX engine.
-"""
+"""Gymnasium adapter for a single IEEE VSSS 3v3 match."""
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, Optional, SupportsFloat
 
 import jax
@@ -27,30 +13,19 @@ from .. import config, physics
 from ..agents import random_policy, stationary_policy
 from ..config import InitMode, RewardProfile
 from .base import VSSBaseEnv
-from .match_rules import MatchRules, MatchStepInput
+from .match_rules import (
+    MatchPhase,
+    MatchRules,
+    MatchStepInput,
+    initial_referee_state,
+)
 
 
 class VSSEnv(VSSBaseEnv):
-    """
-    IEEE VSSS 3 v 3 Gymnasium environment.
+    """Gymnasium environment for one VSSS match.
 
-    Parameters
-    ----------
-    opponent_policy : str or callable, optional
-        ``"stationary"`` (default) – yellow robots do not move.
-        ``"random"``                – yellow robots use uniformly random actions.
-        callable                    – called with the current observation and
-                                      must return an ndarray of shape
-                                      ``(N_ROBOTS, 2)`` with values in [-1, 1].
-    render_mode : ``"human"`` | ``"rgb_array"`` | ``None``
-    max_episode_steps : int
-        Episode length in simulation steps (default: ``config.MAX_EPISODE_STEPS``).
-    init_mode : ``InitMode`` | ``"kickoff"`` | ``"random"``
-        Placement strategy used at every episode reset and in-episode kickoff.
-        ``"kickoff"`` (default) uses the standard formation with small jitter.
-        ``"random"`` places robots uniformly in their respective halves with
-        random headings. Future modes (e.g. a learned selector) can be added
-        by extending :class:`~vsss_sim.config.InitMode`.
+    The blue action contains six normalized wheel speeds. Yellow uses
+    stationary, random, or a callable returning an array of shape (3, 2).
     """
 
     def __init__(
@@ -58,14 +33,49 @@ class VSSEnv(VSSBaseEnv):
         opponent_policy: str | Callable = "stationary",
         render_mode: Optional[str] = None,
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
-        render_fps: Optional[float] = None,
+        control_rate_hz: float = config.FPS,
+        physics_substeps: int = config.SUB_STEPS,
+        speedup_rate: float = 1.0,
         init_mode: InitMode | str = InitMode.KICKOFF,
         reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
     ) -> None:
+        if isinstance(control_rate_hz, bool):
+            raise ValueError("control_rate_hz must be a positive finite number")
+        if isinstance(speedup_rate, bool):
+            raise ValueError("speedup_rate must be a positive finite number")
+        try:
+            control_rate_hz = float(control_rate_hz)
+            substeps_value = float(physics_substeps)
+            speedup_rate = float(speedup_rate)
+        except (TypeError, ValueError) as error:
+            raise ValueError("control rate, substeps, and speedup must be numeric") from error
+        if not math.isfinite(control_rate_hz) or control_rate_hz <= 0.0:
+            raise ValueError("control_rate_hz must be a positive finite number")
+        if (
+            isinstance(physics_substeps, bool)
+            or not math.isfinite(substeps_value)
+            or not substeps_value.is_integer()
+            or substeps_value < 1
+        ):
+            raise ValueError("physics_substeps must be a positive integer")
+        if not math.isfinite(speedup_rate) or speedup_rate <= 0.0:
+            raise ValueError("speedup_rate must be a positive finite number")
+
+        self._control_rate_hz = control_rate_hz
+        self._control_dt = 1.0 / self._control_rate_hz
+        self._physics_substeps = int(substeps_value)
+        self._base_render_fps = self._control_rate_hz * self._physics_substeps
+        self._speedup_rate = speedup_rate
+        # At >1x, group simulated substeps into each displayed frame. Keep
+        # display flips at normal refresh cadence so vsync cannot pin sim time
+        # to one physics substep per monitor refresh.
+        target_render_fps = self._base_render_fps * min(1.0, self._speedup_rate)
+        self._render_substep_accumulator = 0.0
+        self._render_substeps_since_frame = 0
         super().__init__(
             render_mode=render_mode,
             max_episode_steps=max_episode_steps,
-            render_fps=render_fps,
+            render_fps=target_render_fps if render_mode == "human" else None,
         )
 
         self._init_mode = InitMode(init_mode)
@@ -74,6 +84,8 @@ class VSSEnv(VSSBaseEnv):
             max_episode_steps=max_episode_steps,
             init_mode=self._init_mode,
         )
+        self._compiled_match_step = jax.jit(self._match_rules.step)
+        self._referee_state = initial_referee_state()
 
         if callable(opponent_policy):
             self._opponent_policy: Callable = opponent_policy
@@ -87,9 +99,7 @@ class VSSEnv(VSSBaseEnv):
                 "Choose 'stationary', 'random', or pass a callable."
             )
 
-    # ------------------------------------------------------------------
     # Physics helpers
-    # ------------------------------------------------------------------
 
     def _reset_state(self) -> None:
         """Replace ``self._state`` using the configured init_mode."""
@@ -98,37 +108,71 @@ class VSSEnv(VSSBaseEnv):
         )
         key = jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
         self._state = getattr(physics, reset_fn_name)(key)
+        self._referee_state = initial_referee_state()
 
     def _step_physics(self, all_actions: np.ndarray) -> int:
         """Advance the physics by one control step. Returns the goal event."""
         j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
-        self._state, info_phys = physics.step(self._state, j_actions)
+        self._state, info_phys = physics.step(
+            self._state,
+            j_actions,
+            dt=self._control_dt,
+            sub_steps=self._physics_substeps,
+        )
         return int(info_phys["goal"])
 
     def _step_physics_substeps(self, all_actions: np.ndarray) -> int:
-        """Run each physics sub-step individually, rendering after each one.
+        """Advance one control interval and render at the requested cadence.
 
-        Used only in ``render_mode="human"`` so the window shows smooth
-        intermediate motion rather than one jump per control step.
+        At normal speed, render intermediate substeps. At higher speeds, batch
+        the physics and sample fewer states so display refresh does not cap the
+        simulation to one substep per screen frame.
         """
-        sub_dt = config.DT / config.SUB_STEPS
+        j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
+        if self._speedup_rate >= self._physics_substeps:
+            self._state, info_phys = physics.step(
+                self._state,
+                j_actions,
+                dt=self._control_dt,
+                sub_steps=self._physics_substeps,
+            )
+            goal = int(info_phys["goal"])
+            self._render_after_physics(self._physics_substeps, goal)
+            return goal
+
+        sub_dt = self._control_dt / self._physics_substeps
         goal = 0
 
-        j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
-        for _ in range(config.SUB_STEPS):
+        for _ in range(self._physics_substeps):
             self._state, info_phys = physics.step(
                 self._state, j_actions, dt=sub_dt, sub_steps=1
             )
             g = int(info_phys["goal"])
             if goal == 0:
                 goal = g
-            self.render()
+            self._render_after_physics(1, g)
 
         return goal
 
-    # ------------------------------------------------------------------
+    def _render_after_physics(self, simulated_substeps: int, goal: int) -> None:
+        """Render sparsely while preserving the simulation-time speed target."""
+        self._render_substeps_since_frame += simulated_substeps
+        should_render = self._speedup_rate <= 1.0
+        if self._speedup_rate > 1.0:
+            self._render_substep_accumulator += simulated_substeps
+            should_render = (
+                self._render_substep_accumulator >= self._speedup_rate or goal != 0
+            )
+            if should_render:
+                if self._render_substep_accumulator >= self._speedup_rate:
+                    self._render_substep_accumulator -= self._speedup_rate
+                else:
+                    self._render_substep_accumulator = 0.0
+        if should_render:
+            self._render_current_state(self._render_substeps_since_frame)
+            self._render_substeps_since_frame = 0
+
     # Gymnasium interface
-    # ------------------------------------------------------------------
 
     def reset(
         self,
@@ -143,6 +187,8 @@ class VSSEnv(VSSBaseEnv):
         self._reset_state()
         self._step_count = 0
         self._episode_count += 1
+        self._render_substep_accumulator = 0.0
+        self._render_substeps_since_frame = 0
 
         return self._get_obs(), self._get_info()
 
@@ -162,6 +208,8 @@ class VSSEnv(VSSBaseEnv):
         obs_current = self._get_obs()
         yellow_actions = self._opponent_policy(obs_current).reshape(config.N_ROBOTS, 2)
         all_actions = np.stack([blue_actions, yellow_actions], axis=0)
+        if int(np.asarray(self._referee_state.phase)) == MatchPhase.STOPPED:
+            all_actions = np.zeros_like(all_actions)
 
         if self.render_mode == "human":
             goal = self._step_physics_substeps(all_actions)
@@ -173,16 +221,19 @@ class VSSEnv(VSSBaseEnv):
             if goal != 0
             else jax.random.PRNGKey(0)
         )
-        transition = self._match_rules.step(
+        transition = self._compiled_match_step(
             MatchStepInput(
                 simulation_before=simulation_before,
                 simulation_after_physics=self._state,
                 goal=jnp.asarray(goal, dtype=jnp.int32),
                 step_count=jnp.asarray(self._step_count, dtype=jnp.int32),
                 kickoff_key=kickoff_key,
+                referee_state=self._referee_state,
+                dt=jnp.float32(self._control_dt),
             )
         )
         self._state = transition.simulation
+        self._referee_state = transition.referee_state
         reward = float(np.asarray(transition.reward))
 
         terminated = False  # VSSS has no terminal state mid-match
@@ -191,6 +242,12 @@ class VSSEnv(VSSBaseEnv):
         obs = np.asarray(transition.observation, dtype=np.float32)
         info = self._get_info()
         info["goal"] = goal
+        info["event"] = int(np.asarray(transition.event))
+        info["offending_team"] = int(np.asarray(transition.offending_team))
+        info["restart"] = int(np.asarray(transition.restart))
+        info["restart_team"] = int(np.asarray(transition.restart_team))
+        info["quadrant"] = int(np.asarray(transition.quadrant))
+        info["match_phase"] = int(np.asarray(self._referee_state.phase))
 
         if self.render_mode == "rgb_array":
             self.render()
@@ -201,17 +258,17 @@ class VSSEnv(VSSBaseEnv):
         if self.render_mode is None:
             return None
 
+        return self._render_current_state(simulated_substeps=1)
+
+    def _render_current_state(self, simulated_substeps: int) -> Optional[np.ndarray]:
         if self._renderer is None:
             from ..rendering import VSSRenderer
-            # In human mode, render() is called SUB_STEPS times per control
-            # step, so the clock rate must be scaled up so that the wall-clock
-            # rate of *control steps* (not sub-steps) matches render_fps.
-            clock_fps = (
-                self._render_fps * config.SUB_STEPS
-                if self.render_mode == "human" and self._render_fps is not None
-                else self._render_fps
+            self._renderer = VSSRenderer(
+                render_mode=self.render_mode,
+                fps=self._render_fps,
+                baseline_fps=self._base_render_fps,
+                control_dt=self._control_dt,
             )
-            self._renderer = VSSRenderer(render_mode=self.render_mode, fps=clock_fps)
 
         return self._renderer.render(
             np.asarray(self._state.ball),
@@ -219,6 +276,7 @@ class VSSEnv(VSSBaseEnv):
             np.asarray(self._state.score),
             step=self._step_count,
             episode=self._episode_count,
+            simulated_substeps=simulated_substeps,
         )
 
     def close(self) -> None:

@@ -61,12 +61,16 @@ class VSSRenderer:
         scale: float = config.RENDER_SCALE,
         margin: int = config.RENDER_MARGIN,
         fps: Optional[float] = None,
+        baseline_fps: float = config.FPS * config.SUB_STEPS,
+        control_dt: float = config.DT,
     ) -> None:
         _require_pygame()
         self.render_mode = render_mode
         self.scale = scale
         self.margin = margin
         self._fps = fps
+        self._baseline_fps = baseline_fps
+        self._control_dt = control_dt
 
         self._field_px_w = int(config.FIELD_LENGTH * scale)
         self._field_px_h = int(config.FIELD_WIDTH * scale)
@@ -77,16 +81,12 @@ class VSSRenderer:
         self._screen: Optional[pygame.Surface] = None
         self._clock: Optional[pygame.time.Clock] = None
 
-        # Wall-clock FPS estimate (human mode only). Rolling average over the
-        # last `_FPS_WINDOW` frame deltas — long enough to be stable, short
-        # enough to react when the rate changes.
-        self._fps_window: deque[float] = deque(maxlen=30)
+        # Measured simulated substeps per wall-clock second, over recent frames.
+        self._speedup_samples: deque[tuple[float, int]] = deque(maxlen=30)
         self._last_render_t: Optional[float] = None
         self._hud_font: Optional[pygame.font.Font] = None
 
-    # ------------------------------------------------------------------
     # Coordinate helpers
-    # ------------------------------------------------------------------
 
     def _to_px(self, x: float, y: float) -> tuple[int, int]:
         """World coordinates (m) → pixel coordinates."""
@@ -97,9 +97,7 @@ class VSSRenderer:
     def _m_to_px(self, metres: float) -> int:
         return max(1, int(metres * self.scale))
 
-    # ------------------------------------------------------------------
     # Initialisation
-    # ------------------------------------------------------------------
 
     def _init(self) -> None:
         if self._surface is not None:
@@ -112,18 +110,15 @@ class VSSRenderer:
                 self._clock = pygame.time.Clock()
         self._surface = pygame.Surface((self._win_w, self._win_h))
 
-    # ------------------------------------------------------------------
     # Drawing primitives
-    # ------------------------------------------------------------------
 
     def _draw_field(self, surf: pygame.Surface) -> None:
         surf.fill(config.COLOR_BACKGROUND)
 
-        # Green grass — drawn as an octagon to reflect the corner chamfers.
         hl = config.FIELD_LENGTH / 2.0
         hw = config.FIELD_WIDTH / 2.0
         c = config.FIELD_CHAMFER
-        # Eight vertices of the chamfered field in world coords (clockwise from top-left):
+        # Chamfered field boundary, ordered clockwise from the top-left.
         corners_world = [
             (-hl + c,  hw),
             ( hl - c,  hw),
@@ -139,7 +134,6 @@ class VSSRenderer:
         gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD)
         gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD_LINES)
 
-        # Centre line
         mid_x = self.margin + self._field_px_w // 2
         pygame.draw.aaline(
             surf, config.COLOR_FIELD_LINES,
@@ -147,16 +141,32 @@ class VSSRenderer:
             (mid_x, self.margin + self._field_px_h),
         )
 
-        # Centre circle
         cx, cy = self._to_px(0.0, 0.0)
         r_px = self._m_to_px(config.CENTER_RADIUS)
         gfxdraw.aacircle(surf, cx, cy, r_px, config.COLOR_FIELD_LINES)
 
-        # Goals
+        # Free-ball marks (BL), 37.5 cm from each end and 25 cm from each side.
+        cross_half_length = 0.03
+        for sign_x in (-1.0, 1.0):
+            for sign_y in (-1.0, 1.0):
+                mark_x = sign_x * config.FREE_BALL_MARK_X
+                mark_y = sign_y * config.FREE_BALL_MARK_Y
+                pygame.draw.aaline(
+                    surf,
+                    config.COLOR_FIELD_LINES,
+                    self._to_px(mark_x - cross_half_length, mark_y),
+                    self._to_px(mark_x + cross_half_length, mark_y),
+                )
+                pygame.draw.aaline(
+                    surf,
+                    config.COLOR_FIELD_LINES,
+                    self._to_px(mark_x, mark_y - cross_half_length),
+                    self._to_px(mark_x, mark_y + cross_half_length),
+                )
+
         goal_px_h = self._m_to_px(config.GOAL_WIDTH)
         goal_px_d = self._m_to_px(config.GOAL_DEPTH)
 
-        # Blue goal (left, x = -FIELD_LENGTH/2)
         gx_left, gy_top = self._to_px(
             -config.FIELD_LENGTH / 2.0 - config.GOAL_DEPTH,
             config.GOAL_WIDTH / 2.0,
@@ -171,7 +181,6 @@ class VSSRenderer:
             2,
         )
 
-        # Yellow goal (right, x = +FIELD_LENGTH/2)
         gx_right, gy_top = self._to_px(
             config.FIELD_LENGTH / 2.0,
             config.GOAL_WIDTH / 2.0,
@@ -194,11 +203,8 @@ class VSSRenderer:
         for side_x, sign in ((-hl, 1), (hl, -1)):
             inner_x = side_x + sign * ga_x
             for wx, wy in (
-                # inner vertical line
                 ((inner_x, -ga_half_y), (inner_x, ga_half_y)),
-                # top horizontal
                 ((side_x, ga_half_y), (inner_x, ga_half_y)),
-                # bottom horizontal
                 ((side_x, -ga_half_y), (inner_x, -ga_half_y)),
             ):
                 pygame.draw.aaline(
@@ -239,7 +245,6 @@ class VSSRenderer:
         gfxdraw.aapolygon(surf, corners_px, color)
         gfxdraw.aapolygon(surf, corners_px, config.COLOR_ROBOT_OUTLINE)
 
-        # Direction indicator from centre to front face midpoint (AA line)
         cx, cy = self._to_px(x, y)
         tip = self._to_px(x + cos_t * half * 0.85, y + sin_t * half * 0.85)
         pygame.draw.aaline(surf, config.COLOR_ROBOT_OUTLINE, (cx, cy), tip)
@@ -270,13 +275,13 @@ class VSSRenderer:
         )
         surf.blit(text, (self._win_w // 2 - text.get_width() // 2, 8))
 
-    def _update_fps_sample(self) -> None:
-        """Record a wall-clock delta from the previous render call."""
+    def _update_speedup_sample(self, simulated_substeps: int) -> None:
+        """Record elapsed wall time and simulated steps since the prior frame."""
         now = time.perf_counter()
         if self._last_render_t is not None:
             dt = now - self._last_render_t
             if dt > 0:
-                self._fps_window.append(dt)
+                self._speedup_samples.append((dt, simulated_substeps))
         self._last_render_t = now
 
     def _hud_font_or_none(self) -> Optional["pygame.font.Font"]:
@@ -287,17 +292,24 @@ class VSSRenderer:
                 return None
         return self._hud_font
 
-    def _draw_fps(self, surf: pygame.Surface) -> None:
-        """Draw a wall-clock FPS readout in the top-left corner."""
-        if not self._fps_window:
+    def _draw_speedup(self, surf: pygame.Surface) -> None:
+        """Draw the achieved simulation speed relative to real time."""
+        if not self._speedup_samples:
             return
-        avg_dt = sum(self._fps_window) / len(self._fps_window)
-        fps = 1.0 / avg_dt if avg_dt > 0 else 0.0
+        elapsed = sum(dt for dt, _ in self._speedup_samples)
+        simulated_substeps = sum(steps for _, steps in self._speedup_samples)
+        speedup_rate = (
+            simulated_substeps / (elapsed * self._baseline_fps)
+            if elapsed > 0 and self._baseline_fps > 0
+            else 0.0
+        )
 
         font = self._hud_font_or_none()
         if font is None:
             return
-        text = font.render(f"{fps:5.1f} fps", True, config.COLOR_FIELD_LINES)
+        text = font.render(
+            f"speedup {speedup_rate:4.1f}x", True, config.COLOR_FIELD_LINES
+        )
         surf.blit(text, (8, 8))
 
     def _draw_step(self, surf: pygame.Surface, step: int) -> None:
@@ -305,8 +317,7 @@ class VSSRenderer:
         font = self._hud_font_or_none()
         if font is None:
             return
-        # Sim time = step * DT — handy alongside the integer count.
-        sim_t = step * config.DT
+        sim_t = step * self._control_dt
         # Extra spaces after "step" and "episode" align the two numeric
         # columns vertically (see _draw_episode below).
         text = font.render(
@@ -324,9 +335,7 @@ class VSSRenderer:
         )
         surf.blit(text, (8, self._win_h - 2 * font.get_linesize() - 8))
 
-    # ------------------------------------------------------------------
     # Public render method
-    # ------------------------------------------------------------------
 
     def render(
         self,
@@ -335,6 +344,7 @@ class VSSRenderer:
         score: np.ndarray,
         step: Optional[int] = None,
         episode: Optional[int] = None,
+        simulated_substeps: int = 1,
     ) -> Optional[np.ndarray]:
         """
         Render one frame.
@@ -348,6 +358,8 @@ class VSSRenderer:
             left in human mode.
         episode : optional episode counter; when given, drawn just above the
             step counter in human mode.
+        simulated_substeps : number of physics substeps represented by this
+            frame, used to calculate the achieved speedup in human mode.
 
         Returns
         -------
@@ -371,8 +383,8 @@ class VSSRenderer:
         self._draw_score(surf, int(score[0]), int(score[1]))
 
         if self.render_mode == "human":
-            self._update_fps_sample()
-            self._draw_fps(surf)
+            self._update_speedup_sample(simulated_substeps)
+            self._draw_speedup(surf)
             if step is not None:
                 self._draw_step(surf, int(step))
             if episode is not None:
@@ -385,10 +397,9 @@ class VSSRenderer:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     raise SystemExit(0)
             if self._clock is not None:
-                self._clock.tick(self._fps)
+                self._clock.tick(int(self._fps))
             return None
 
-        # rgb_array: return numpy array (H, W, 3)
         raw = pygame.surfarray.array3d(surf)   # (W, H, 3)
         return np.transpose(raw, (1, 0, 2))    # → (H, W, 3)
 

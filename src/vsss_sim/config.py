@@ -19,23 +19,27 @@ class InitMode(str, Enum):
 
     KICKOFF : standard formation with small jitter (default).
     RANDOM  : uniformly random positions in each team's half; random headings.
-              Future: SELECTOR — a learned/heuristic model outputs placements.
     """
     KICKOFF = "kickoff"
     RANDOM = "random"
 
 
 class RewardProfile(str, Enum):
-    """Team reward rule selected for a match or RL experiment."""
+    """Reward formula used by a match or RL experiment."""
 
     DEFAULT = "default"
     BRANDAO_REWARD = "brandao_reward"
 
-# ---------------------------------------------------------------------------
 # Field (all dimensions in metres)
-# ---------------------------------------------------------------------------
 FIELD_LENGTH: float = 1.50   # x-axis extent (150 cm)
 FIELD_WIDTH: float = 1.30    # y-axis extent (130 cm)
+
+# Free-ball marks from the LARC-VSSS field diagram: 37.5 cm from each end
+# line and 25 cm from each sideline.
+FREE_BALL_MARK_X: float = FIELD_LENGTH / 4.0
+FREE_BALL_MARK_Y: float = FIELD_WIDTH / 2.0 - 0.25
+# The penalty mark is 37.5 cm from the centerline (x = ±FIELD_LENGTH / 4).
+PENALTY_MARK_X: float = FIELD_LENGTH / 4.0
 
 # Goal
 GOAL_WIDTH: float = 0.40     # 40 cm opening
@@ -51,27 +55,21 @@ FIELD_CHAMFER: float = 0.07  # 7 cm
 # Center circle radius (used for kickoff clearance)
 CENTER_RADIUS: float = 0.20  # 20 cm
 
-# ---------------------------------------------------------------------------
 # Teams
-# ---------------------------------------------------------------------------
 N_TEAMS: int = 2
 N_ROBOTS: int = 3            # per team (3 v 3 format)
 
 TEAM_BLUE: int = 0           # blue team index
 TEAM_YELLOW: int = 1         # yellow team index
 
-# ---------------------------------------------------------------------------
 # Ball
-# ---------------------------------------------------------------------------
 BALL_RADIUS: float = 0.02135  # golf ball: 42.67 mm diameter → 21.35 mm radius
 BALL_MASS: float = 0.046      # kg  (~45.9 g golf ball)
 BALL_FRICTION: float = 0.05   # rolling-friction coefficient (μ_r)
 BALL_WALL_RESTITUTION: float = 0.80
 BALL_ROBOT_RESTITUTION: float = 0.80
 
-# ---------------------------------------------------------------------------
 # Robot
-# ---------------------------------------------------------------------------
 ROBOT_SIZE: float = 0.075                # max 7.5 cm × 7.5 cm footprint
 ROBOT_RADIUS: float = ROBOT_SIZE / 2.0   # collision radius (≈ bounding circle)
 ROBOT_MASS: float = 0.312                 # kg
@@ -90,9 +88,7 @@ ROBOT_MAX_WHEEL_SPEED: float = ROBOT_MAX_MOTOR_SPEED * ROBOT_WHEEL_RADIUS  # ≈
 # bound for VSSS-class robots; 0 → max takes ~133 ms (~8 control steps).
 ROBOT_WHEEL_ACCEL_LIMIT: float = 1.0 * 9.81  # m/s² (≈ 1 g)
 
-# ---------------------------------------------------------------------------
 # Simulation
-# ---------------------------------------------------------------------------
 FPS: float = 15.0           # control loop frequency in-game (Hz)
 DT: float = 1.0 / FPS       # control loop timestep in-game (s)
 SUB_STEPS: int = 4          # number of physics sub-steps per control loop step
@@ -100,9 +96,7 @@ SUB_STEPS: int = 4          # number of physics sub-steps per control loop step
 MAX_EPISODE_STEPS: int = 300  # 20 s at 15 Hz (config.FPS control steps)
 KICKOFF_CLEAR_DIST: float = 0.20  # minimum robot distance from centre at kickoff
 
-# ---------------------------------------------------------------------------
 # Reward shaping
-# ---------------------------------------------------------------------------
 # Small dense reward per step proportional to the ball's forward displacement
 # (Δx for the blue team; blue attacks +x). Telescopes to coef * (x_end - x_start)
 # over an episode, so per-episode shaping is bounded by coef * FIELD_LENGTH.
@@ -113,11 +107,9 @@ BALL_FORWARD_REWARD_COEF: float = 0.10
 # worst-case penalty per tick is 2× this value.
 GOAL_AREA_CROWDING_PENALTY: float = -0.02
 
-# ---------------------------------------------------------------------------
 # Normalisation headroom factor for velocity observations (ensures values
 # slightly above max wheel speed are still within a reasonable range)
 VELOCITY_NORM_HEADROOM: float = 1.5
-# ---------------------------------------------------------------------------
 RENDER_SCALE: float = 350.0   # pixels per metre
 RENDER_MARGIN: int = 60       # pixel border around the field
 

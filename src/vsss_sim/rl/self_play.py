@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import serialization
 
+from .. import config as sim_config
 from ..config import InitMode, RewardProfile
 from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
 from ..envs.jumanji import VSSJumanjiEnv
@@ -107,6 +108,8 @@ class ExperimentConfig:
     opponent_weights: OpponentSamplingWeights = field(
         default_factory=OpponentSamplingWeights
     )
+    control_rate_hz: float | None = None
+    physics_substeps: int | None = None
 
     def __post_init__(self) -> None:
         if not _SAFE_NAME.fullmatch(self.experiment_name) or self.experiment_name in (".", ".."):
@@ -135,6 +138,37 @@ class ExperimentConfig:
             raise ValueError(
                 "policy_architecture must be 'joint', 'brandao_shared', or 'brandao_sets'"
             )
+        is_brandao_policy = self.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+        if self.control_rate_hz is None:
+            object.__setattr__(
+                self,
+                "control_rate_hz",
+                10.0 if is_brandao_policy else sim_config.FPS,
+            )
+        if self.physics_substeps is None:
+            object.__setattr__(
+                self,
+                "physics_substeps",
+                6 if is_brandao_policy else sim_config.SUB_STEPS,
+            )
+        if (
+            self.control_rate_hz is None
+            or isinstance(self.control_rate_hz, bool)
+            or not isinstance(self.control_rate_hz, (int, float))
+            or not np.isfinite(self.control_rate_hz)
+            or self.control_rate_hz <= 0.0
+        ):
+            raise ValueError("control_rate_hz must be a positive finite number")
+        if (
+            self.physics_substeps is None
+            or isinstance(self.physics_substeps, bool)
+            or not isinstance(self.physics_substeps, (int, float))
+            or not np.isfinite(self.physics_substeps)
+            or int(self.physics_substeps) != self.physics_substeps
+            or self.physics_substeps < 1
+        ):
+            raise ValueError("physics_substeps must be a positive integer")
+        object.__setattr__(self, "physics_substeps", int(self.physics_substeps))
         if self.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
             if self.reward_profile == RewardProfile.DEFAULT.value:
                 object.__setattr__(
@@ -364,6 +398,8 @@ def _make_env(config: ExperimentConfig) -> Any:
         terminate_on_goal=config.terminate_on_goal,
         reward_profile=config.reward_profile,
         policy_architecture=config.policy_architecture,
+        control_rate_hz=config.control_rate_hz,
+        physics_substeps=config.physics_substeps,
     )
 
 
