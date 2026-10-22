@@ -197,8 +197,14 @@ def _resolve_referee(
     pending_defender_violations = []
     for team in range(config.N_TEAMS):
         attacking_area = areas_after[team, :, 1 - team]
+        attacking_ball_dispute = (
+            ball_areas[1 - team]
+            & jnp.any(near_ball[team])
+            & jnp.any(near_ball[1 - team])
+        )
         attacking_violations.append(
-            (jnp.sum(attacking_area) >= 2)
+            attacking_ball_dispute
+            & (jnp.sum(attacking_area) >= 2)
             & _second_robot_participates(
                 attacking_area,
                 area_seconds[team, :, 1 - team],

@@ -18,7 +18,8 @@ from .. import config as sim_config
 from ..config import InitMode, RewardProfile
 from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
 from ..envs.jumanji import VSSJumanjiEnv
-from .ppo import PPO, PPOConfig
+from ..envs.match_referee import RefereeEvent
+from .ppo import PPO, PPOConfig, deterministic_policy_action
 
 _SNAPSHOT_SCHEMA_VERSION = 1
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -94,6 +95,9 @@ class ExperimentConfig:
     hidden_sizes: tuple[int, ...] = (64, 64)
     seed: int = 0
     snapshot_interval: int = 10
+    generation_offset: int = 0
+    initial_policy_snapshot: str | None = None
+    initial_opponent_snapshot: str | None = None
     active_pool_limit: int | None = None
     max_episode_steps: int = 300
     terminate_on_goal: bool = False
@@ -110,6 +114,7 @@ class ExperimentConfig:
     )
     control_rate_hz: float | None = None
     physics_substeps: int | None = None
+    require_gpu: bool = False
 
     def __post_init__(self) -> None:
         if not _SAFE_NAME.fullmatch(self.experiment_name) or self.experiment_name in (".", ".."):
@@ -130,6 +135,16 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be at least 1")
         if self.active_pool_limit is not None and self.active_pool_limit < 1:
             raise ValueError("active_pool_limit must be at least 1 when provided")
+        if (
+            isinstance(self.generation_offset, bool)
+            or not isinstance(self.generation_offset, int)
+            or self.generation_offset < 0
+        ):
+            raise ValueError("generation_offset must be a non-negative integer")
+        if self.generation_offset > 0 and not self.initial_policy_snapshot:
+            raise ValueError(
+                "generation_offset requires an initial_policy_snapshot"
+            )
         if self.opponent_update_threshold < 0.0:
             raise ValueError("opponent_update_threshold must be non-negative")
         if self.init_mode not in ("kickoff", "random"):
@@ -139,6 +154,10 @@ class ExperimentConfig:
                 "policy_architecture must be 'joint', 'brandao_shared', or 'brandao_sets'"
             )
         is_brandao_policy = self.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+        if self.initial_opponent_snapshot and not is_brandao_policy:
+            raise ValueError(
+                "initial_opponent_snapshot is only supported for Brandao policies"
+            )
         if self.control_rate_hz is None:
             object.__setattr__(
                 self,
@@ -469,8 +488,135 @@ def _write_json_line(path: Path, value: dict[str, Any]) -> None:
         file.write(json.dumps(value, sort_keys=True) + "\n")
 
 
+def _opponent_evaluation_summary(scores: np.ndarray, threshold: float) -> dict[str, Any]:
+    """Summarize candidate-vs-opponent matches and apply the goal-delta rule."""
+    scores = np.asarray(scores, dtype=np.float64)
+    if scores.ndim != 2 or scores.shape[1] != sim_config.N_TEAMS:
+        raise ValueError("scores must have shape (matches, teams)")
+    if scores.shape[0] < 1:
+        raise ValueError("opponent evaluation must contain at least one match")
+
+    goals_for = scores[:, sim_config.TEAM_BLUE]
+    goals_against = scores[:, sim_config.TEAM_YELLOW]
+    mean_goal_delta = float(np.mean(goals_for - goals_against))
+    return {
+        "evaluation_sample_count": int(scores.shape[0]),
+        "mean_goals_for": float(np.mean(goals_for)),
+        "mean_goals_against": float(np.mean(goals_against)),
+        "mean_goal_delta": mean_goal_delta,
+        "opponent_replaced": mean_goal_delta >= threshold,
+    }
+
+
+def _make_candidate_evaluator(env: VSSJumanjiEnv, model, policy_architecture: str):
+    """Build a compiled batch evaluator for single-goal, 40-second matches."""
+
+    def evaluate(candidate_params: dict, opponent_params: dict, seeds: jax.Array):
+        keys = jax.vmap(jax.random.PRNGKey)(seeds)
+        states, timesteps = jax.vmap(env.reset)(keys)
+        observations = timesteps.observation
+        completed = jnp.zeros((seeds.shape[0],), dtype=jnp.bool_)
+
+        def match_step(carry, _):
+            states, observations, completed = carry
+
+            def advance_one(state, observation, done):
+                def advance(_):
+                    candidate_action = deterministic_policy_action(
+                        model, candidate_params, observation, policy_architecture
+                    )
+                    opponent_observation = env.opponent_observation(state)
+                    opponent_action = deterministic_policy_action(
+                        model,
+                        opponent_params,
+                        opponent_observation,
+                        policy_architecture,
+                    )
+                    next_state, timestep = env.step(
+                        state,
+                        candidate_action,
+                        opponent_action=opponent_action,
+                        opponent_mode=0,
+                    )
+                    return next_state, timestep.observation, timestep.last()
+
+                return jax.lax.cond(
+                    done,
+                    lambda _: (state, observation, done),
+                    advance,
+                    operand=None,
+                )
+
+            states, observations, completed = jax.vmap(advance_one)(
+                states, observations, completed
+            )
+            return (states, observations, completed), None
+
+        (states, _, _), _ = jax.lax.scan(
+            match_step,
+            (states, observations, completed),
+            xs=None,
+            length=env.max_episode_steps,
+        )
+        return states.simulation.score
+
+    return jax.jit(evaluate)
+
+
+def _require_gpu_backend() -> None:
+    """Fail before creating outputs if JAX cannot execute on a GPU."""
+    try:
+        gpu_devices = jax.devices("gpu")
+        default_backend = jax.default_backend()
+    except RuntimeError as error:
+        raise RuntimeError(
+            "this experiment requires a visible JAX GPU; refusing CPU fallback"
+        ) from error
+    if not gpu_devices or default_backend != "gpu":
+        raise RuntimeError(
+            "this experiment requires a visible JAX GPU; refusing CPU fallback"
+        )
+
+
+def _load_external_snapshot(
+    snapshot_path: str | Path,
+    template: dict,
+    config: ExperimentConfig,
+) -> tuple[dict, dict[str, Any], Path]:
+    """Load and validate a policy snapshot used to warm-start an experiment."""
+    path = Path(snapshot_path).expanduser().resolve()
+    metadata_path = path.with_suffix(".json")
+    if not path.is_file():
+        raise FileNotFoundError(f"initial policy snapshot not found: {path}")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"snapshot metadata not found: {metadata_path}")
+    with metadata_path.open(encoding="utf-8") as file:
+        metadata = json.load(file)
+    if metadata.get("schema_version") != _SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError(f"unsupported snapshot schema in {metadata_path}")
+    if metadata.get("artifact") != path.name:
+        raise ValueError(f"snapshot metadata artifact does not match {path.name}")
+    if metadata.get("policy_architecture", "joint") != config.policy_architecture:
+        raise ValueError("initial snapshot policy architecture does not match experiment")
+    if tuple(metadata.get("hidden_sizes", ())) != tuple(config.hidden_sizes):
+        raise ValueError("initial snapshot hidden sizes do not match experiment")
+    expected_observation_size = (
+        BRANDAO_OBSERVATION_SIZE
+        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+        else 46
+    )
+    if int(metadata.get("observation_size", -1)) != expected_observation_size:
+        raise ValueError("initial snapshot observation size does not match experiment")
+    if int(metadata.get("generation", -1)) < 0:
+        raise ValueError("initial snapshot generation metadata is invalid")
+    params = serialization.from_bytes(template, path.read_bytes())
+    return jax.tree_util.tree_map(jnp.asarray, params), metadata, path
+
+
 def run_experiment(config: ExperimentConfig, config_source: str | Path | None = None) -> Path:
     """Run one experiment with independent PPO learner states on a lineage axis."""
+    if config.require_gpu:
+        _require_gpu_backend()
     output_root = Path(config.output_root)
     experiment_dir = output_root / config.experiment_name
     if experiment_dir.exists() and any(experiment_dir.iterdir()):
@@ -478,6 +624,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             f"experiment output already exists: {experiment_dir}; use a new experiment_name"
         )
     experiment_dir.mkdir(parents=True, exist_ok=True)
+    run_started = time.perf_counter()
     resolved_config = config.to_dict()
     (experiment_dir / "config.json").write_text(
         json.dumps(resolved_config, indent=2, sort_keys=True), encoding="utf-8"
@@ -489,6 +636,11 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
 
     env = _make_env(config)
     trainer = PPO(env, config.ppo_config())
+    opponent_evaluator = (
+        _make_candidate_evaluator(env, trainer.model, config.policy_architecture)
+        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+        else None
+    )
     archives = [
         SnapshotArchive(output_root, config.experiment_name, lineage)
         for lineage in range(config.num_lineages)
@@ -497,13 +649,53 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
     initial_runners = jax.jit(jax.vmap(trainer._initialize))(keys)
     jax.block_until_ready(initial_runners)
 
+    template_params = _extract_lineage(initial_runners.train_state.params, 0)
+    initial_policy = (
+        _load_external_snapshot(
+            config.initial_policy_snapshot, template_params, config
+        )
+        if config.initial_policy_snapshot is not None
+        else None
+    )
+    if (
+        initial_policy is not None
+        and int(initial_policy[1]["generation"]) != config.generation_offset
+    ):
+        raise ValueError(
+            "initial policy snapshot generation must equal generation_offset"
+        )
+    initial_opponent = (
+        _load_external_snapshot(
+            config.initial_opponent_snapshot, template_params, config
+        )
+        if config.initial_opponent_snapshot is not None
+        else None
+    )
+    if initial_opponent is not None:
+        initial_opponent_generation = int(initial_opponent[1]["generation"])
+        if initial_opponent_generation == config.generation_offset:
+            raise ValueError(
+                "initial opponent and initial policy must use distinct generation IDs"
+            )
+
+    if initial_policy is not None:
+        stacked_initial_params = jax.tree_util.tree_map(
+            lambda *values: jnp.stack(values),
+            *([initial_policy[0]] * config.num_lineages),
+        )
+        initial_runners = initial_runners._replace(
+            train_state=initial_runners.train_state.replace(
+                params=stacked_initial_params
+            )
+        )
+
     for lineage, archive in enumerate(archives):
         initial_params = _extract_lineage(
             initial_runners.train_state.params, lineage
         )
         archive.save(
             initial_params,
-            generation=0,
+            generation=config.generation_offset,
             seed=config.seed,
             hidden_sizes=config.hidden_sizes,
             observation_size=(
@@ -515,12 +707,70 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             policy_architecture=config.policy_architecture,
         )
 
+    if initial_opponent is not None:
+        for archive in archives:
+            archive.save(
+                initial_opponent[0],
+                generation=initial_opponent_generation,
+                seed=config.seed,
+                hidden_sizes=config.hidden_sizes,
+                observation_size=(
+                    BRANDAO_OBSERVATION_SIZE
+                    if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                    else 46
+                ),
+                action_size=(
+                    2
+                    if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                    else 6
+                ),
+                policy_architecture=config.policy_architecture,
+            )
+
+    if initial_policy is not None or initial_opponent is not None:
+        warm_start_metadata = {
+            "generation_offset": config.generation_offset,
+            "initial_policy_snapshot": (
+                {
+                    "path": str(initial_policy[2]),
+                    "source_experiment": initial_policy[1].get("experiment_name"),
+                    "source_lineage": initial_policy[1].get("lineage"),
+                    "source_generation": initial_policy[1]["generation"],
+                }
+                if initial_policy is not None
+                else None
+            ),
+            "initial_opponent_snapshot": (
+                {
+                    "path": str(initial_opponent[2]),
+                    "source_experiment": initial_opponent[1].get("experiment_name"),
+                    "source_lineage": initial_opponent[1].get("lineage"),
+                    "source_generation": initial_opponent[1]["generation"],
+                }
+                if initial_opponent is not None
+                else None
+            ),
+            "optimizer_state_restored": False,
+            "trainer_state": (
+                "fresh PPO optimizer and environment state; policy weights loaded from snapshots"
+            ),
+        }
+        (experiment_dir / "warm_start.json").write_text(
+            json.dumps(warm_start_metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
     pool_load_started = time.perf_counter()
     if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
-        selected_opponent_generations = [0] * config.num_lineages
+        selected_generation = (
+            initial_opponent_generation
+            if initial_opponent is not None
+            else config.generation_offset
+        )
+        selected_opponent_generations = [selected_generation] * config.num_lineages
         pools, probabilities, generation_ids, pool_generations = _brandao_opponent_pools(
             archives,
-            _extract_lineage(initial_runners.train_state.params, 0),
+            template_params,
             config,
             selected_opponent_generations,
         )
@@ -531,6 +781,12 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
         )
     initial_pool_load_seconds = time.perf_counter() - pool_load_started
     runners = trainer.initialize_lineages(keys, pools, probabilities, generation_ids)
+    if initial_policy is not None:
+        # initialize_lineages creates a fresh optimizer and environment state;
+        # replace only its parameters so the optimizer state remains fresh.
+        runners = runners._replace(
+            train_state=runners.train_state.replace(params=stacked_initial_params)
+        )
     jax.block_until_ready(runners)
 
     metrics_path = experiment_dir / "metrics.jsonl"
@@ -539,9 +795,14 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
         performance_path,
         {
             "event": "initial_pool_load",
-            "generation": 0,
+            "generation": config.generation_offset,
             "seconds": initial_pool_load_seconds,
             "active_snapshots_per_lineage": len(pool_generations[0]),
+            "selected_opponent_generation": (
+                selected_opponent_generations[0]
+                if selected_opponent_generations
+                else None
+            ),
             "opponent_update_threshold": (
                 config.opponent_update_threshold
                 if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
@@ -576,8 +837,8 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             performance_path,
             {
                 "event": "train_chunk",
-                "generation_start": completed + 1,
-                "generation_end": completed + chunk_size,
+                "generation_start": config.generation_offset + completed + 1,
+                "generation_end": config.generation_offset + completed + chunk_size,
                 "seconds": elapsed,
                 "env_steps": chunk_size * steps_per_generation * config.num_lineages,
                 "agent_transitions": (
@@ -600,9 +861,24 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             },
         )
         host_history = jax.device_get(history)
+        metric_records = {}
         for update_in_chunk in range(chunk_size):
-            generation = completed + update_in_chunk + 1
+            generation = (
+                config.generation_offset + completed + update_in_chunk + 1
+            )
             for lineage in range(config.num_lineages):
+                blue_goals_by_env = np.asarray(
+                    host_history["blue_goals_by_env"][update_in_chunk, lineage],
+                    dtype=np.int64,
+                )
+                yellow_goals_by_env = np.asarray(
+                    host_history["yellow_goals_by_env"][update_in_chunk, lineage],
+                    dtype=np.int64,
+                )
+                referee_event_counts = np.asarray(
+                    host_history["referee_event_counts"][update_in_chunk, lineage],
+                    dtype=np.int64,
+                )
                 record = {
                     "generation": generation,
                     "lineage": lineage,
@@ -639,9 +915,39 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                         host_history["mean_episode_length"][update_in_chunk, lineage]
                     ),
                     "episodes": int(host_history["episodes"][update_in_chunk, lineage]),
+                    "episode_terminations": int(
+                        host_history["episodes"][update_in_chunk, lineage]
+                    ),
                     "blue_goals": int(host_history["blue_goals"][update_in_chunk, lineage]),
                     "yellow_goals": int(
                         host_history["yellow_goals"][update_in_chunk, lineage]
+                    ),
+                    "blue_goals_by_env": blue_goals_by_env.tolist(),
+                    "yellow_goals_by_env": yellow_goals_by_env.tolist(),
+                    "mean_blue_goals_per_env": float(np.mean(blue_goals_by_env)),
+                    "mean_yellow_goals_per_env": float(np.mean(yellow_goals_by_env)),
+                    "mean_goal_delta_per_env": float(
+                        np.mean(blue_goals_by_env - yellow_goals_by_env)
+                    ),
+                    "referee_event_counts": {
+                        event.name.lower(): int(referee_event_counts[int(event)])
+                        for event in RefereeEvent
+                    },
+                    "opponent_generation": (
+                        selected_opponent_generations[lineage]
+                        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                        else None
+                    ),
+                    "opponent_evaluated": False,
+                    "opponent_evaluation_sample_count": 0,
+                    "opponent_evaluation_mean_goals_for": None,
+                    "opponent_evaluation_mean_goals_against": None,
+                    "opponent_evaluation_mean_goal_delta": None,
+                    "opponent_replaced": False,
+                    "selected_opponent_generation": (
+                        selected_opponent_generations[lineage]
+                        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                        else None
                     ),
                     "opponent_selector_step_counts": {
                         name: int(count)
@@ -667,18 +973,19 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                         if generation >= 0
                     },
                 }
-                _write_json_line(metrics_path, record)
+                metric_records[(generation, lineage)] = record
         completed += chunk_size
 
         should_snapshot = completed % config.snapshot_interval == 0
         is_final = completed == config.num_generations
         if should_snapshot or is_final:
+            snapshot_generation = config.generation_offset + completed
             snapshot_started = time.perf_counter()
             for lineage, archive in enumerate(archives):
                 params = _extract_lineage(runners.train_state.params, lineage)
                 archive.save(
                     params,
-                    generation=completed,
+                    generation=snapshot_generation,
                     seed=config.seed + lineage,
                     hidden_sizes=config.hidden_sizes,
                     observation_size=(
@@ -694,28 +1001,87 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                 performance_path,
                 {
                     "event": "snapshot_write",
-                    "generation": completed,
+                    "generation": snapshot_generation,
                     "seconds": snapshot_seconds,
                 },
             )
-            if not is_final:
-                pool_load_started = time.perf_counter()
-                if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
-                    episodes = np.asarray(host_history["episodes"], dtype=np.float64).sum(
-                        axis=0
+
+            if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
+                replaced_any = False
+                for lineage, archive in enumerate(archives):
+                    candidate_params = _extract_lineage(
+                        runners.train_state.params, lineage
                     )
-                    goal_difference = (
-                        np.asarray(host_history["blue_goals"], dtype=np.float64).sum(
-                            axis=0
-                        )
-                        - np.asarray(
-                            host_history["yellow_goals"], dtype=np.float64
-                        ).sum(axis=0)
+                    opponent_generation = selected_opponent_generations[lineage]
+                    opponent_params = archive.load(
+                        candidate_params,
+                        opponent_generation,
+                        expected_hidden_sizes=config.hidden_sizes,
+                        expected_policy_architecture=config.policy_architecture,
                     )
-                    score_by_lineage = goal_difference / np.maximum(episodes, 1.0)
-                    for lineage, score in enumerate(score_by_lineage):
-                        if score >= config.opponent_update_threshold:
-                            selected_opponent_generations[lineage] = completed
+                    evaluation_seed = (
+                        config.seed
+                        + snapshot_generation * config.evaluation_matches
+                        + lineage * 10_000_000
+                    )
+                    evaluation_seeds = jnp.arange(
+                        evaluation_seed,
+                        evaluation_seed + config.evaluation_matches,
+                        dtype=jnp.uint32,
+                    )
+                    scores = opponent_evaluator(
+                        candidate_params, opponent_params, evaluation_seeds
+                    )
+                    jax.block_until_ready(scores)
+                    evaluation = _opponent_evaluation_summary(
+                        np.asarray(scores), config.opponent_update_threshold
+                    )
+                    replaced = bool(evaluation["opponent_replaced"])
+                    if replaced:
+                        selected_opponent_generations[lineage] = snapshot_generation
+                        replaced_any = True
+                    record = metric_records[(snapshot_generation, lineage)]
+                    record.update(
+                        {
+                            "opponent_generation": opponent_generation,
+                            "opponent_evaluated": True,
+                            "opponent_evaluation_sample_count": evaluation[
+                                "evaluation_sample_count"
+                            ],
+                            "opponent_evaluation_mean_goals_for": evaluation[
+                                "mean_goals_for"
+                            ],
+                            "opponent_evaluation_mean_goals_against": evaluation[
+                                "mean_goals_against"
+                            ],
+                            "opponent_evaluation_mean_goal_delta": evaluation[
+                                "mean_goal_delta"
+                            ],
+                            "opponent_replaced": replaced,
+                            "selected_opponent_generation": (
+                                selected_opponent_generations[lineage]
+                            ),
+                        }
+                    )
+                    _write_json_line(
+                        performance_path,
+                        {
+                            "event": "opponent_evaluation",
+                            "generation": snapshot_generation,
+                            "lineage": lineage,
+                            "opponent_generation": opponent_generation,
+                            **evaluation,
+                            "update_threshold": config.opponent_update_threshold,
+                            "selected_opponent_generation": (
+                                selected_opponent_generations[lineage]
+                            ),
+                            "evaluation_seed": evaluation_seed,
+                            "policy_action_mode": "deterministic_mean",
+                        },
+                    )
+
+                if replaced_any and not is_final:
+                    pool_load_started = time.perf_counter()
                     pools, probabilities, generation_ids, pool_generations = (
                         _brandao_opponent_pools(
                             archives,
@@ -727,41 +1093,60 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     _write_json_line(
                         performance_path,
                         {
-                            "event": "brandao_opponent_selection",
-                            "generation": completed,
-                            "goal_difference_per_episode": [
-                                float(value) for value in score_by_lineage
-                            ],
-                            "update_threshold": config.opponent_update_threshold,
-                            "selected_opponent_generations": list(
-                                selected_opponent_generations
-                            ),
+                            "event": "active_pool_reload",
+                            "generation": snapshot_generation,
+                            "seconds": time.perf_counter() - pool_load_started,
+                            "active_snapshots_per_lineage": len(pool_generations[0]),
                         },
                     )
-                else:
-                    pools, probabilities, generation_ids, pool_generations = (
-                        _active_pools(
-                            archives,
-                            _extract_lineage(runners.train_state.params, 0),
-                            config,
-                        )
-                    )
-                pool_load_seconds = time.perf_counter() - pool_load_started
+            elif not is_final:
+                pool_load_started = time.perf_counter()
+                pools, probabilities, generation_ids, pool_generations = _active_pools(
+                    archives,
+                    _extract_lineage(runners.train_state.params, 0),
+                    config,
+                )
                 _write_json_line(
                     performance_path,
                     {
                         "event": "active_pool_reload",
-                        "generation": completed,
-                        "seconds": pool_load_seconds,
+                        "generation": config.generation_offset + completed,
+                        "seconds": time.perf_counter() - pool_load_started,
                         "active_snapshots_per_lineage": len(pool_generations[0]),
                     },
                 )
 
+        for record in metric_records.values():
+            record["run_elapsed_seconds"] = time.perf_counter() - run_started
+            _write_json_line(metrics_path, record)
+
         steps = chunk_size * steps_per_generation * config.num_lineages
         print(
-            f"Generations {completed - chunk_size + 1}-{completed}: "
+            f"Generations {config.generation_offset + completed - chunk_size + 1}-"
+            f"{config.generation_offset + completed}: "
             f"{steps:,} env steps in {elapsed:.2f}s "
             f"({steps / max(elapsed, 1e-9):,.0f} env-steps/s)"
         )
 
+    total_elapsed = time.perf_counter() - run_started
+    total_env_steps = (
+        config.num_generations
+        * steps_per_generation
+        * config.num_lineages
+    )
+    _write_json_line(
+        performance_path,
+        {
+            "event": "experiment_complete",
+            "generation_start": config.generation_offset + 1,
+            "generation_end": config.generation_offset + config.num_generations,
+            "elapsed_seconds": total_elapsed,
+            "env_steps": total_env_steps,
+            "agent_transitions": total_env_steps * transitions_per_step,
+            "env_steps_per_second": total_env_steps / max(total_elapsed, 1e-9),
+            "agent_transitions_per_second": (
+                total_env_steps * transitions_per_step / max(total_elapsed, 1e-9)
+            ),
+        },
+    )
     return experiment_dir

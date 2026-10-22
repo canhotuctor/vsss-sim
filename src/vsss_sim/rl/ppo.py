@@ -19,6 +19,7 @@ from flax.training.train_state import TrainState
 from ..envs.brandao_observation import mirror_x_axis_observation
 from ..envs.jumanji import State as EnvState
 from ..envs.jumanji import VSSJumanjiEnv
+from ..envs.match_referee import RefereeEvent
 
 _LOG_2PI = jnp.log(jnp.float32(2.0 * jnp.pi))
 
@@ -282,6 +283,7 @@ class _Transition(NamedTuple):
     completed_return: jax.Array
     completed_length: jax.Array
     goal: jax.Array
+    referee_event: jax.Array
     opponent_index: jax.Array
     opponent_mode: jax.Array
     opponent_category: jax.Array
@@ -885,6 +887,7 @@ class PPO:
                 completed_return=completed_return,
                 completed_length=completed_length,
                 goal=timestep.extras["goal"],
+                referee_event=timestep.extras["event"],
                 opponent_index=carry.opponent_indices,
                 opponent_mode=carry.opponent_modes,
                 opponent_category=carry.opponent_categories,
@@ -1107,6 +1110,8 @@ class PPO:
 
         episode_count = jnp.sum(trajectory.episode_end)
         safe_episode_count = jnp.maximum(episode_count, 1)
+        blue_goals_by_env = jnp.sum(trajectory.goal == 1, axis=0)
+        yellow_goals_by_env = jnp.sum(trajectory.goal == -1, axis=0)
         metrics.update(
             {
                 "mean_reward": jnp.mean(trajectory.reward),
@@ -1121,8 +1126,18 @@ class PPO:
                 ),
                 "mean_episode_length": jnp.sum(trajectory.completed_length)
                 / safe_episode_count,
-                "blue_goals": jnp.sum(trajectory.goal == 1),
-                "yellow_goals": jnp.sum(trajectory.goal == -1),
+                "blue_goals": jnp.sum(blue_goals_by_env),
+                "yellow_goals": jnp.sum(yellow_goals_by_env),
+                "blue_goals_by_env": blue_goals_by_env,
+                "yellow_goals_by_env": yellow_goals_by_env,
+                "mean_blue_goals_per_env": jnp.mean(blue_goals_by_env),
+                "mean_yellow_goals_per_env": jnp.mean(yellow_goals_by_env),
+                "mean_goal_delta_per_env": jnp.mean(
+                    blue_goals_by_env - yellow_goals_by_env
+                ),
+                "referee_event_counts": jnp.bincount(
+                    trajectory.referee_event.reshape(-1), length=len(RefereeEvent)
+                ),
                 "env_steps": runner.env_steps,
             }
         )

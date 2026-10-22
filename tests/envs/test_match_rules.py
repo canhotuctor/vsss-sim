@@ -127,6 +127,31 @@ def test_foul_near_midfield_is_not_attributed_to_remote_pair_during_goal_area_pl
     assert int(result.restart) == RestartType.NONE
 
 
+@pytest.mark.parametrize(
+    "ball, opponent_position, expected_event",
+    [
+        ((0.66, 0.0, 0.0, 0.0), (-0.2, 0.0), RefereeEvent.NONE),
+        ((0.0, 0.0, 0.0, 0.0), (0.66, 0.0), RefereeEvent.NONE),
+        ((0.66, 0.0, 0.0, 0.0), (0.66, 0.0), RefereeEvent.ATTACKER_GOAL_AREA),
+    ],
+)
+def test_two_attackers_in_opponent_area_require_contested_ball_in_that_area(
+    ball, opponent_position, expected_event
+):
+    simulation = _simulation(ball=ball)
+    robots = simulation.robots
+    robots = robots.at[config.TEAM_BLUE, 0, 0:2].set([0.66, 0.0])
+    robots = robots.at[config.TEAM_BLUE, 1, 0:2].set([0.69, 0.0])
+    robots = robots.at[config.TEAM_YELLOW, 0, 0:2].set(opponent_position)
+    simulation = simulation._replace(robots=robots)
+
+    result = MatchRules().step(_context(simulation, simulation))
+
+    assert int(result.event) == expected_event
+    if expected_event == RefereeEvent.ATTACKER_GOAL_AREA:
+        assert int(result.offending_team) == config.TEAM_BLUE
+
+
 def test_foul_is_detected_near_goal_area_ball_when_robots_are_outside_area():
     before = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
     robots_before = before.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.48, 0.0])
