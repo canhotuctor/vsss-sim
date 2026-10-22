@@ -264,7 +264,6 @@ class RunnerState(NamedTuple):
     episode_return: jax.Array
     episode_length: jax.Array
     env_steps: jax.Array
-    opponent_params: dict | None
     opponent_indices: jax.Array
     opponent_modes: jax.Array
     opponent_categories: jax.Array
@@ -630,7 +629,6 @@ class PPO:
             episode_return=zeros_float,
             episode_length=zeros_int,
             env_steps=jnp.zeros((), dtype=jnp.int32),
-            opponent_params=None,
             opponent_indices=jnp.zeros(self.config.num_envs, dtype=jnp.int32),
             opponent_modes=jnp.full(self.config.num_envs, 2, dtype=jnp.int32),
             opponent_categories=jnp.full(self.config.num_envs, 4, dtype=jnp.int32),
@@ -643,7 +641,7 @@ class PPO:
         opponent_pool: dict,
         category_probabilities: jax.Array,
         generation_ids: jax.Array,
-    ) -> tuple[dict, jax.Array, jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         pool_size = jax.tree_util.tree_leaves(opponent_pool)[0].shape[0]
         category_key, all_key, recent_key = jax.random.split(key, 3)
         category = jax.random.categorical(
@@ -660,9 +658,8 @@ class PPO:
             jnp.where(category == 1, recent_index, jnp.maximum(pool_size - 1, 0)),
         )
         mode = jnp.where(category < 3, 0, category - 2).astype(jnp.int32)
-        params = jax.tree_util.tree_map(lambda value: value[opponent_index], opponent_pool)
         generation = jnp.where(mode == 0, generation_ids[opponent_index], -1)
-        return params, opponent_index, mode, category, generation
+        return opponent_index, mode, category, generation
 
     def _initialize_self_play(
         self,
@@ -674,17 +671,38 @@ class PPO:
         runner = self._initialize(key)
         sample_key, next_key = jax.random.split(runner.key)
         sample_keys = jax.random.split(sample_key, self.config.num_envs)
-        params, indices, modes, categories, generations = jax.vmap(
+        indices, modes, categories, generations = jax.vmap(
             self._sample_opponent, in_axes=(0, None, None, None)
         )(sample_keys, opponent_pool, opponent_probabilities, opponent_generations)
         return runner._replace(
             key=next_key,
-            opponent_params=params,
             opponent_indices=indices,
             opponent_modes=modes,
             opponent_categories=categories,
             opponent_generations=generations,
         )
+
+    def _apply_opponent_policy(
+        self,
+        opponent_pool: dict,
+        opponent_indices: jax.Array,
+        observations: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Apply sampled opponents without storing a full parameter tree per env.
+
+        A single-policy pool is shared across the whole environment batch. For
+        larger pools, gather only the selected trees needed for this inference
+        call; the runner state retains indices rather than those gathered trees.
+        """
+        pool_size = jax.tree_util.tree_leaves(opponent_pool)[0].shape[0]
+        if pool_size == 1:
+            shared_params = jax.tree_util.tree_map(lambda value: value[0], opponent_pool)
+            return self.model.apply(shared_params, observations)
+
+        selected_params = jax.tree_util.tree_map(
+            lambda value: value[opponent_indices], opponent_pool
+        )
+        return jax.vmap(self.model.apply)(selected_params, observations)
 
     def _sample_policy(
         self, params: dict, observation: jax.Array, key: jax.Array
@@ -704,7 +722,6 @@ class PPO:
         state: EnvState,
         observation: jax.Array,
         key: jax.Array,
-        old_opponent_params: dict,
         old_opponent_index: jax.Array,
         old_opponent_mode: jax.Array,
         old_opponent_category: jax.Array,
@@ -712,19 +729,18 @@ class PPO:
         opponent_pool: dict,
         opponent_probabilities: jax.Array,
         opponent_generations: jax.Array,
-    ) -> tuple[EnvState, jax.Array, dict, jax.Array, jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[EnvState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
         def reset(args) -> tuple[
-            EnvState, jax.Array, dict, jax.Array, jax.Array, jax.Array, jax.Array
+            EnvState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
         ]:
             reset_key, sample_key = args
             reset_state, reset_timestep = self.env.reset(reset_key)
-            params, index, mode, category, generation = self._sample_opponent(
+            index, mode, category, generation = self._sample_opponent(
                 sample_key, opponent_pool, opponent_probabilities, opponent_generations
             )
             return (
                 reset_state,
                 reset_timestep.observation,
-                params,
                 index,
                 mode,
                 category,
@@ -732,12 +748,11 @@ class PPO:
             )
 
         def keep(_: None) -> tuple[
-            EnvState, jax.Array, dict, jax.Array, jax.Array, jax.Array, jax.Array
+            EnvState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
         ]:
             return (
                 state,
                 observation,
-                old_opponent_params,
                 old_opponent_index,
                 old_opponent_mode,
                 old_opponent_category,
@@ -774,8 +789,10 @@ class PPO:
                 stepped_state, timestep = self._batched_step(carry.env_state, action)
             else:
                 opponent_observation = self._batched_opponent_observation(carry.env_state)
-                first, second, _ = jax.vmap(self.model.apply)(
-                    carry.opponent_params, opponent_observation
+                first, second, _ = self._apply_opponent_policy(
+                    opponent_pool,
+                    carry.opponent_indices,
+                    opponent_observation,
                 )
                 if self.policy_architecture in ("brandao_shared", "brandao_sets"):
                     opponent_sample = jax.random.beta(opponent_key, first, second)
@@ -820,7 +837,6 @@ class PPO:
                 next_env_state, next_observation = jax.vmap(self._maybe_reset_legacy)(
                     episode_end, stepped_state, timestep.observation, reset_keys
                 )
-                next_opponent_params = None
                 next_opponent_indices = carry.opponent_indices
                 next_opponent_modes = carry.opponent_modes
                 next_opponent_categories = carry.opponent_categories
@@ -831,7 +847,6 @@ class PPO:
                     stepped_state,
                     timestep.observation,
                     reset_keys,
-                    carry.opponent_params,
                     carry.opponent_indices,
                     carry.opponent_modes,
                     carry.opponent_categories,
@@ -840,18 +855,16 @@ class PPO:
                 (
                     next_env_state,
                     next_observation,
-                    next_opponent_params,
                     next_opponent_indices,
                     next_opponent_modes,
                     next_opponent_categories,
                     next_opponent_generations,
                 ) = jax.vmap(
-                    lambda done, state, obs, key, params, index, mode, category, generation: self._maybe_reset(
+                    lambda done, state, obs, key, index, mode, category, generation: self._maybe_reset(
                         done,
                         state,
                         obs,
                         key,
-                        params,
                         index,
                         mode,
                         category,
@@ -869,7 +882,6 @@ class PPO:
                 episode_return=jnp.where(return_episode_end, 0.0, running_return),
                 episode_length=jnp.where(episode_end, 0, running_length),
                 env_steps=carry.env_steps + jnp.int32(self.config.num_envs),
-                opponent_params=next_opponent_params,
                 opponent_indices=next_opponent_indices,
                 opponent_modes=next_opponent_modes,
                 opponent_categories=next_opponent_categories,

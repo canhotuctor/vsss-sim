@@ -175,7 +175,7 @@ def test_ppo_update_runs_against_historical_policy_pool():
         )
     ]
     assert any(changed)
-    assert updated.opponent_params is not None
+    assert not hasattr(updated, "opponent_params")
     assert updated.opponent_indices.shape == (config.num_envs,)
     assert int(metrics["env_steps"]) == config.batch_size
     assert metrics["blue_goals_by_env"].shape == (config.num_envs,)
@@ -185,6 +185,46 @@ def test_ppo_update_runs_against_historical_policy_pool():
         config.rollout_length * config.num_envs
     )
     assert all(np.isfinite(np.asarray(value)).all() for value in metrics.values())
+
+
+def test_single_opponent_pool_keeps_policy_shared_across_environments():
+    config = PPOConfig(
+        num_envs=3,
+        rollout_length=1,
+        update_epochs=1,
+        num_minibatches=1,
+        hidden_sizes=(8,),
+    )
+    trainer = PPO(
+        VSSJumanjiEnv(
+            max_episode_steps=2,
+            reward_profile="brandao_reward",
+            policy_architecture="brandao_shared",
+        ),
+        config,
+    )
+    initial = trainer.initialize(jax.random.PRNGKey(44))
+    params = initial.train_state.params
+    pool = jax.tree_util.tree_map(lambda value: value[None, ...], params)
+    probabilities = jnp.asarray([0.0, 0.0, 1.0, 0.0, 0.0], dtype=jnp.float32)
+
+    runner = trainer.initialize(jax.random.PRNGKey(45), pool, probabilities)
+
+    assert not hasattr(runner, "opponent_params")
+    np.testing.assert_array_equal(runner.opponent_indices, np.zeros(3, dtype=np.int32))
+    shared_outputs = trainer._apply_opponent_policy(
+        pool, runner.opponent_indices, runner.observation
+    )
+    per_env_params = jax.tree_util.tree_map(
+        lambda value: value[runner.opponent_indices], pool
+    )
+    per_env_outputs = jax.vmap(trainer.model.apply)(
+        per_env_params, runner.observation
+    )
+    for shared_output, per_env_output in zip(
+        shared_outputs, per_env_outputs, strict=True
+    ):
+        np.testing.assert_allclose(shared_output, per_env_output, rtol=1e-6, atol=1e-6)
 
 
 def test_brandao_opponent_update_uses_mean_goal_delta_not_win_rate():
