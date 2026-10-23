@@ -21,6 +21,7 @@ from vsss_sim.envs.brandao_observation import (
     flatten_history,
     initialize_history,
 )
+from vsss_sim.envs.match_referee import MatchPhase
 from vsss_sim.rl.ppo import create_policy_model
 
 
@@ -215,6 +216,9 @@ def main() -> None:
                 while policy_steps < policy_episode_steps and not done:
                     robot_observation = flatten_history(history, config.TEAM_BLUE)
                     blue_action = action_for(robot_observation)
+                    # VSSEnv zeroes every command on a STOPPED step; record what
+                    # was applied, as VSSJumanjiEnv does during training.
+                    stopped = int(np.asarray(env._referee_state.phase)) == MatchPhase.STOPPED
                     observation, reward, terminated, truncated, info = env.step(
                         blue_action.reshape(-1)
                     )
@@ -227,7 +231,7 @@ def main() -> None:
                     score_yellow = int(info["score_yellow"])
                     done = bool(goal or terminated or truncated)
                     previous_actions = previous_actions.at[config.TEAM_BLUE].set(
-                        blue_action
+                        np.zeros_like(blue_action) if stopped else blue_action
                     )
                     policy_steps += 1
                     if not done and policy_steps < policy_episode_steps:
