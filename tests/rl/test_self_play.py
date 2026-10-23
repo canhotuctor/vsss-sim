@@ -11,15 +11,18 @@ pytest.importorskip("jumanji")
 pytest.importorskip("flax")
 
 from vsss_sim.envs.jumanji import VSSJumanjiEnv  # noqa: E402
+from vsss_sim.envs.match_referee import RefereeEvent  # noqa: E402
 from vsss_sim.perspective import switch_team_perspective  # noqa: E402
 from vsss_sim.rl import PPO, PPOConfig  # noqa: E402
 from vsss_sim.rl.evaluate import evaluate_experiment  # noqa: E402
-from vsss_sim.rl.ppo import ActorCritic  # noqa: E402
+from vsss_sim.rl.ppo import ActorCritic, create_policy_model  # noqa: E402
 from vsss_sim.rl.self_play import (  # noqa: E402
     ExperimentConfig,
     OpponentSamplingWeights,
     SnapshotArchive,
     _make_env,
+    _opponent_evaluation_summary,
+    _require_gpu_backend,
     run_experiment,
 )
 
@@ -173,10 +176,255 @@ def test_ppo_update_runs_against_historical_policy_pool():
         )
     ]
     assert any(changed)
-    assert updated.opponent_params is not None
+    assert not hasattr(updated, "opponent_params")
     assert updated.opponent_indices.shape == (config.num_envs,)
     assert int(metrics["env_steps"]) == config.batch_size
+    assert metrics["blue_goals_by_env"].shape == (config.num_envs,)
+    assert metrics["yellow_goals_by_env"].shape == (config.num_envs,)
+    assert metrics["referee_event_counts"].shape == (len(RefereeEvent),)
+    assert int(metrics["referee_event_counts"].sum()) == (
+        config.rollout_length * config.num_envs
+    )
     assert all(np.isfinite(np.asarray(value)).all() for value in metrics.values())
+
+
+def test_single_opponent_pool_keeps_policy_shared_across_environments():
+    config = PPOConfig(
+        num_envs=3,
+        rollout_length=1,
+        update_epochs=1,
+        num_minibatches=1,
+        hidden_sizes=(8,),
+    )
+    trainer = PPO(
+        VSSJumanjiEnv(
+            max_episode_steps=2,
+            reward_profile="brandao_reward",
+            policy_architecture="brandao_shared",
+        ),
+        config,
+    )
+    initial = trainer.initialize(jax.random.PRNGKey(44))
+    params = initial.train_state.params
+    pool = jax.tree_util.tree_map(lambda value: value[None, ...], params)
+    probabilities = jnp.asarray([0.0, 0.0, 1.0, 0.0, 0.0], dtype=jnp.float32)
+
+    runner = trainer.initialize(jax.random.PRNGKey(45), pool, probabilities)
+
+    assert not hasattr(runner, "opponent_params")
+    np.testing.assert_array_equal(runner.opponent_indices, np.zeros(3, dtype=np.int32))
+    shared_outputs = trainer._apply_opponent_policy(
+        pool, runner.opponent_indices, runner.observation
+    )
+    per_env_params = jax.tree_util.tree_map(
+        lambda value: value[runner.opponent_indices], pool
+    )
+    per_env_outputs = jax.vmap(trainer.model.apply)(
+        per_env_params, runner.observation
+    )
+    for shared_output, per_env_output in zip(
+        shared_outputs, per_env_outputs, strict=True
+    ):
+        np.testing.assert_allclose(shared_output, per_env_output, rtol=1e-6, atol=1e-6)
+
+
+def test_brandao_opponent_update_uses_mean_goal_delta_not_win_rate():
+    scores = np.asarray([[1, 0], [1, 0], [0, 1]], dtype=np.int32)
+
+    summary = _opponent_evaluation_summary(scores, threshold=0.6)
+
+    assert summary["evaluation_sample_count"] == 3
+    assert summary["mean_goals_for"] == pytest.approx(2 / 3)
+    assert summary["mean_goals_against"] == pytest.approx(1 / 3)
+    assert summary["mean_goal_delta"] == pytest.approx(1 / 3)
+    assert summary["opponent_replaced"] is False
+
+    at_threshold = _opponent_evaluation_summary(
+        np.asarray([[1, 0], [1, 0], [1, 0], [1, 0], [0, 1]], dtype=np.int32),
+        threshold=0.6,
+    )
+    assert at_threshold["mean_goal_delta"] == pytest.approx(0.6)
+    assert at_threshold["opponent_replaced"] is True
+
+
+def test_gpu_required_experiment_rejects_unavailable_gpu(monkeypatch):
+    def unavailable_gpu(_backend):
+        raise RuntimeError("no GPU backend")
+
+    monkeypatch.setattr(jax, "devices", unavailable_gpu)
+
+    with pytest.raises(RuntimeError, match="refusing CPU fallback"):
+        _require_gpu_backend()
+
+
+def test_tiny_brandao_run_logs_candidate_opponent_evaluation_and_env_metrics(tmp_path):
+    config = ExperimentConfig(
+        experiment_name="brandao-evaluation",
+        num_generations=1,
+        num_lineages=1,
+        num_envs_per_lineage=1,
+        rollout_length=2,
+        update_epochs=1,
+        num_minibatches=1,
+        seed=11,
+        snapshot_interval=1,
+        max_episode_steps=2,
+        init_mode="random",
+        reward_profile="brandao_reward",
+        policy_architecture="brandao_shared",
+        evaluation_matches=2,
+        output_root=str(tmp_path),
+    )
+
+    experiment_dir = run_experiment(config)
+    row = json.loads((experiment_dir / "metrics.jsonl").read_text().splitlines()[0])
+
+    assert row["generation"] == 1
+    assert len(row["blue_goals_by_env"]) == 1
+    assert len(row["yellow_goals_by_env"]) == 1
+    assert row["mean_goal_delta_per_env"] == pytest.approx(
+        row["blue_goals_by_env"][0] - row["yellow_goals_by_env"][0]
+    )
+    assert row["referee_event_counts"]["none"] + sum(
+        count
+        for event, count in row["referee_event_counts"].items()
+        if event != "none"
+    ) == 2
+    assert row["opponent_evaluated"] is True
+    assert row["opponent_generation"] == 0
+    assert row["opponent_evaluation_sample_count"] == 2
+    assert row["opponent_evaluation_mean_goal_delta"] == pytest.approx(
+        row["opponent_evaluation_mean_goals_for"]
+        - row["opponent_evaluation_mean_goals_against"]
+    )
+
+
+def test_brandao_run_warm_starts_policy_and_opponent_at_generation_offset(
+    tmp_path, monkeypatch
+):
+    hidden_sizes = (300, 200, 100)
+    model = create_policy_model("brandao_shared", hidden_sizes)
+    source_policy = model.init(
+        jax.random.PRNGKey(17), jnp.zeros((424,), dtype=jnp.float32)
+    )
+    source_opponent = jax.tree_util.tree_map(lambda value: value + 0.001, source_policy)
+    source_archive = SnapshotArchive(tmp_path, "source", lineage=0)
+    for params, generation in ((source_opponent, 200), (source_policy, 1000)):
+        source_archive.save(
+            params,
+            generation,
+            seed=17,
+            hidden_sizes=hidden_sizes,
+            observation_size=424,
+            action_size=2,
+            policy_architecture="brandao_shared",
+        )
+
+    config = ExperimentConfig(
+        experiment_name="warm-started",
+        num_generations=1,
+        num_lineages=1,
+        num_envs_per_lineage=1,
+        rollout_length=2,
+        update_epochs=1,
+        num_minibatches=1,
+        seed=19,
+        snapshot_interval=1,
+        generation_offset=1000,
+        initial_policy_snapshot=str(
+            source_archive.directory / "generation_00001000.msgpack"
+        ),
+        initial_opponent_snapshot=str(
+            source_archive.directory / "generation_00000200.msgpack"
+        ),
+        max_episode_steps=2,
+        init_mode="random",
+        reward_profile="brandao_reward",
+        policy_architecture="brandao_shared",
+        evaluation_matches=1,
+        output_root=str(tmp_path),
+    )
+
+    training_start_params = {}
+    original_train_lineages = PPO.train_lineages
+
+    def capture_training_start(trainer, runners, *args, **kwargs):
+        training_start_params["params"] = jax.tree_util.tree_map(
+            lambda value: np.asarray(value[0]), runners.train_state.params
+        )
+        return original_train_lineages(trainer, runners, *args, **kwargs)
+
+    monkeypatch.setattr(PPO, "train_lineages", capture_training_start)
+
+    experiment_dir = run_experiment(config)
+    archive = SnapshotArchive(tmp_path, "warm-started", lineage=0)
+    snapshots = archive.list_snapshots()
+    row = json.loads((experiment_dir / "metrics.jsonl").read_text().splitlines()[0])
+    warm_start = json.loads((experiment_dir / "warm_start.json").read_text())
+
+    assert [item["generation"] for item in snapshots] == [200, 1000, 1001]
+    assert row["generation"] == 1001
+    assert row["opponent_generation"] == 200
+    assert row["opponent_replaced"] is False
+    assert row["selected_opponent_generation"] == 200
+    for expected, actual in zip(
+        jax.tree_util.tree_leaves(source_policy),
+        jax.tree_util.tree_leaves(training_start_params["params"]),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    assert row["opponent_evaluated"] is True
+    assert warm_start["generation_offset"] == 1000
+    assert warm_start["optimizer_state_restored"] is False
+    loaded_initial = archive.load(
+        source_policy,
+        1000,
+        expected_hidden_sizes=hidden_sizes,
+        expected_policy_architecture="brandao_shared",
+    )
+    for expected, actual in zip(
+        jax.tree_util.tree_leaves(source_policy),
+        jax.tree_util.tree_leaves(loaded_initial),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_initial_opponent_generation_must_not_collide_with_future_snapshots(tmp_path):
+    hidden_sizes = (300, 200, 100)
+    model = create_policy_model("brandao_shared", hidden_sizes)
+    opponent = model.init(jax.random.PRNGKey(23), jnp.zeros((424,), dtype=jnp.float32))
+    source_archive = SnapshotArchive(tmp_path, "source", lineage=0)
+    source_archive.save(
+        opponent,
+        2,
+        seed=23,
+        hidden_sizes=hidden_sizes,
+        observation_size=424,
+        action_size=2,
+        policy_architecture="brandao_shared",
+    )
+    config = ExperimentConfig(
+        experiment_name="colliding-opponent",
+        num_generations=4,
+        num_lineages=1,
+        num_envs_per_lineage=1,
+        rollout_length=2,
+        update_epochs=1,
+        num_minibatches=1,
+        snapshot_interval=2,
+        initial_opponent_snapshot=str(
+            source_archive.directory / "generation_00000002.msgpack"
+        ),
+        max_episode_steps=2,
+        policy_architecture="brandao_shared",
+        evaluation_matches=1,
+        output_root=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="collides with a snapshot"):
+        run_experiment(config)
+    assert not SnapshotArchive(tmp_path, "colliding-opponent", lineage=0).list_snapshots()
 
 
 def test_tiny_experiment_keeps_lineage_archives_separate(tmp_path):

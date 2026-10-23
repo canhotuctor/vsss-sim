@@ -6,6 +6,7 @@ the device boundary, so a trainer can ``jit``/``vmap`` the complete rollout.
 """
 from __future__ import annotations
 
+import math
 from functools import cached_property
 from typing import NamedTuple
 
@@ -31,17 +32,24 @@ from .brandao_observation import (
 from .brandao_observation import (
     OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE,
 )
-from .match_rules import MatchRules, MatchStepInput, build_observation
+from .match_rules import (
+    MatchPhase,
+    MatchRules,
+    MatchStepInput,
+    RefereeState,
+    build_observation,
+    initial_referee_state,
+)
 
 _OBS_DIM = 4 + config.N_TEAMS * config.N_ROBOTS * 7
 _ACTION_DIM = config.N_ROBOTS * 2
-_BRANDAO_CONTROL_DT = 0.1
 
 
 class State(NamedTuple):
     """Complete JAX environment state; safe to pass through ``jit`` and ``vmap``."""
 
     simulation: physics.SimState
+    referee_state: RefereeState
     key: chex.PRNGKey
     step_count: jax.Array
     previous_actions: jax.Array
@@ -65,6 +73,8 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         terminate_on_goal: bool | None = None,
         reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
         policy_architecture: str = "joint",
+        control_rate_hz: float | None = None,
+        physics_substeps: int | None = None,
     ) -> None:
         if opponent_policy not in ("stationary", "random"):
             raise ValueError(
@@ -88,6 +98,31 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             "brandao_shared",
             "brandao_sets",
         )
+        if control_rate_hz is None:
+            control_rate_hz = 10.0 if self.individual_agent_rewards else config.FPS
+        if isinstance(control_rate_hz, bool):
+            raise ValueError("control_rate_hz must be a positive finite number")
+        try:
+            control_rate_hz = float(control_rate_hz)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "control_rate_hz must be a positive finite number"
+            ) from error
+        if not math.isfinite(control_rate_hz) or control_rate_hz <= 0.0:
+            raise ValueError("control_rate_hz must be a positive finite number")
+        if physics_substeps is None:
+            physics_substeps = 6 if self.individual_agent_rewards else config.SUB_STEPS
+        if (
+            isinstance(physics_substeps, bool)
+            or not isinstance(physics_substeps, (int, float))
+            or not math.isfinite(float(physics_substeps))
+            or int(physics_substeps) != physics_substeps
+            or physics_substeps < 1
+        ):
+            raise ValueError("physics_substeps must be a positive integer")
+        self.control_rate_hz = float(control_rate_hz)
+        self.control_dt = 1.0 / self.control_rate_hz
+        self.physics_substeps = int(physics_substeps)
         self.reward_profile = RewardProfile(reward_profile)
         if (
             self.individual_agent_rewards
@@ -174,6 +209,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             observation = self._match_rules.observation(simulation)
         state = State(
             simulation=simulation,
+            referee_state=initial_referee_state(),
             key=state_key,
             step_count=jnp.zeros((), dtype=jnp.int32),
             previous_actions=previous_actions,
@@ -219,22 +255,22 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             )
 
         actions = jnp.stack([blue, yellow], axis=0)
+        actions = jnp.where(
+            state.referee_state.phase == MatchPhase.STOPPED,
+            jnp.zeros_like(actions),
+            actions,
+        )
         previous_actions = actions
         step_count = state.step_count + jnp.int32(1)
-        if self.individual_agent_rewards:
-            # Brandão makes one policy decision per 0.1 s. Advance the physics
-            # integrator by that exact interval instead of approximating 10 Hz
-            # by alternating the simulator's default 15 Hz frames. Six
-            # substeps preserve the default integrator's 1/60 s substep size.
-            simulation_after_physics, physics_info = physics.step(
-                state.simulation, actions, dt=_BRANDAO_CONTROL_DT, sub_steps=6
-            )
-            goal = physics_info["goal"]
-        else:
-            simulation_after_physics, physics_info = physics.step(
-                state.simulation, actions
-            )
-            goal = physics_info["goal"]
+        # Keep the control interval and physics integration cadence explicit
+        # so archived experiments can replay their exact simulator timing.
+        simulation_after_physics, physics_info = physics.step(
+            state.simulation,
+            actions,
+            dt=self.control_dt,
+            sub_steps=self.physics_substeps,
+        )
+        goal = physics_info["goal"]
         match_step = self._match_rules.step(
             MatchStepInput(
                 simulation_before=state.simulation,
@@ -242,6 +278,8 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
                 goal=goal,
                 step_count=step_count,
                 kickoff_key=kickoff_key,
+                referee_state=state.referee_state,
+                dt=jnp.float32(self.control_dt),
             )
         )
         simulation = match_step.simulation
@@ -268,6 +306,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             observation = match_step.observation
         next_state = State(
             simulation=simulation,
+            referee_state=match_step.referee_state,
             key=next_key,
             step_count=step_count,
             previous_actions=previous_actions,
@@ -278,6 +317,12 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             "score_blue": simulation.score[config.TEAM_BLUE],
             "score_yellow": simulation.score[config.TEAM_YELLOW],
             "sim_time": simulation.t,
+            "event": match_step.event,
+            "offending_team": match_step.offending_team,
+            "restart": match_step.restart,
+            "restart_team": match_step.restart_team,
+            "quadrant": match_step.quadrant,
+            "match_phase": match_step.referee_state.phase,
         }
         if self.terminate_on_goal:
             timestep = jax.lax.cond(

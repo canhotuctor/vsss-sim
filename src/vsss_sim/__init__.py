@@ -12,6 +12,13 @@ Quick start
 
 from __future__ import annotations
 
+import os
+
+# JAX otherwise selects an accelerator automatically when one is available.
+# Keep simulator runs on CPU by default; callers can explicitly opt into a
+# backend (for example, ``JAX_PLATFORMS=cuda``) before importing vsss_sim.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import gymnasium as gym
 
 from . import config  # noqa: F401 – expose constants at package level

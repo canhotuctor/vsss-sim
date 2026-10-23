@@ -36,3 +36,6 @@ mlflow.db
 
 mlruns/
 runs/
+
+# Cursor
+.cursor/
