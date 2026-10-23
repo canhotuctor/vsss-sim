@@ -578,17 +578,19 @@ def _make_candidate_evaluator(env: VSSJumanjiEnv, model, policy_architecture: st
 
 def _require_gpu_backend() -> None:
     """Fail before creating outputs if JAX cannot execute on a GPU."""
+    message = (
+        "this experiment requires a visible JAX GPU; refusing CPU fallback. "
+        "vsss_sim defaults JAX_PLATFORMS to 'cpu' (currently "
+        f"{os.environ.get('JAX_PLATFORMS', '<unset>')!r}); "
+        "export JAX_PLATFORMS=cuda before starting Python to train on a GPU"
+    )
     try:
         gpu_devices = jax.devices("gpu")
         default_backend = jax.default_backend()
     except RuntimeError as error:
-        raise RuntimeError(
-            "this experiment requires a visible JAX GPU; refusing CPU fallback"
-        ) from error
+        raise RuntimeError(message) from error
     if not gpu_devices or default_backend != "gpu":
-        raise RuntimeError(
-            "this experiment requires a visible JAX GPU; refusing CPU fallback"
-        )
+        raise RuntimeError(message)
 
 
 def _load_external_snapshot(
