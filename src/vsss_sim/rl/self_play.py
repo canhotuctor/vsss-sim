@@ -476,6 +476,19 @@ def _brandao_opponent_pools(
     )
 
 
+def _snapshot_generations(config: ExperimentConfig) -> set[int]:
+    """Return the generation IDs ``run_experiment`` saves after training starts."""
+    generations = set(
+        range(
+            config.generation_offset + config.snapshot_interval,
+            config.generation_offset + config.num_generations + 1,
+            config.snapshot_interval,
+        )
+    )
+    generations.add(config.generation_offset + config.num_generations)
+    return generations
+
+
 def _lineage_seeds(seed: int, count: int) -> jax.Array:
     root_key = jax.random.PRNGKey(seed)
     return jax.vmap(lambda lineage: jax.random.fold_in(root_key, lineage))(
@@ -676,6 +689,12 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
         if initial_opponent_generation == config.generation_offset:
             raise ValueError(
                 "initial opponent and initial policy must use distinct generation IDs"
+            )
+        if initial_opponent_generation in _snapshot_generations(config):
+            raise ValueError(
+                f"initial opponent generation {initial_opponent_generation} collides "
+                "with a snapshot this run will save; use an opponent generation outside "
+                "the run's snapshot schedule"
             )
 
     if initial_policy is not None:

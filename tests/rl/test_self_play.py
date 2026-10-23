@@ -390,6 +390,43 @@ def test_brandao_run_warm_starts_policy_and_opponent_at_generation_offset(
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+def test_initial_opponent_generation_must_not_collide_with_future_snapshots(tmp_path):
+    hidden_sizes = (300, 200, 100)
+    model = create_policy_model("brandao_shared", hidden_sizes)
+    opponent = model.init(jax.random.PRNGKey(23), jnp.zeros((424,), dtype=jnp.float32))
+    source_archive = SnapshotArchive(tmp_path, "source", lineage=0)
+    source_archive.save(
+        opponent,
+        2,
+        seed=23,
+        hidden_sizes=hidden_sizes,
+        observation_size=424,
+        action_size=2,
+        policy_architecture="brandao_shared",
+    )
+    config = ExperimentConfig(
+        experiment_name="colliding-opponent",
+        num_generations=4,
+        num_lineages=1,
+        num_envs_per_lineage=1,
+        rollout_length=2,
+        update_epochs=1,
+        num_minibatches=1,
+        snapshot_interval=2,
+        initial_opponent_snapshot=str(
+            source_archive.directory / "generation_00000002.msgpack"
+        ),
+        max_episode_steps=2,
+        policy_architecture="brandao_shared",
+        evaluation_matches=1,
+        output_root=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="collides with a snapshot"):
+        run_experiment(config)
+    assert not SnapshotArchive(tmp_path, "colliding-opponent", lineage=0).list_snapshots()
+
+
 def test_tiny_experiment_keeps_lineage_archives_separate(tmp_path):
     config = ExperimentConfig(
         experiment_name="tiny",
