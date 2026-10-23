@@ -11,6 +11,7 @@ pytest.importorskip("jumanji")
 pytest.importorskip("flax")
 
 from vsss_sim.envs.jumanji import VSSJumanjiEnv  # noqa: E402
+from vsss_sim.envs.match_referee import RefereeEvent  # noqa: E402
 from vsss_sim.perspective import switch_team_perspective  # noqa: E402
 from vsss_sim.rl import PPO, PPOConfig  # noqa: E402
 from vsss_sim.rl.evaluate import evaluate_experiment  # noqa: E402
@@ -180,7 +181,7 @@ def test_ppo_update_runs_against_historical_policy_pool():
     assert int(metrics["env_steps"]) == config.batch_size
     assert metrics["blue_goals_by_env"].shape == (config.num_envs,)
     assert metrics["yellow_goals_by_env"].shape == (config.num_envs,)
-    assert metrics["referee_event_counts"].shape == (9,)
+    assert metrics["referee_event_counts"].shape == (len(RefereeEvent),)
     assert int(metrics["referee_event_counts"].sum()) == (
         config.rollout_length * config.num_envs
     )

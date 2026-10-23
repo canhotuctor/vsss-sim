@@ -264,6 +264,61 @@ def test_defender_goal_area_violation_is_immediate_during_active_ball_contest():
     assert not bool(result.referee_state.defender_area_violation_pending[config.TEAM_BLUE])
 
 
+@pytest.mark.parametrize("reward_profile", list(RewardProfile))
+def test_uncontested_stopped_ball_in_goal_area_awards_penalty_against_area_team(
+    reward_profile: RewardProfile,
+):
+    simulation = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
+    context = _context(simulation, simulation)._replace(
+        referee_state=initial_referee_state()._replace(
+            goal_area_stopped_seconds=jnp.float32(4.99)
+        ),
+        dt=jnp.float32(0.02),
+    )
+
+    result = MatchRules(reward_profile=reward_profile).step(context)
+
+    assert int(result.event) == RefereeEvent.GOAL_AREA_STOPPED_BALL
+    assert int(result.offending_team) == config.TEAM_BLUE
+    assert int(result.restart) == RestartType.PENALTY_KICK
+    assert int(result.restart_team) == config.TEAM_YELLOW
+    assert float(result.reward) == pytest.approx(-1.0)
+    assert float(result.referee_state.goal_area_stopped_seconds) == 0.0
+
+
+@pytest.mark.parametrize(
+    "ball,robots",
+    [
+        # Rolling ball: not at rest.
+        ((-0.66, 0.0, 0.05, 0.0), []),
+        # Contested ball: the goal-area impasse rule applies instead.
+        ((-0.66, 0.0, 0.0, 0.0), [(config.TEAM_YELLOW, 0, -0.63, 0.0), (config.TEAM_BLUE, 0, -0.69, 0.0)]),
+        # Ball at rest outside the goal areas: the free-ball rule applies instead.
+        ((0.0, 0.0, 0.0, 0.0), []),
+    ],
+)
+def test_goal_area_stopped_ball_timer_only_runs_for_uncontested_ball_at_rest(
+    ball: tuple[float, float, float, float],
+    robots: list[tuple[int, int, float, float]],
+):
+    simulation = _simulation(ball=ball)
+    for team, robot, x, y in robots:
+        simulation = simulation._replace(
+            robots=simulation.robots.at[team, robot, 0:2].set([x, y])
+        )
+    context = _context(simulation, simulation)._replace(
+        referee_state=initial_referee_state()._replace(
+            goal_area_stopped_seconds=jnp.float32(4.99)
+        ),
+        dt=jnp.float32(0.02),
+    )
+
+    result = MatchRules().step(context)
+
+    assert int(result.event) != RefereeEvent.GOAL_AREA_STOPPED_BALL
+    assert float(result.referee_state.goal_area_stopped_seconds) == 0.0
+
+
 @pytest.mark.parametrize(
     "attacker_moves, expected_event",
     [(False, RefereeEvent.NONE), (True, RefereeEvent.GOALKEEPER_BLOCK)],

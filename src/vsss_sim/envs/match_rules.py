@@ -259,6 +259,7 @@ class MatchRules:
                 | (event == RefereeEvent.GOALKEEPER_TIMEOUT)
                 | (event == RefereeEvent.PERSONAL_FOUL)
                 | (event == RefereeEvent.GOALKEEPER_BLOCK)
+                | (event == RefereeEvent.GOAL_AREA_STOPPED_BALL)
             )
             foul_reward = jnp.where(offending_team == config.TEAM_BLUE, -1.0, 1.0).astype(
                 jnp.float32

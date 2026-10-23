@@ -39,6 +39,7 @@ class RefereeEvent(IntEnum):
     FIELD_IMPASSE = 6
     PERSONAL_FOUL = 7
     GOALKEEPER_BLOCK = 8
+    GOAL_AREA_STOPPED_BALL = 9
 
 
 class RestartType(IntEnum):
@@ -64,6 +65,7 @@ class RefereeState(NamedTuple):
     goalkeeper_hold_seconds: jax.Array
     goal_area_impasse_seconds: jax.Array
     field_impasse_seconds: jax.Array
+    goal_area_stopped_seconds: jax.Array
     defender_area_violation_pending: jax.Array
     phase: jax.Array
 
@@ -84,6 +86,7 @@ def initial_referee_state() -> RefereeState:
         goalkeeper_hold_seconds=jnp.zeros((config.N_TEAMS,), dtype=jnp.float32),
         goal_area_impasse_seconds=jnp.zeros((), dtype=jnp.float32),
         field_impasse_seconds=jnp.zeros((), dtype=jnp.float32),
+        goal_area_stopped_seconds=jnp.zeros((), dtype=jnp.float32),
         defender_area_violation_pending=jnp.zeros((config.N_TEAMS,), dtype=jnp.bool_),
         phase=jnp.asarray(MatchPhase.PLAYING, dtype=jnp.int32),
     )
@@ -343,8 +346,18 @@ def _resolve_referee(
         previous.field_impasse_seconds + dt,
         jnp.zeros_like(previous.field_impasse_seconds),
     )
+    # A ball left at rest in a goal area without a contest is the defending
+    # team's fault: its goalkeeper had the free-ball timeout to clear it.
+    goal_area_stopped_seconds = jnp.where(
+        ball_in_goal_area & field_ball_is_stopped & ~goal_area_contest,
+        previous.goal_area_stopped_seconds + dt,
+        jnp.zeros_like(previous.goal_area_stopped_seconds),
+    )
     goal_area_impasse = (goal_area_impasse_seconds >= _RULE_TIMEOUT_SECONDS) & ball_in_goal_area
     field_impasse = (field_impasse_seconds >= _FREE_BALL_TIMEOUT_SECONDS) & ~ball_in_goal_area
+    goal_area_stopped_ball = (
+        goal_area_stopped_seconds >= _FREE_BALL_TIMEOUT_SECONDS
+    ) & ball_in_goal_area
 
     # Approximate personal fouls only for a closing opponent pair in a goal-
     # area play. This avoids turning harmless distant collisions into whistles.
@@ -378,9 +391,13 @@ def _resolve_referee(
                                 goal_area_impasse,
                                 jnp.int32(RefereeEvent.GOAL_AREA_IMPASSE),
                                 jnp.where(
-                                    field_impasse,
-                                    jnp.int32(RefereeEvent.FIELD_IMPASSE),
-                                    jnp.int32(RefereeEvent.NONE),
+                                    goal_area_stopped_ball,
+                                    jnp.int32(RefereeEvent.GOAL_AREA_STOPPED_BALL),
+                                    jnp.where(
+                                        field_impasse,
+                                        jnp.int32(RefereeEvent.FIELD_IMPASSE),
+                                        jnp.int32(RefereeEvent.NONE),
+                                    ),
                                 ),
                             ),
                         ),
@@ -405,7 +422,11 @@ def _resolve_referee(
                     jnp.where(
                         event == RefereeEvent.PERSONAL_FOUL,
                         personal_foul_team,
-                        jnp.int32(-1),
+                        jnp.where(
+                            event == RefereeEvent.GOAL_AREA_STOPPED_BALL,
+                            ball_side,
+                            jnp.int32(-1),
+                        ),
                     ),
                 ),
             ),
@@ -442,7 +463,9 @@ def _resolve_referee(
         event == RefereeEvent.GOAL,
         jnp.int32(RestartType.KICKOFF),
         jnp.where(
-            (event == RefereeEvent.DEFENDER_GOAL_AREA) | (event == RefereeEvent.GOALKEEPER_TIMEOUT),
+            (event == RefereeEvent.DEFENDER_GOAL_AREA)
+            | (event == RefereeEvent.GOALKEEPER_TIMEOUT)
+            | (event == RefereeEvent.GOAL_AREA_STOPPED_BALL),
             jnp.int32(RestartType.PENALTY_KICK),
             jnp.where(
                 (event == RefereeEvent.ATTACKER_GOAL_AREA)
@@ -483,6 +506,11 @@ def _resolve_referee(
             goal_event | whistle,
             jnp.zeros_like(field_impasse_seconds),
             field_impasse_seconds,
+        ),
+        goal_area_stopped_seconds=jnp.where(
+            goal_event | whistle,
+            jnp.zeros_like(goal_area_stopped_seconds),
+            goal_area_stopped_seconds,
         ),
         defender_area_violation_pending=jnp.where(
             goal_event | whistle,
