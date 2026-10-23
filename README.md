@@ -53,4 +53,6 @@ reported separately.
 - [Reward profiles](docs/brandao-reward-profile.md): current reward equations
   and how they are assigned.
 - [CUDA setup](docs/cuda-setup.md): install and verify JAX GPU support.
+- [Performance and memory report](docs/performance-memory-report.md): where
+  brandao_shared training memory and time go, and ranked improvements.
 - [Glossary](docs/glossary.md): reinforcement-learning terms used here.
