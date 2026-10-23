@@ -19,6 +19,7 @@ from vsss_sim.envs.match_rules import (
     build_observation,
     initial_referee_state,
 )
+from vsss_sim.envs.match_restarts import _restart_positions
 from vsss_sim.physics import jax_backend as physics
 
 
@@ -317,6 +318,45 @@ def test_goal_area_stopped_ball_timer_only_runs_for_uncontested_ball_at_rest(
 
     assert int(result.event) != RefereeEvent.GOAL_AREA_STOPPED_BALL
     assert float(result.referee_state.goal_area_stopped_seconds) == 0.0
+
+
+@pytest.mark.parametrize("restart_team", [config.TEAM_BLUE, config.TEAM_YELLOW])
+def test_free_kick_formation_keeps_players_off_the_ball_and_each_other(restart_team: int):
+    half_length = config.FIELD_LENGTH / 2.0 - config.ROBOT_RADIUS
+    half_width = config.FIELD_WIDTH / 2.0 - config.ROBOT_RADIUS
+    xs, ys = np.meshgrid(
+        np.linspace(-half_length, half_length, 21), np.linspace(-half_width, half_width, 19)
+    )
+    balls = np.stack((xs.ravel(), ys.ravel()), axis=-1)
+    # Keep ball spots the ball itself can reach past the corner chamfers.
+    corner = config.FIELD_LENGTH / 2.0 + config.FIELD_WIDTH / 2.0 - config.FIELD_CHAMFER
+    balls = balls[np.abs(balls).sum(axis=-1) <= corner - 2.0 * config.BALL_RADIUS]
+
+    def place_and_step(ball_xy):
+        simulation = physics.empty_state()._replace(
+            ball=jnp.concatenate((ball_xy, jnp.zeros(2))).astype(jnp.float32)
+        )
+        restarted = _restart_positions(
+            simulation,
+            jnp.int32(RestartType.FREE_KICK),
+            jnp.int32(restart_team),
+            jnp.int32(-1),
+        )
+        stepped, _ = physics.step(restarted, jnp.zeros((2, 3, 2)), dt=0.1, sub_steps=6)
+        return restarted, stepped
+
+    restarted, stepped = jax.jit(jax.vmap(place_and_step))(jnp.asarray(balls, jnp.float32))
+    positions = np.asarray(restarted.robots[..., 0:2]).reshape(len(balls), 6, 2)
+    ball = np.asarray(restarted.ball[:, 0:2])
+    np.testing.assert_allclose(ball, balls, atol=1e-6)
+
+    ball_distance = np.linalg.norm(positions - ball[:, None, :], axis=-1)
+    assert ball_distance.min() >= 0.10 - 1e-5
+    pair_distance = np.linalg.norm(positions[:, :, None] - positions[:, None, :], axis=-1)
+    pair_distance += np.eye(6)[None] * 10.0
+    assert pair_distance.min() >= config.ROBOT_SIZE * 2.0**0.5
+    # Players start clear of the ball and walls, so a frozen step leaves it in place.
+    np.testing.assert_allclose(np.asarray(stepped.ball[:, 0:2]), ball, atol=1e-6)
 
 
 @pytest.mark.parametrize(
