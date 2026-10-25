@@ -133,7 +133,7 @@ class TestStep:
         e.reset(seed=0)
         balls = e._state.ball.at[0].set(
             jnp.asarray(
-                [config.FIELD_LENGTH / 2.0 + 0.02, 0.0, 0.05, 0.0],
+                [config.FIELD_LENGTH / 2.0 + 0.03, 0.0, 0.05, 0.0],
                 dtype=jnp.float32,
             )
         )

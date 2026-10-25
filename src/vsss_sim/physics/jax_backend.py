@@ -63,47 +63,29 @@ def _diff_drive(
 # Initialisation
 # ---------------------------------------------------------------------------
 
-_BLUE_STARTS = jnp.array(
-    [[-0.55, 0.0], [-0.30, 0.30], [-0.30, -0.30]], dtype=jnp.float32
-)
-_YELLOW_STARTS = jnp.array(
-    [[0.55, 0.0], [0.30, -0.30], [0.30, 0.30]], dtype=jnp.float32
-)
+def reset_kickoff(key: jnp.ndarray, possession_team=None) -> SimState:
+    """Legal kickoff: a random coin toss initially, explicit possession after goals.
 
-
-def reset_kickoff(key: jnp.ndarray) -> SimState:
-    """Place robots and ball for a standard kickoff (functional)."""
-    half_l = jnp.float32(config.FIELD_LENGTH / 2.0 - config.ROBOT_RADIUS)
-    clear = jnp.float32(config.KICKOFF_CLEAR_DIST)
-
-    key_b, key_y = jax.random.split(key)
-    blue_jitter = jax.random.uniform(key_b, (3, 2), minval=-0.05, maxval=0.05)
-    yellow_jitter = jax.random.uniform(key_y, (3, 2), minval=-0.05, maxval=0.05)
-
-    blue = _BLUE_STARTS + blue_jitter
-    blue = blue.at[:, 0].set(jnp.clip(blue[:, 0], -half_l, -clear))
-    blue = blue.at[:, 1].set(jnp.clip(blue[:, 1], -half_l, half_l))
-
-    yellow = _YELLOW_STARTS + yellow_jitter
-    yellow = yellow.at[:, 0].set(jnp.clip(yellow[:, 0], clear, half_l))
-    yellow = yellow.at[:, 1].set(jnp.clip(yellow[:, 1], -half_l, half_l))
-
+    Only the possessing team places a kicker inside the centre circle. Robot
+    footprints of the defending team stay outside it, including placement jitter.
+    """
+    if possession_team is None:
+        possession_team = jax.random.randint(jax.random.fold_in(key, 2), (), 0, config.N_TEAMS)
+    key_a, key_d = jax.random.split(key)
+    attacking = jnp.asarray([[-0.65, 0.0], [-0.12, 0.0], [-0.35, 0.35]])
+    defending = jnp.asarray([[-0.65, 0.0], [-0.30, -0.30], [-0.30, 0.30]])
+    attacking += jax.random.uniform(key_a, (3, 2), minval=-0.02, maxval=0.02)
+    defending += jax.random.uniform(key_d, (3, 2), minval=-0.02, maxval=0.02)
+    direction = jnp.where(possession_team == config.TEAM_BLUE, 1.0, -1.0)
     robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 6), dtype=jnp.float32)
-    robots = robots.at[config.TEAM_BLUE, :, 0:2].set(blue)
-    robots = robots.at[config.TEAM_YELLOW, :, 0:2].set(yellow)
-
-    # Face toward the ball at origin.
+    robots = robots.at[possession_team, :, :2].set(direction * attacking)
+    robots = robots.at[1 - possession_team, :, :2].set(-direction * defending)
     theta = jnp.arctan2(-robots[:, :, 1], -robots[:, :, 0])
     robots = robots.at[:, :, 2].set(theta)
-
     return SimState(
-        ball=jnp.zeros(4, dtype=jnp.float32),
-        robots=robots,
-        score=jnp.zeros(2, dtype=jnp.int32),
-        t=jnp.zeros((), dtype=jnp.float32),
-        wheel_speeds=jnp.zeros(
-            (config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32
-        ),
+        ball=jnp.zeros(4, dtype=jnp.float32), robots=robots,
+        score=jnp.zeros(2, dtype=jnp.int32), t=jnp.zeros((), dtype=jnp.float32),
+        wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
     )
 
 
@@ -321,29 +303,21 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     bvy = jnp.where(hit_bot, jnp.abs(bvy) * e_wall, bvy)
     bvy = jnp.where(hit_top, -jnp.abs(bvy) * e_wall, bvy)
 
-    # --- x walls / goals (use post-y-clamp by for goal-y check) ---
-    in_goal_y = jnp.abs(by) <= half_goal
-    hit_left = bx - r < -half_l
-    hit_right = bx + r > half_l
-
-    left_goal = hit_left & in_goal_y    # yellow scores (-1)
-    right_goal = hit_right & in_goal_y  # blue scores (+1)
-
-    # Left side: clamp to back-of-net if goal, else to wall.
-    bx = jnp.where(
-        left_goal,
-        -half_l - goal_depth + r,
-        jnp.where(hit_left, -half_l + r, bx),
-    )
-    bvx = jnp.where(hit_left, jnp.abs(bvx) * e_wall, bvx)
-
-    # Right side: same treatment.
-    bx = jnp.where(
-        right_goal,
-        half_l + goal_depth - r,
-        jnp.where(hit_right, half_l - r, bx),
-    )
-    bvx = jnp.where(hit_right, -jnp.abs(bvx) * e_wall, bvx)
+    # The mouth is open while a ball is straddling the goal line. Do not
+    # bounce it off that line before its trailing edge can cross (Rule 8.1).
+    in_goal_y = jnp.abs(by) + r <= half_goal + 1e-7
+    hit_left = (bx - r < -half_l) & ~in_goal_y
+    hit_right = (bx + r > half_l) & ~in_goal_y
+    left_goal = (bx + r < -half_l) & in_goal_y
+    right_goal = (bx - r > half_l) & in_goal_y
+    left_back = bx - r < -half_l - goal_depth
+    right_back = bx + r > half_l + goal_depth
+    bx = jnp.where(hit_left, -half_l + r, bx)
+    bx = jnp.where(hit_right, half_l - r, bx)
+    bx = jnp.where(left_back & in_goal_y, -half_l - goal_depth + r, bx)
+    bx = jnp.where(right_back & in_goal_y, half_l + goal_depth - r, bx)
+    bvx = jnp.where(hit_left | (left_back & in_goal_y), jnp.abs(bvx) * e_wall, bvx)
+    bvx = jnp.where(hit_right | (right_back & in_goal_y), -jnp.abs(bvx) * e_wall, bvx)
 
     goal = jnp.where(
         right_goal,
@@ -725,7 +699,12 @@ def step(
 
     def body(_, carry):
         state, goal_acc = carry
-        state, g = _substep(state, target_speeds, sub_dt, max_delta)
+        state, g = jax.lax.cond(
+            goal_acc == 0,
+            lambda current: _substep(current, target_speeds, sub_dt, max_delta),
+            lambda current: (current, jnp.int32(0)),
+            state,
+        )
         goal_acc = jnp.where(goal_acc == 0, g, goal_acc)
         return state, goal_acc
 

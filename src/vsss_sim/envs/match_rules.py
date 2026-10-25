@@ -34,7 +34,7 @@ class MatchStepInput(NamedTuple):
     """Facts needed to resolve one completed control step.
 
     Pass ``referee_state`` from the previous result to retain referee timers,
-    pending goal-area violations, and restart phase. ``dt`` is the control
+    attack membership, free-ball recurrence, and restart phase. ``dt`` is the control
     interval used by those timers. Omitting either supports one-off transitions.
     """
 
@@ -284,10 +284,8 @@ class MatchRules:
         if self.kickoff_on_goal:
 
             def kickoff(simulation: physics.SimState) -> physics.SimState:
-                if self.init_mode is InitMode.RANDOM:
-                    fresh = physics.reset_random(context.kickoff_key)
-                else:
-                    fresh = physics.reset_kickoff(context.kickoff_key)
+                # Curriculum reset placement is independent of legal kickoffs.
+                fresh = physics.reset_kickoff(context.kickoff_key, decision.restart_team)
                 return fresh._replace(score=simulation.score, t=simulation.t)
 
             simulation = jax.lax.cond(
@@ -302,7 +300,8 @@ class MatchRules:
         whistle = ~resuming & (restart != RestartType.NONE) & (event != RefereeEvent.GOAL)
         simulation = jax.lax.cond(
             whistle,
-            lambda state: _restart_positions(state, restart, restart_team, quadrant),
+            lambda state: _restart_positions(state, restart, restart_team, quadrant,
+                                              decision.state.free_ball_count),
             lambda state: state,
             simulation,
         )

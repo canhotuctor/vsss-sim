@@ -48,6 +48,13 @@ GOAL_DEPTH: float = 0.10     # 10 cm deep behind end-line
 # Goal area
 GOAL_AREA_LENGTH_X: float = 0.15   # 15 cm
 GOAL_AREA_LENGTH_Y: float = 0.70    # 70 cm
+# Rulebook Fig. 1: the front edge has a 20 cm wide, 5 cm deep arc.
+GOAL_AREA_ARC_DEPTH: float = 0.05
+GOAL_AREA_ARC_HALF_WIDTH: float = 0.10
+# Circular segment determined by its half-chord and sagitta.
+GOAL_AREA_ARC_RADIUS: float = (
+    GOAL_AREA_ARC_HALF_WIDTH**2 + GOAL_AREA_ARC_DEPTH**2
+) / (2.0 * GOAL_AREA_ARC_DEPTH)
 
 # Corner chamfers (cut at 45° with this leg length on each edge)
 FIELD_CHAMFER: float = 0.07  # 7 cm

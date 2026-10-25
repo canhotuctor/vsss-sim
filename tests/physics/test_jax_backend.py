@@ -137,7 +137,7 @@ class TestBallWallCollisions:
     def test_blue_scores_right_goal(self):
         s = jb.empty_state()
         s = s._replace(ball=jnp.array(
-            [config.FIELD_LENGTH / 2.0 + 0.01, 0.0, 0.1, 0.0],
+            [config.FIELD_LENGTH / 2.0 + 0.03, 0.0, 0.1, 0.0],
             dtype=jnp.float32,
         ))
         _, goal = jb._ball_wall_collisions(s)
@@ -146,7 +146,7 @@ class TestBallWallCollisions:
     def test_yellow_scores_left_goal(self):
         s = jb.empty_state()
         s = s._replace(ball=jnp.array(
-            [-(config.FIELD_LENGTH / 2.0 + 0.01), 0.0, -0.1, 0.0],
+            [-(config.FIELD_LENGTH / 2.0 + 0.03), 0.0, -0.1, 0.0],
             dtype=jnp.float32,
         ))
         _, goal = jb._ball_wall_collisions(s)
@@ -251,7 +251,7 @@ class TestStep:
     def test_goal_registered(self):
         s = self._make_state()
         s = s._replace(ball=jnp.array(
-            [config.FIELD_LENGTH / 2.0 + 0.01, 0.0, 0.1, 0.0],
+            [config.FIELD_LENGTH / 2.0 + 0.03, 0.0, 0.1, 0.0],
             dtype=jnp.float32,
         ))
         _, info = jb.step(s, self._zero_actions())

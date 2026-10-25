@@ -211,6 +211,16 @@ class VSSRenderer:
                     surf, config.COLOR_FIELD_LINES,
                     self._to_px(*wx), self._to_px(*wy),
                 )
+            radius = config.GOAL_AREA_ARC_RADIUS
+            extent = math.asin(config.GOAL_AREA_ARC_HALF_WIDTH / radius)
+            arc = [
+                self._to_px(
+                    inner_x + sign * (config.GOAL_AREA_ARC_DEPTH - radius + radius * math.cos(angle)),
+                    radius * math.sin(angle),
+                )
+                for angle in np.linspace(-extent, extent, 33)
+            ]
+            pygame.draw.aalines(surf, config.COLOR_FIELD_LINES, False, arc)
 
     def _draw_robot(
         self,

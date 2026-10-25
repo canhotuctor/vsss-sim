@@ -11,20 +11,19 @@ import jax.numpy as jnp
 from .. import config, physics
 from .match_geometry import (
     _PLAY_INVOLVEMENT_DISTANCE,
-    _ROBOT_CONTACT_DISTANCE,
     _ball_between,
     _ball_goal_area_membership,
     _goal_area_membership,
-    _players_near_each_other,
+    _robot_ball_contacts,
     _robot_ball_distance,
+    _robot_contacts,
 )
 
 _BALL_STUCK_SPEED = 0.01
 _FREE_BALL_STOPPED_SPEED = 0.001  # m/s (1 mm/s)
 _FREE_BALL_TIMEOUT_SECONDS = 5.0
-# Rule 15 and the 3v3 reference setups place each designated player 20 cm away.
-_GOALKEEPER_HOLD_SPEED = 0.05
-_RULE_TIMEOUT_SECONDS = 10.0
+_RULE_TIMEOUT_SECONDS = 5.0
+_BALL_MOVEMENT_TOLERANCE = 0.001
 
 
 class RefereeEvent(IntEnum):
@@ -66,7 +65,12 @@ class RefereeState(NamedTuple):
     goal_area_impasse_seconds: jax.Array
     field_impasse_seconds: jax.Array
     goal_area_stopped_seconds: jax.Array
-    defender_area_violation_pending: jax.Array
+    attack_primary: jax.Array
+    defender_pushed_in: jax.Array
+    field_impasse_quadrant: jax.Array
+    free_ball_count: jax.Array
+    free_ball_quadrant: jax.Array
+    free_ball_origin: jax.Array
     phase: jax.Array
 
 
@@ -87,73 +91,65 @@ def initial_referee_state() -> RefereeState:
         goal_area_impasse_seconds=jnp.zeros((), dtype=jnp.float32),
         field_impasse_seconds=jnp.zeros((), dtype=jnp.float32),
         goal_area_stopped_seconds=jnp.zeros((), dtype=jnp.float32),
-        defender_area_violation_pending=jnp.zeros((config.N_TEAMS,), dtype=jnp.bool_),
+        attack_primary=jnp.full((config.N_TEAMS,), -1, dtype=jnp.int32),
+        defender_pushed_in=jnp.zeros((config.N_TEAMS, config.N_ROBOTS), dtype=jnp.bool_),
+        field_impasse_quadrant=jnp.int32(-1),
+        free_ball_count=jnp.int32(0),
+        free_ball_quadrant=jnp.int32(-1),
+        free_ball_origin=jnp.zeros((2,), dtype=jnp.float32),
         phase=jnp.asarray(MatchPhase.PLAYING, dtype=jnp.int32),
     )
 
 
-def _illegal_push(
-    simulation_before: physics.SimState,
-    simulation_after: physics.SimState,
-    areas: jax.Array,
-    ball_areas: jax.Array,
-):
-    """Find a local close pair and identify which robot initiated contact."""
-    before = simulation_before.robots
-    after = simulation_after.robots
-    ball = simulation_after.ball
-    ball_in_goal_area = jnp.any(ball_areas)
-    near_ball = _robot_ball_distance(after, ball) <= jnp.float32(_PLAY_INVOLVEMENT_DISTANCE)
-    robot_in_area = jnp.any(areas, axis=-1)
-    hits_by_team = []
-    for offender in range(config.N_TEAMS):
-        victim = 1 - offender
-        before_delta = before[victim, None, :, 0:2] - before[offender, :, None, 0:2]
-        after_delta = after[victim, None, :, 0:2] - after[offender, :, None, 0:2]
-        before_distance = jnp.linalg.norm(before_delta, axis=-1)
-        after_distance = jnp.linalg.norm(after_delta, axis=-1)
-        contact = after_distance <= jnp.float32(_ROBOT_CONTACT_DISTANCE)
-        closing = before_distance > after_distance + 1e-4
-        direction = before_delta / jnp.maximum(before_distance[..., None], 1e-8)
-        offender_motion = after[offender, :, None, 0:2] - before[offender, :, None, 0:2]
-        victim_motion = after[victim, None, :, 0:2] - before[victim, None, :, 0:2]
-        offender_advance = jnp.sum(offender_motion * direction, axis=-1)
-        victim_advance = -jnp.sum(victim_motion * direction, axis=-1)
-        initiated_contact = offender_advance > victim_advance + 1e-4
-        first_robots = jnp.broadcast_to(
-            after[offender, :, None, :],
-            (config.N_ROBOTS, config.N_ROBOTS, after.shape[-1]),
+def _initiated_contacts(simulation_before, simulation_after, contacts):
+    """Observed closing contact initiated by one team, including legal pushes.
+
+    A 2D engine cannot infer intent or toppling. Require actual footprint
+    contact and greater advance by the initiator, never proximity alone.
+    """
+    before, after = simulation_before.robots, simulation_after.robots
+    contacts_before = _robot_contacts(before)
+    hits = []
+    for team in range(config.N_TEAMS):
+        delta = before[1 - team, None, :, :2] - before[team, :, None, :2]
+        distance = jnp.linalg.norm(delta, axis=-1)
+        direction = delta / jnp.maximum(distance[..., None], 1e-8)
+        motion = after[team, :, None, :2] - before[team, :, None, :2]
+        other_motion = after[1 - team, None, :, :2] - before[1 - team, None, :, :2]
+        advance = jnp.sum(motion * direction, axis=-1)
+        other_advance = -jnp.sum(other_motion * direction, axis=-1)
+        after_distance = jnp.linalg.norm(
+            after[1 - team, None, :, :2] - after[team, :, None, :2], axis=-1
         )
-        second_robots = jnp.broadcast_to(
-            after[victim, None, :, :],
-            (config.N_ROBOTS, config.N_ROBOTS, after.shape[-1]),
+        closing = (distance > after_distance + 1e-4) | contacts_before[team, :, 1 - team, :]
+        hits.append(
+            contacts[team, :, 1 - team, :]
+            & closing
+            & (advance > 1e-4)
+            & (advance > other_advance + 1e-4)
         )
-        ball_between = _ball_between(
-            first_robots,
-            second_robots,
-            ball,
+    return jnp.stack(hits)
+
+
+def _illegal_push(simulation_before, simulation_after, initiated=None):
+    """Approximate disruptive personal contact anywhere on the field (9.1)."""
+    if initiated is None:
+        contacts = _robot_contacts(simulation_after.robots)
+        initiated = _initiated_contacts(simulation_before, simulation_after, contacts)
+    legal_ball_push = []
+    for team in range(config.N_TEAMS):
+        legal_ball_push.append(
+            _ball_between(
+                simulation_after.robots[team, :, None, :],
+                simulation_after.robots[1 - team, None, :, :],
+                simulation_after.ball,
+            )
         )
-        involved_area = robot_in_area[offender, :, None] | robot_in_area[victim, None, :]
-        near_ball_pair = near_ball[offender, :, None] | near_ball[victim, None, :]
-        goal_play = involved_area | (ball_in_goal_area & near_ball_pair)
-        hits_by_team.append(contact & closing & initiated_contact & ~ball_between & goal_play)
-    return jnp.stack(hits_by_team)
+    return initiated & ~jnp.stack(legal_ball_push)
 
 
 def _free_ball_quadrant(ball: jax.Array) -> jax.Array:
     return (ball[0] >= 0.0).astype(jnp.int32) + 2 * (ball[1] >= 0.0).astype(jnp.int32)
-
-
-def _second_robot_participates(
-    area_members: jax.Array,
-    area_seconds: jax.Array,
-    participates: jax.Array,
-) -> jax.Array:
-    """Require an involved player beyond the longest-standing area occupant."""
-    longest_stay = jnp.max(jnp.where(area_members, area_seconds, -1.0))
-    longest_count = jnp.sum(area_members & (area_seconds == longest_stay))
-    second = area_members & ((area_seconds < longest_stay) | (longest_count > 1)) & participates
-    return jnp.any(second)
 
 
 def _resolve_referee(
@@ -174,73 +170,74 @@ def _resolve_referee(
     )
     ball_areas = _ball_goal_area_membership(simulation.ball)
     ball_in_goal_area = jnp.any(ball_areas)
-    nearby_players = _players_near_each_other(simulation.robots)
-    near_ball = _robot_ball_distance(simulation.robots, simulation.ball) <= jnp.float32(
-        _PLAY_INVOLVEMENT_DISTANCE
+    contacts = _robot_contacts(simulation.robots)
+    ball_contacts = _robot_ball_contacts(simulation.robots, simulation.ball)
+    near_ball = (
+        _robot_ball_distance(simulation.robots, simulation.ball) <= _PLAY_INVOLVEMENT_DISTANCE
     )
-    involved = near_ball | jnp.any(nearby_players, axis=(-2, -1))
+    ball_areas_before = _ball_goal_area_membership(simulation_before.ball)
+    near_ball_before = (
+        _robot_ball_distance(simulation_before.robots, simulation_before.ball)
+        <= _PLAY_INVOLVEMENT_DISTANCE
+    )
+    initiated = _initiated_contacts(simulation_before, simulation, contacts)
 
     pushed_in = []
     for team in range(config.N_TEAMS):
-        opponent = 1 - team
-        near_opponent = jnp.any(nearby_players[team, :, opponent, :], axis=-1)
-        opponent_near_ball = jnp.any(near_ball[opponent])
+        forced_entry = (
+            areas_after[team, :, team]
+            & ~areas_before[team, :, team]
+            & near_ball_before[team]
+            & jnp.any(initiated[1 - team].T & near_ball_before[1 - team][None, :], axis=-1)
+        )
         pushed_in.append(
-            areas_after[team]
-            & ~areas_before[team]
-            & near_opponent[:, None]
-            & near_ball[team, :, None]
-            & opponent_near_ball
+            areas_after[team, :, team] & (previous.defender_pushed_in[team] | forced_entry)
         )
     pushed_in = jnp.stack(pushed_in)
-    participation = involved[..., None] & ~pushed_in
 
-    attacking_violations = []
-    defending_violations = []
-    pending_defender_violations = []
-    for team in range(config.N_TEAMS):
-        attacking_area = areas_after[team, :, 1 - team]
-        attacking_ball_dispute = (
-            ball_areas[1 - team]
-            & jnp.any(near_ball[team])
-            & jnp.any(near_ball[1 - team])
+    attacking_violations, defending_violations, primary_attackers = [], [], []
+    robot_ids = jnp.arange(config.N_ROBOTS)
+    for defending_team in range(config.N_TEAMS):
+        attacker = 1 - defending_team
+        attacking_area = areas_after[attacker, :, defending_team]
+        active_attackers = attacking_area & near_ball[attacker]
+        attack = ball_areas[defending_team] & jnp.any(active_attackers)
+        old_primary = previous.attack_primary[defending_team]
+        safe_primary = jnp.maximum(old_primary, 0)
+        keep_primary = (
+            ball_areas_before[defending_team] & (old_primary >= 0) & attacking_area[safe_primary]
         )
+        first_active = jnp.argmax(
+            jnp.where(active_attackers, area_seconds[attacker, :, defending_team], -1.0)
+        )
+        primary = jnp.where(keep_primary, old_primary, jnp.where(attack, first_active, -1)).astype(
+            jnp.int32
+        )
+        primary_attackers.append(jnp.where(ball_areas[defending_team], primary, -1))
+        active_players = areas_after[:, :, defending_team] & near_ball
+        touches_play = jnp.any(contacts[attacker] & active_players[None, :, :], axis=(1, 2))
+        second_attacker = attacking_area & (robot_ids != primary)
         attacking_violations.append(
-            attacking_ball_dispute
-            & (jnp.sum(attacking_area) >= 2)
-            & _second_robot_participates(
-                attacking_area,
-                area_seconds[team, :, 1 - team],
-                participation[team, :, 1 - team],
-            )
+            attack & jnp.any(second_attacker & (ball_contacts[attacker] | touches_play))
         )
 
-        defending_area = areas_after[team, :, team]
-        second_defender_participates = (jnp.sum(defending_area) >= 2) & _second_robot_participates(
-            defending_area,
-            area_seconds[team, :, team],
-            participation[team, :, team],
+        defending_area = areas_after[defending_team, :, defending_team]
+        goalkeeper = jnp.argmax(
+            jnp.where(defending_area, area_seconds[defending_team, :, defending_team], -1.0)
         )
-        active_ball_dispute = jnp.any(defending_area & near_ball[team]) & jnp.any(
-            near_ball[1 - team]
+        second_defender = defending_area & (robot_ids != goalkeeper) & ~pushed_in[defending_team]
+        touches_attacker = jnp.any(
+            contacts[defending_team, :, attacker, :] & active_attackers[None, :], axis=-1
         )
-        violation_in_area = ball_areas[team] & second_defender_participates
-        immediate_violation = violation_in_area & active_ball_dispute
-        deferred_violation = previous.defender_area_violation_pending[team] & ~ball_areas[team]
-        defending_violations.append(immediate_violation | deferred_violation)
-        pending_defender_violations.append(
-            ball_areas[team]
-            & (
-                previous.defender_area_violation_pending[team]
-                | (violation_in_area & ~active_ball_dispute)
-            )
+        defending_violations.append(
+            attack & jnp.any(second_defender & (ball_contacts[defending_team] | touches_attacker))
         )
     attacking_violations = jnp.stack(attacking_violations)
     defending_violations = jnp.stack(defending_violations)
-    pending_defender_violations = jnp.stack(pending_defender_violations)
+    primary_attackers = jnp.stack(primary_attackers)
     has_attacking_violation = jnp.any(attacking_violations)
     has_defending_violation = jnp.any(defending_violations)
-    attacking_team = jnp.argmax(attacking_violations.astype(jnp.int32))
+    attacking_team = 1 - jnp.argmax(attacking_violations.astype(jnp.int32))
     defending_team = jnp.argmax(defending_violations.astype(jnp.int32))
 
     # The goalkeeper is the longest-standing robot in its own goal area.
@@ -255,49 +252,22 @@ def _resolve_referee(
         has_goalkeeper = jnp.any(own_area)
         goalkeeper = simulation.robots[team, goalkeeper_index]
         opponents = simulation.robots[1 - team]
-        opponents_before = simulation_before.robots[1 - team]
-        goalkeeper_before = simulation_before.robots[team, goalkeeper_index]
-        before_to_keeper = goalkeeper_before[None, 0:2] - opponents_before[:, 0:2]
-        before_distance = jnp.linalg.norm(before_to_keeper, axis=-1)
-        opponent_to_keeper = jnp.linalg.norm(opponents[:, 0:2] - goalkeeper[None, 0:2], axis=-1)
-        opponent_near_keeper = jnp.any(opponent_to_keeper <= _PLAY_INVOLVEMENT_DISTANCE)
         opponent_near_ball = jnp.any(near_ball[1 - team])
-        keeper_ball_distance = jnp.linalg.norm(goalkeeper[0:2] - simulation.ball[0:2])
-        keeper_touches_ball = keeper_ball_distance <= (
-            config.ROBOT_RADIUS + config.BALL_RADIUS + 0.01
-        )
-        ball_speed = jnp.linalg.norm(simulation.ball[2:4])
-        attacker_contests = opponent_near_keeper | opponent_near_ball
+        keeper_touches_ball = ball_contacts[team, goalkeeper_index]
+        # Possession must end with the ball outside the area. Dribbling or
+        # briefly losing contact inside it does not restart the five seconds.
         holds_ball = (
             ball_areas[team]
             & has_goalkeeper
-            & keeper_touches_ball
-            & (ball_speed <= _GOALKEEPER_HOLD_SPEED)
-            & ~attacker_contests
+            & ~opponent_near_ball
+            & (keeper_touches_ball | (previous.goalkeeper_hold_seconds[team] > 0))
         )
-
-        # Rule 14: an attacker blocking the goalkeeper without a ball contest
-        # causes a goal kick. The 50-percent area test applies to both robots.
         attacker_in_area = areas_after[1 - team, :, team]
-        attacker_near_keeper = opponent_to_keeper <= _ROBOT_CONTACT_DISTANCE
-        before_direction = before_to_keeper / jnp.maximum(before_distance[:, None], 1e-8)
-        attacker_motion = opponents[:, 0:2] - opponents_before[:, 0:2]
-        keeper_motion = goalkeeper[0:2] - goalkeeper_before[0:2]
-        attacker_advance = jnp.sum(attacker_motion * before_direction, axis=-1)
-        keeper_advance = -jnp.sum(keeper_motion[None, :] * before_direction, axis=-1)
-        attacker_closing = (before_distance > opponent_to_keeper + 1e-4) & (
-            attacker_advance > keeper_advance + 1e-4
-        )
-        no_ball_contest = (keeper_ball_distance > _PLAY_INVOLVEMENT_DISTANCE) & (
-            jnp.linalg.norm(opponents[:, 0:2] - simulation.ball[None, 0:2], axis=-1)
-            > _PLAY_INVOLVEMENT_DISTANCE
-        )
         blocks = (
             attacker_in_area
-            & attacker_near_keeper
-            & attacker_closing
-            & no_ball_contest
             & has_goalkeeper
+            & initiated[1 - team, :, goalkeeper_index]
+            & ~_ball_between(opponents, goalkeeper, simulation.ball)
         )
         goalkeeper_indices.append(goalkeeper_index)
         goalkeeper_present.append(has_goalkeeper)
@@ -313,19 +283,17 @@ def _resolve_referee(
         previous.goalkeeper_hold_seconds + dt,
         jnp.zeros_like(previous.goalkeeper_hold_seconds),
     )
-    goalkeeper_timeouts = hold_seconds >= _RULE_TIMEOUT_SECONDS
+    goalkeeper_timeouts = hold_seconds >= _RULE_TIMEOUT_SECONDS - 1e-6
     has_goalkeeper_timeout = jnp.any(goalkeeper_timeouts)
     timeout_team = jnp.argmax(goalkeeper_timeouts.astype(jnp.int32))
 
     ball_side = jnp.argmax(ball_areas.astype(jnp.int32))
     goalkeeper_index = goalkeeper_indices[ball_side]
-    goalkeeper = simulation.robots[ball_side, goalkeeper_index]
-    goalkeeper_distance = jnp.linalg.norm(goalkeeper[0:2] - simulation.ball[0:2])
     attacker_near_impasse_ball = jnp.any(near_ball[1 - ball_side])
     goal_area_contest = (
         ball_in_goal_area
         & goalkeeper_present[ball_side]
-        & (goalkeeper_distance <= config.ROBOT_RADIUS + config.BALL_RADIUS + 0.01)
+        & ball_contacts[ball_side, goalkeeper_index]
         & attacker_near_impasse_ball
     )
     ball_speed = jnp.linalg.norm(simulation.ball[2:4])
@@ -353,15 +321,18 @@ def _resolve_referee(
         previous.goal_area_stopped_seconds + dt,
         jnp.zeros_like(previous.goal_area_stopped_seconds),
     )
-    goal_area_impasse = (goal_area_impasse_seconds >= _RULE_TIMEOUT_SECONDS) & ball_in_goal_area
-    field_impasse = (field_impasse_seconds >= _FREE_BALL_TIMEOUT_SECONDS) & ~ball_in_goal_area
+    goal_area_impasse = (
+        goal_area_impasse_seconds >= _RULE_TIMEOUT_SECONDS - 1e-6
+    ) & ball_in_goal_area
+    field_impasse = (
+        field_impasse_seconds >= _FREE_BALL_TIMEOUT_SECONDS - 1e-6
+    ) & ~ball_in_goal_area
     goal_area_stopped_ball = (
-        goal_area_stopped_seconds >= _FREE_BALL_TIMEOUT_SECONDS
+        goal_area_stopped_seconds >= _FREE_BALL_TIMEOUT_SECONDS - 1e-6
     ) & ball_in_goal_area
 
-    # Approximate personal fouls only for a closing opponent pair in a goal-
-    # area play. This avoids turning harmless distant collisions into whistles.
-    push_hits = _illegal_push(simulation_before, simulation, areas_after, ball_areas)
+    # Only physical, initiated contact qualifies; proximity is not a foul.
+    push_hits = _illegal_push(simulation_before, simulation, initiated)
     push_by_team = jnp.any(push_hits, axis=(1, 2))
     has_personal_foul = jnp.any(push_by_team)
     personal_foul_team = jnp.argmax(push_by_team.astype(jnp.int32))
@@ -432,19 +403,7 @@ def _resolve_referee(
             ),
         ),
     ).astype(jnp.int32)
-    personal_offender_in_own_area = (
-        jnp.any(areas_after[offending_team, :, offending_team]) & ball_areas[offending_team]
-    )
-    personal_offender_in_attack_area = jnp.any(areas_after[offending_team, :, 1 - offending_team])
-    personal_restart = jnp.where(
-        personal_offender_in_own_area,
-        jnp.int32(RestartType.PENALTY_KICK),
-        jnp.where(
-            personal_offender_in_attack_area,
-            jnp.int32(RestartType.GOAL_KICK),
-            jnp.int32(RestartType.FREE_KICK),
-        ),
-    )
+    personal_restart = jnp.int32(RestartType.FREE_KICK)
     conceding_team = jnp.where(goal == 1, config.TEAM_YELLOW, config.TEAM_BLUE).astype(jnp.int32)
     restart_team = jnp.where(
         event == RefereeEvent.GOAL,
@@ -484,11 +443,31 @@ def _resolve_referee(
             ),
         ),
     ).astype(jnp.int32)
+    restart_team = jnp.where(restart == RestartType.NONE, -1, restart_team).astype(jnp.int32)
+    moved_since_free_ball = (
+        jnp.linalg.norm(simulation.ball[:2] - previous.free_ball_origin) > _BALL_MOVEMENT_TOLERANCE
+    ) | (ball_speed >= _FREE_BALL_STOPPED_SPEED)
+    previous_count = jnp.where(moved_since_free_ball, 0, previous.free_ball_count)
+    stopped_quadrant = jnp.where(
+        previous.field_impasse_seconds > 0,
+        previous.field_impasse_quadrant,
+        _free_ball_quadrant(simulation.ball),
+    )
     quadrant = jnp.where(
         event == RefereeEvent.FIELD_IMPASSE,
-        _free_ball_quadrant(simulation.ball),
-        jnp.int32(-1),
+        jnp.where(previous_count > 0, previous.free_ball_quadrant, stopped_quadrant),
+        -1,
     ).astype(jnp.int32)
+    free_ball_count = jnp.where(
+        event == RefereeEvent.FIELD_IMPASSE, jnp.minimum(previous_count + 1, 3), previous_count
+    ).astype(jnp.int32)
+    free_ball_mark = jnp.asarray(
+        [
+            jnp.where((quadrant & 1) != 0, config.FREE_BALL_MARK_X, -config.FREE_BALL_MARK_X),
+            jnp.where((quadrant & 2) != 0, config.FREE_BALL_MARK_Y, -config.FREE_BALL_MARK_Y),
+        ]
+    )
+    free_ball_origin = jnp.where(free_ball_count >= 2, jnp.zeros(2), free_ball_mark)
     whistle = (restart != RestartType.NONE) & (event != RefereeEvent.GOAL)
     next_state = RefereeState(
         goal_area_seconds=jnp.where(
@@ -512,10 +491,17 @@ def _resolve_referee(
             jnp.zeros_like(goal_area_stopped_seconds),
             goal_area_stopped_seconds,
         ),
-        defender_area_violation_pending=jnp.where(
-            goal_event | whistle,
-            jnp.zeros_like(pending_defender_violations),
-            pending_defender_violations,
+        attack_primary=jnp.where(goal_event | whistle, -1, primary_attackers),
+        defender_pushed_in=jnp.where(goal_event | whistle, False, pushed_in),
+        field_impasse_quadrant=jnp.where(goal_event | whistle, -1, stopped_quadrant),
+        free_ball_count=jnp.where(
+            goal_event | (whistle & (event != RefereeEvent.FIELD_IMPASSE)), 0, free_ball_count
+        ),
+        free_ball_quadrant=jnp.where(
+            event == RefereeEvent.FIELD_IMPASSE, quadrant, previous.free_ball_quadrant
+        ),
+        free_ball_origin=jnp.where(
+            event == RefereeEvent.FIELD_IMPASSE, free_ball_origin, previous.free_ball_origin
         ),
         phase=jnp.where(
             whistle,

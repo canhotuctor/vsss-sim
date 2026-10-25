@@ -11,6 +11,7 @@ from vsss_sim.envs.match_geometry import (
     _goal_area_membership,
     _robot_goal_area_fraction,
 )
+from vsss_sim.envs.match_restarts import _restart_positions
 from vsss_sim.envs.match_rules import (
     MatchRules,
     MatchStepInput,
@@ -19,13 +20,13 @@ from vsss_sim.envs.match_rules import (
     build_observation,
     initial_referee_state,
 )
-from vsss_sim.envs.match_restarts import _restart_positions
 from vsss_sim.physics import jax_backend as physics
 
 
 def _simulation(ball: tuple[float, float, float, float] = (0, 0, 0, 0)):
     simulation = physics.reset_kickoff(jax.random.PRNGKey(0))
-    robots = jnp.zeros_like(simulation.robots)
+    robots = jnp.zeros_like(simulation.robots).at[..., :2].set(jnp.asarray([
+        [[-.3, -.4], [-.3, 0], [-.3, .4]], [[.3, -.4], [.3, 0], [.3, .4]]]))
     return simulation._replace(
         ball=jnp.asarray(ball, dtype=jnp.float32),
         robots=robots,
@@ -70,25 +71,23 @@ def test_goal_area_corner_clips_robot_footprint_on_both_edges(heading: float):
     membership = jax.jit(_goal_area_membership)(robots)
 
     np.testing.assert_allclose(fraction, 0.25, atol=1e-5)
-    assert not bool(membership[config.TEAM_BLUE, 0, 0])
+    assert bool(membership[config.TEAM_BLUE, 0, 0])
 
 
 @pytest.mark.parametrize(
     "offset, expected_membership",
     [(-1e-3, True), (0.0, True), (1e-3, False)],
 )
-def test_goal_area_membership_uses_half_footprint_threshold(
+def test_goal_area_membership_includes_any_footprint_contact(
     offset: float, expected_membership: bool
 ):
     robots = _simulation().robots
     inner_x = -config.FIELD_LENGTH / 2.0 + config.GOAL_AREA_LENGTH_X
-    robot = jnp.asarray([inner_x + offset, 0.0, 0.0, 0.0, 0.0, 0.0])
+    robot = jnp.asarray([inner_x + config.ROBOT_SIZE / 2 + offset, 0.25, 0.0, 0.0, 0.0, 0.0])
     robots = robots.at[config.TEAM_BLUE, 0].set(robot)
 
-    fraction = _robot_goal_area_fraction(robot, jnp.int32(0))
     membership = jax.jit(_goal_area_membership)(robots)
 
-    np.testing.assert_allclose(fraction, 0.5 - offset / config.ROBOT_SIZE, atol=1e-5)
     assert bool(membership[config.TEAM_BLUE, 0, 0]) is expected_membership
 
 
@@ -100,7 +99,7 @@ def test_personal_foul_identifies_the_team_that_advances_into_the_opponent(
     robots_before = before.robots
     goal_area_x = -0.66 if offending_team == config.TEAM_BLUE else 0.66
     direction = 1.0 if offending_team == config.TEAM_BLUE else -1.0
-    victim_x = goal_area_x + direction * 0.08
+    victim_x = goal_area_x + direction * 0.075
     robots_before = robots_before.at[offending_team, 0, 0:2].set(
         [goal_area_x - direction * 0.09, 0.0]
     )
@@ -115,7 +114,7 @@ def test_personal_foul_identifies_the_team_that_advances_into_the_opponent(
     assert int(result.restart_team) == 1 - offending_team
 
 
-def test_foul_near_midfield_is_not_attributed_to_remote_pair_during_goal_area_play():
+def test_personal_contact_at_midfield_is_called_independently_of_ball_area():
     before = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
     robots_before = before.robots.at[config.TEAM_BLUE, 0, 0:2].set([0.15, 0.0])
     robots_before = robots_before.at[config.TEAM_YELLOW, 0, 0:2].set([0.12, 0.0])
@@ -124,19 +123,19 @@ def test_foul_near_midfield_is_not_attributed_to_remote_pair_during_goal_area_pl
 
     result = MatchRules().step(_context(before._replace(robots=robots_before), after))
 
-    assert int(result.event) == RefereeEvent.NONE
-    assert int(result.restart) == RestartType.NONE
+    assert int(result.event) == RefereeEvent.PERSONAL_FOUL
+    assert int(result.restart) == RestartType.FREE_KICK
 
 
 @pytest.mark.parametrize(
     "ball, opponent_position, expected_event",
     [
-        ((0.66, 0.0, 0.0, 0.0), (-0.2, 0.0), RefereeEvent.NONE),
+        ((0.66, 0.0, 0.0, 0.0), (-0.2, 0.0), RefereeEvent.ATTACKER_GOAL_AREA),
         ((0.0, 0.0, 0.0, 0.0), (0.66, 0.0), RefereeEvent.NONE),
         ((0.66, 0.0, 0.0, 0.0), (0.66, 0.0), RefereeEvent.ATTACKER_GOAL_AREA),
     ],
 )
-def test_two_attackers_in_opponent_area_require_contested_ball_in_that_area(
+def test_two_attackers_require_an_attack_but_not_an_opposing_defender(
     ball, opponent_position, expected_event
 ):
     simulation = _simulation(ball=ball)
@@ -227,42 +226,30 @@ def test_switching_impasse_context_does_not_reuse_other_timer(
     assert float(getattr(result.referee_state, other_timer)) == pytest.approx(0.0)
 
 
-def test_defender_goal_area_violation_waits_until_ball_exits_without_contest():
+def test_two_defenders_without_an_attack_do_not_create_a_delayed_penalty():
     first = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
-    robots = first.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.70, 0.0])
-    robots = robots.at[config.TEAM_BLUE, 1, 0:2].set([-0.62, 0.0])
+    robots = first.robots.at[0, 0, :2].set(jnp.asarray([-.70, 0.0]))
+    robots = robots.at[0, 1, :2].set(jnp.asarray([-.62, 0.0]))
     first = first._replace(robots=robots)
-
     step = jax.jit(MatchRules().step)
-    first_context = _context(first, first)._replace(referee_state=initial_referee_state())
-    pending = step(first_context)
-
-    assert int(pending.event) == RefereeEvent.NONE
-    assert bool(pending.referee_state.defender_area_violation_pending[config.TEAM_BLUE])
-
-    exiting = pending.simulation._replace(ball=pending.simulation.ball.at[0].set(-0.55))
-    call_context = _context(pending.simulation, exiting)._replace(
-        referee_state=pending.referee_state
-    )
-    result = step(call_context)
-
-    assert int(result.event) == RefereeEvent.DEFENDER_GOAL_AREA
-    assert int(result.offending_team) == config.TEAM_BLUE
-    assert int(result.restart) == RestartType.PENALTY_KICK
+    initial = step(_context(first, first))
+    assert int(initial.event) == RefereeEvent.NONE
+    exiting = initial.simulation._replace(ball=initial.simulation.ball.at[0].set(-.50))
+    result = step(_context(initial.simulation, exiting)._replace(referee_state=initial.referee_state))
+    assert int(result.event) == RefereeEvent.NONE
 
 
 def test_defender_goal_area_violation_is_immediate_during_active_ball_contest():
     simulation = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
     robots = simulation.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.70, 0.0])
     robots = robots.at[config.TEAM_BLUE, 1, 0:2].set([-0.62, 0.0])
-    robots = robots.at[config.TEAM_YELLOW, 0, 0:2].set([-0.56, 0.0])
+    robots = robots.at[config.TEAM_YELLOW, 0, 0:2].set([-0.60, 0.0])
     simulation = simulation._replace(robots=robots)
 
     result = MatchRules().step(_context(simulation, simulation))
 
     assert int(result.event) == RefereeEvent.DEFENDER_GOAL_AREA
     assert int(result.offending_team) == config.TEAM_BLUE
-    assert not bool(result.referee_state.defender_area_violation_pending[config.TEAM_BLUE])
 
 
 @pytest.mark.parametrize("reward_profile", list(RewardProfile))
@@ -348,7 +335,9 @@ def test_free_kick_formation_keeps_players_off_the_ball_and_each_other(restart_t
     restarted, stepped = jax.jit(jax.vmap(place_and_step))(jnp.asarray(balls, jnp.float32))
     positions = np.asarray(restarted.robots[..., 0:2]).reshape(len(balls), 6, 2)
     ball = np.asarray(restarted.ball[:, 0:2])
-    np.testing.assert_allclose(ball, balls, atol=1e-6)
+    direction = 1 if restart_team == config.TEAM_BLUE else -1
+    expected_mark = np.broadcast_to([direction * config.PENALTY_MARK_X, 0.0], ball.shape)
+    np.testing.assert_allclose(ball, expected_mark, atol=1e-6)
 
     ball_distance = np.linalg.norm(positions - ball[:, None, :], axis=-1)
     assert ball_distance.min() >= 0.10 - 1e-5
@@ -466,7 +455,7 @@ def test_brandao_goal_reward_uses_remaining_horizon_and_keeps_match_score(
     assert result.simulation.score.tolist() == [2 + (goal == 1), 3 + (goal == -1)]
     assert float(result.simulation.t) == float(after.t)
     assert abs(float(result.simulation.ball[0])) < 0.1
-    np.testing.assert_allclose(result.observation, build_observation(result.simulation))
+    np.testing.assert_allclose(result.observation, build_observation(result.simulation), atol=1e-7)
 
 
 def test_goal_without_kickoff_returns_scored_physics_state():

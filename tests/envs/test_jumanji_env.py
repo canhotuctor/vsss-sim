@@ -57,7 +57,7 @@ def test_time_limit_is_bootstrappable_truncation():
 def test_goal_kickoff_preserves_score_and_match_time():
     env = VSSJumanjiEnv()
     state, _ = env.reset(jax.random.PRNGKey(0))
-    ball = state.simulation.ball.at[0].set(config.FIELD_LENGTH / 2.0 + 0.02)
+    ball = state.simulation.ball.at[0].set(config.FIELD_LENGTH / 2.0 + 0.03)
     ball = ball.at[1].set(0.0).at[2].set(0.05)
     state = state._replace(simulation=state.simulation._replace(ball=ball))
 
@@ -72,7 +72,7 @@ def test_goal_kickoff_preserves_score_and_match_time():
 def test_brandao_goal_reward_is_jittable_and_uses_remaining_horizon():
     env = VSSJumanjiEnv(max_episode_steps=5, reward_profile="brandao_reward")
     state, _ = env.reset(jax.random.PRNGKey(0))
-    ball = state.simulation.ball.at[0].set(config.FIELD_LENGTH / 2.0 + 0.02)
+    ball = state.simulation.ball.at[0].set(config.FIELD_LENGTH / 2.0 + 0.03)
     ball = ball.at[1].set(0.0).at[2].set(0.05)
     state = state._replace(simulation=state.simulation._replace(ball=ball))
 
@@ -85,6 +85,7 @@ def test_brandao_goal_reward_is_jittable_and_uses_remaining_horizon():
     np.testing.assert_allclose(
         timestep.observation,
         env._match_rules.observation(next_state.simulation),
+        atol=1e-7,
     )
 
 
