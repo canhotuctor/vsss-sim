@@ -498,13 +498,8 @@ def _ball_robot_collisions(state: SimState) -> SimState:
 
 
 # ---------------------------------------------------------------------------
-# Robot–robot collisions (OBB vs OBB via SAT) — fori_loop over 15 pairs
+# Robot–robot collisions (OBB vs OBB via SAT) — dense masked contacts
 # ---------------------------------------------------------------------------
-
-# Pre-compute the 15 unique (i, j) pairs for 6 robots.
-_PAIR_I, _PAIR_J = jnp.triu_indices(_N_ROBOTS_TOTAL, k=1)
-_N_PAIRS = int(_PAIR_I.shape[0])
-
 
 def _sat_square_overlap(
     pos_a: jnp.ndarray, theta_a: jnp.ndarray,
@@ -541,9 +536,11 @@ def _sat_square_overlap(
 
     # Pick the axis with the minimum overlap (only meaningful when overlapping).
     min_idx = jnp.argmin(overlaps)
-    min_overlap = overlaps[min_idx]
-    axis = axes[min_idx]
-    sign = jnp.where(proj[min_idx] >= 0, 1.0, -1.0)
+    selected = jnp.arange(4) == min_idx
+    min_overlap = jnp.sum(jnp.where(selected, overlaps, 0.0))
+    axis = jnp.sum(jnp.where(selected[:, None], axes, 0.0), axis=0)
+    selected_proj = jnp.sum(jnp.where(selected, proj, 0.0))
+    sign = jnp.where(selected_proj >= 0, 1.0, -1.0)
     normal = axis * sign
 
     # When not overlapping, return safe zeros.
@@ -585,44 +582,63 @@ def _resolve_robot_pair(
 def _robot_robot_collisions(state: SimState) -> SimState:
     """Resolve inelastic collisions between all 15 robot pairs in parallel.
 
-    All SAT tests are batched via vmap; corrections are scatter-added back so
-    each robot accumulates its share from every overlapping pair simultaneously.
+    A dense contact tensor and row/column reductions accumulate each robot's
+    simultaneous corrections without gathering pairs or scatter-adding them.
     """
     robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
     e = jnp.float32(config.ROBOT_WALL_RESTITUTION)
+    positions = robots_flat[:, 0:2]
+    velocities = robots_flat[:, 3:5]
 
-    pos_a = robots_flat[_PAIR_I, 0:2]    # (15, 2)
-    theta_a = robots_flat[_PAIR_I, 2]    # (15,)
-    pos_b = robots_flat[_PAIR_J, 0:2]    # (15, 2)
-    theta_b = robots_flat[_PAIR_J, 2]    # (15,)
-    vel_a = robots_flat[_PAIR_I, 3:5]    # (15, 2)
-    vel_b = robots_flat[_PAIR_J, 3:5]    # (15, 2)
-
+    # Pack only the 15 i < j contacts using static slices. Evaluating the full
+    # 6x6 grid would duplicate SAT work and reverse tied/coincident contact axes.
+    first = jnp.concatenate(
+        [
+            jnp.broadcast_to(robots_flat[index:index + 1], (_N_ROBOTS_TOTAL - index - 1, 6))
+            for index in range(_N_ROBOTS_TOTAL - 1)
+        ],
+        axis=0,
+    )
+    second = jnp.concatenate(
+        [robots_flat[index + 1:] for index in range(_N_ROBOTS_TOTAL - 1)], axis=0
+    )
     overlapping, normals, overlaps = jax.vmap(_sat_square_overlap)(
-        pos_a, theta_a, pos_b, theta_b
-    )  # (15,), (15, 2), (15,)
+        first[:, :2], first[:, 2], second[:, :2], second[:, 2]
+    )
 
     # Position corrections
-    sep = normals * overlaps[:, None] * 0.5
-    pos_delta_a = jnp.where(overlapping[:, None],  sep, 0.0)
-    pos_delta_b = jnp.where(overlapping[:, None], -sep, 0.0)
+    sep = jnp.where(overlapping[:, None], normals * overlaps[:, None] * 0.5, 0.0)
 
     # Velocity impulses
-    rel_vel = vel_a - vel_b
+    rel_vel = first[:, 3:5] - second[:, 3:5]
     vel_along = jnp.sum(rel_vel * normals, axis=-1)
     do_impulse = overlapping & (vel_along < 0)
     j_imp = jnp.where(do_impulse, -(1.0 + e) * vel_along * 0.5, 0.0)
     impulse = j_imp[:, None] * normals
-    vel_delta_a = jnp.where(do_impulse[:, None],  impulse, 0.0)
-    vel_delta_b = jnp.where(do_impulse[:, None], -impulse, 0.0)
 
-    # Scatter-add all corrections back onto each robot
-    new_pos = robots_flat[:, 0:2]
-    new_vel = robots_flat[:, 3:5]
-    new_pos = new_pos.at[_PAIR_I].add(pos_delta_a).at[_PAIR_J].add(pos_delta_b)
-    new_vel = new_vel.at[_PAIR_I].add(vel_delta_a).at[_PAIR_J].add(vel_delta_b)
+    def contact_matrix(deltas: jnp.ndarray) -> jnp.ndarray:
+        """Expand packed contacts into upper-triangular rows without scatters."""
+        rows = []
+        offset = 0
+        for index in range(_N_ROBOTS_TOTAL):
+            width = _N_ROBOTS_TOTAL - index - 1
+            rows.append(
+                jnp.pad(deltas[offset:offset + width], ((index + 1, 0), (0, 0)))
+            )
+            offset += width
+        return jnp.stack(rows)
 
-    new_robots_flat = robots_flat.at[:, 0:2].set(new_pos).at[:, 3:5].set(new_vel)
+    sep = contact_matrix(sep)
+    impulse = contact_matrix(impulse)
+
+    # Each upper-triangular contact contributes +delta to its row robot and
+    # -delta to its column robot, with no diagonal or duplicate contacts.
+    new_pos = positions + jnp.sum(sep, axis=1) - jnp.sum(sep, axis=0)
+    new_vel = velocities + jnp.sum(impulse, axis=1) - jnp.sum(impulse, axis=0)
+
+    new_robots_flat = jnp.concatenate(
+        (new_pos, robots_flat[:, 2:3], new_vel, robots_flat[:, 5:6]), axis=1
+    )
     return state._replace(
         robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6)
     )

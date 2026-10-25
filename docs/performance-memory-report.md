@@ -197,8 +197,8 @@ five update epochs and eight minibatches. Memory is XLA executable
 
 | Metric | Before | M1 + M2 | Change |
 |---|---:|---:|---:|
-| Estimated XLA peak buffers | 644.4 MB | 162.3 MB | -74.8% |
-| Temporary buffers | 629.2 MB | 147.1 MB | -76.6% |
+| Estimated XLA peak buffers | 644.4 MiB | 162.3 MiB | -74.8% |
+| Temporary buffers | 629.2 MiB | 147.1 MiB | -76.6% |
 | Full PPO update | 3.886 s | 3.794 s | -2.4% |
 | Full-update throughput | 11,014 env-steps/s | 11,281 env-steps/s | +2.4% |
 | Rollout only | 2.098 s | 2.059 s | -1.9% |
@@ -206,12 +206,81 @@ five update epochs and eight minibatches. Memory is XLA executable
 The small throughput delta is within the expected variation of a CPU timing
 run; the meaningful outcome is that rebuilding minibatch histories did not
 materially slow the update while reducing the compiled memory estimate by about
-482 MB per lineage.
+482 MiB per lineage.
 
 Correctness coverage includes an exact reconstruction test with six reset
 boundaries across two environments and a reversed minibatch order. The targeted
 PPO and self-play suites passed after the change, including the mirrored
 Brandao-set update path.
+
+## 6. T1, T2 and T5 implementation
+
+The implementation plan uses the M1/M2 result above, committed as `8738590`,
+as its performance baseline:
+
+1. **T1: fixed-capacity goal-area clipping.** Evaluate polygon edges in parallel,
+   mask inactive vertices, and compact intersection/endpoint candidates with
+   prefix counts. Four half-plane clips of a convex square need at most eight
+   vertices, including duplicate boundary endpoints. Retain the float32
+   intersection arithmetic and the existing 50% membership threshold.
+2. **T2: batch exact Beta factors.** Evaluate learner and historical-opponent
+   concentrations, stack their alpha/beta factors, and call
+   `jax.random.loggamma` once. Form each Beta ratio in log space using the same
+   stable scaling as JAX's Beta implementation. Standalone stochastic actions
+   use the same helper. This preserves the distribution and independent draws,
+   but changes the stochastic stream for a given seed; old training runs will
+   not replay bit for bit.
+3. **T5: dense contact accumulation.** Pack the 15 unique robot pairs with static
+   slices and broadcasts, evaluate SAT once per pair, and expand corrections
+   into upper-triangular 6x6 arrays for row/column reductions. One-hot SAT axis,
+   projection and overlap selection preserves first-axis tie behavior and its
+   derivative. This avoids runtime pair gathers and correction scatters while
+   keeping the original simultaneous response and restitution.
+
+### Measurements on the same CPU
+
+The same temporary `mem.py` and full-update/rollout/environment portions of
+`time.py` were repeated after implementation, with the configuration and package
+versions from section 5. The baseline is the already measured M1/M2 result.
+Memory values use MiB (2^20 bytes); the original appendix's `MB` fields also
+divide bytes by 2^20.
+
+| Metric | M1 + M2 baseline | With T1 + T2 + T5 | Change |
+|---|---:|---:|---:|
+| Estimated XLA peak buffers | 162.3 MiB | 162.3 MiB | unchanged |
+| Temporary buffers | 147.1 MiB | 147.1 MiB | unchanged |
+| Full PPO update | 3.794 s | 3.761 s | -0.9% |
+| Full-update throughput | 11,281 env-steps/s | 11,380 env-steps/s | +0.9% |
+| Rollout only | 2.059 s | 2.016 s | -2.1% |
+| Environment-only scan | 1.000 s | 0.951 s | -4.9% |
+
+The full-update delta is too small to establish a CPU speedup from these short
+timings. A paired kernel diagnostic against source at `8738590` helps explain
+the tradeoffs. Each row is the minimum of three warmed scans over the same
+input batch: 214 control steps, or 214 x 6 iterations for robot contacts.
+
+| Isolated CPU workload | Baseline | Final implementation |
+|---|---:|---:|
+| Physics, six substeps | 0.563 s | 0.586 s |
+| Goal-area membership, once per step | 0.149 s | 0.113 s |
+| Robot contacts, 1,284 iterations | 0.140 s | 0.198 s |
+| Learner + opponent Beta sampling | 0.417 s | 0.427 s |
+
+Clipping improves on this CPU. Dense contact accumulation and the larger
+gamma batch cost more in isolation; computing only 15 unique contacts avoids
+the much larger CPU cost of evaluating all 36 matrix entries. The GPU launch
+latency benefit of removing dynamic loops remains unmeasured here.
+
+The final compiled CPU training executable has 37 while operations, of which
+two have data-dependent trip counts: the nested exact gamma rejection loops.
+Standalone goal-area clipping has no while or conditional operations, and
+standalone robot contacts have no gather or scatter operations. Regression
+coverage checks polygon clipping against an independent numerical oracle,
+maximum-capacity and boundary cases, contact responses and tied-axis gradients
+against the former implementation, and Beta moments and independence. The
+self-play rollout trace contains one gamma-sampling primitive for both teams.
+The full CPU suite passed with 205 tests and four CUDA skips; Ruff passed for
+all changed Python files.
 
 ## Appendix: measurement scripts
 

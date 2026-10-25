@@ -375,6 +375,24 @@ def _normal_entropy(log_std: jax.Array) -> jax.Array:
     return jnp.sum(log_std + 0.5 * (1.0 + _LOG_2PI), axis=-1)
 
 
+def _sample_beta(
+    key: jax.Array, alpha: jax.Array, beta: jax.Array
+) -> jax.Array:
+    """Sample independent Beta variates with one batched gamma sampler.
+
+    The leading parameter axis combines both gamma factors in one draw. Keep
+    the ratio in log space, as in JAX's Beta sampler, to avoid underflow for
+    small concentrations. Grouped learner/opponent arrays share this call
+    while retaining independent draws for every element.
+    """
+    alpha, beta = jnp.broadcast_arrays(alpha, beta)
+    log_alpha, log_beta = jax.random.loggamma(key, jnp.stack((alpha, beta)))
+    log_max = jnp.maximum(log_alpha, log_beta)
+    alpha_scaled = jnp.exp(log_alpha - log_max)
+    beta_scaled = jnp.exp(log_beta - log_max)
+    return alpha_scaled / (alpha_scaled + beta_scaled)
+
+
 def _beta_log_prob(
     sample: jax.Array, alpha: jax.Array, beta: jax.Array
 ) -> jax.Array:
@@ -651,7 +669,7 @@ class PPO:
             else:
                 if key is None:
                     raise ValueError("key is required for stochastic actions")
-                sample = jax.random.beta(key, first, second)
+                sample = _sample_beta(key, first, second)
             return 2.0 * sample - 1.0
         if deterministic:
             raw_action = first
@@ -768,7 +786,7 @@ class PPO:
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         first, second, value = self.model.apply(params, observation)
         if self.policy_architecture in ("brandao_shared", "brandao_sets"):
-            sample = jax.random.beta(key, first, second)
+            sample = _sample_beta(key, first, second)
             log_prob = _beta_log_prob(sample, first, second)
             return 2.0 * sample - 1.0, sample, log_prob, value
         raw_action = first + jnp.exp(second) * jax.random.normal(key, first.shape)
@@ -830,9 +848,36 @@ class PPO:
     ) -> tuple[RunnerState, _Transition]:
         def rollout_step(carry: RunnerState, _: None):
             policy_key, opponent_key, reset_key, next_key = jax.random.split(carry.key, 4)
-            action, raw_action, log_prob, value = self._sample_policy(
-                carry.train_state.params, carry.observation, policy_key
-            )
+            if opponent_pool is not None:
+                opponent_observation = self._batched_opponent_observation(carry.env_state)
+                opponent_first, opponent_second, _ = self._apply_opponent_policy(
+                    opponent_pool,
+                    carry.opponent_indices,
+                    opponent_observation,
+                )
+            if self.is_shared_agent_policy and opponent_pool is not None:
+                first, second, value = self.model.apply(
+                    carry.train_state.params, carry.observation
+                )
+                raw_action, opponent_sample = _sample_beta(
+                    policy_key,
+                    jnp.stack((first, opponent_first)),
+                    jnp.stack((second, opponent_second)),
+                )
+                action = 2.0 * raw_action - 1.0
+                log_prob = _beta_log_prob(raw_action, first, second)
+                opponent_action = 2.0 * opponent_sample - 1.0
+            else:
+                action, raw_action, log_prob, value = self._sample_policy(
+                    carry.train_state.params, carry.observation, policy_key
+                )
+                if opponent_pool is not None:
+                    opponent_raw_action = (
+                        opponent_first
+                        + jnp.exp(opponent_second)
+                        * jax.random.normal(opponent_key, opponent_first.shape)
+                    )
+                    opponent_action = jnp.tanh(opponent_raw_action)
             if self.config.mirror_augmentation:
                 mirrored_observation = mirror_x_axis_observation(carry.observation)
                 mirrored_first, mirrored_second, mirrored_value = self.model.apply(
@@ -847,20 +892,6 @@ class PPO:
             if opponent_pool is None:
                 stepped_state, timestep = self._batched_step(carry.env_state, action)
             else:
-                opponent_observation = self._batched_opponent_observation(carry.env_state)
-                first, second, _ = self._apply_opponent_policy(
-                    opponent_pool,
-                    carry.opponent_indices,
-                    opponent_observation,
-                )
-                if self.policy_architecture in ("brandao_shared", "brandao_sets"):
-                    opponent_sample = jax.random.beta(opponent_key, first, second)
-                    opponent_action = 2.0 * opponent_sample - 1.0
-                else:
-                    opponent_raw_action = first + jnp.exp(second) * jax.random.normal(
-                        opponent_key, first.shape
-                    )
-                    opponent_action = jnp.tanh(opponent_raw_action)
                 stepped_state, timestep = self._batched_step_with_opponent(
                     carry.env_state,
                     action,

@@ -9,15 +9,7 @@ from .. import config
 
 _PLAY_INVOLVEMENT_DISTANCE = 0.12
 _ROBOT_CONTACT_DISTANCE = config.ROBOT_SIZE + 0.01
-_POLYGON_CAPACITY = 12
-
-
-def _append_vertex(
-    polygon: jax.Array, count: jax.Array, point: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    safe_count = jnp.minimum(count, _POLYGON_CAPACITY - 1)
-    polygon = polygon.at[safe_count].set(point)
-    return polygon, jnp.minimum(count + 1, _POLYGON_CAPACITY)
+_POLYGON_CAPACITY = 8
 
 
 def _clip_polygon(
@@ -27,38 +19,36 @@ def _clip_polygon(
     boundary: jax.Array,
     keep_greater: bool,
 ) -> tuple[jax.Array, jax.Array]:
-    """Clip a small convex polygon against one axis-aligned half plane."""
-    output = jnp.zeros_like(polygon)
+    """Clip every fixed-capacity edge in parallel, masking inactive vertices.
 
-    def inside(point: jax.Array) -> jax.Array:
-        return point[axis] >= boundary if keep_greater else point[axis] <= boundary
+    Clipping a convex polygon adds at most one vertex per half plane, including
+    duplicate boundary endpoints. A square clipped by four rectangle edges
+    therefore fits eight vertices. Prefix counts retain the Sutherland-Hodgman
+    vertex order without a data-dependent loop.
+    """
+    indices = jnp.arange(_POLYGON_CAPACITY, dtype=jnp.int32)
+    previous_indices = jnp.where(indices == 0, jnp.maximum(count - 1, 0), indices - 1)
+    previous = polygon[previous_indices]
+    previous_inside = (
+        previous[:, axis] >= boundary if keep_greater else previous[:, axis] <= boundary
+    )
+    current_inside = (
+        polygon[:, axis] >= boundary if keep_greater else polygon[:, axis] <= boundary
+    )
+    active = indices < count
+    crosses = (previous_inside != current_inside) & active
+    denominator = polygon[:, axis] - previous[:, axis]
+    safe_denominator = jnp.where(jnp.abs(denominator) < 1e-8, 1e-8, denominator)
+    fraction = (boundary - previous[:, axis]) / safe_denominator
+    intersection = previous + fraction[:, None] * (polygon - previous)
 
-    def clip_edge(index: int, carry: tuple[jax.Array, jax.Array]):
-        clipped, clipped_count = carry
-        previous_index = jnp.where(index == 0, count - 1, index - 1)
-        previous = polygon[previous_index]
-        current = polygon[index]
-        previous_inside = inside(previous)
-        current_inside = inside(current)
-        crosses = previous_inside != current_inside
-        denominator = current[axis] - previous[axis]
-        safe_denominator = jnp.where(jnp.abs(denominator) < 1e-8, 1e-8, denominator)
-        fraction = (boundary - previous[axis]) / safe_denominator
-        intersection = previous + fraction * (current - previous)
-        clipped, clipped_count = jax.lax.cond(
-            crosses,
-            lambda state: _append_vertex(state[0], state[1], intersection),
-            lambda state: state,
-            (clipped, clipped_count),
-        )
-        return jax.lax.cond(
-            current_inside,
-            lambda state: _append_vertex(state[0], state[1], current),
-            lambda state: state,
-            (clipped, clipped_count),
-        )
-
-    return jax.lax.fori_loop(0, count, clip_edge, (output, jnp.int32(0)))
+    # Each edge emits its intersection first and its inside endpoint second.
+    candidates = jnp.stack((intersection, polygon), axis=1).reshape((-1, 2))
+    valid = jnp.stack((crosses, current_inside & active), axis=1).reshape(-1)
+    destinations = jnp.cumsum(valid.astype(jnp.int32)) - 1
+    destinations = jnp.where(valid, destinations, _POLYGON_CAPACITY)
+    output = jnp.zeros_like(polygon).at[destinations].set(candidates, mode="drop")
+    return output, jnp.sum(valid, dtype=jnp.int32)
 
 
 def _polygon_area(polygon: jax.Array, count: jax.Array) -> jax.Array:
