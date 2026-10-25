@@ -175,6 +175,44 @@ On XLA:GPU, each iteration of a data-dependent while loop copies its predicate b
 
 With M1 and M2, the budget that holds 4 lineages today should hold about 16 at the same configuration.
 
+## 5. 2026-10-25 implementation validation
+
+M2 was implemented first in `PPO._optimize`: the shuffled permutation is
+reshaped to `(num_minibatches, minibatch_size)` and each scan iteration gathers
+only its own rows. No shuffled copy of the full training batch is materialized.
+
+M1 then changes Brandao rollout storage. The rollout keeps the newest
+53-feature frame for each robot rather than the complete 424-feature history.
+At optimization time, it combines the rollout-start eight-frame history with
+those stored frames and derives each episode start from the previous step's
+`episode_end`. This preserves the repeated reset frame after every autoreset.
+The non-Brandao PPO path continues to retain its dense observation.
+
+The before/after measurements below ran on 2026-10-25 on this Apple Silicon
+macOS machine (10 logical CPUs reported by Python), with JAX 0.11.2, Flax
+0.12.10 and Optax 0.2.8. Both runs forced the CPU backend and used the same
+one-lineage `brandao_shared` workload: 200 environments, rollout length 214,
+five update epochs and eight minibatches. Memory is XLA executable
+`memory_analysis()`; timing is the best of three warmed executions.
+
+| Metric | Before | M1 + M2 | Change |
+|---|---:|---:|---:|
+| Estimated XLA peak buffers | 644.4 MB | 162.3 MB | -74.8% |
+| Temporary buffers | 629.2 MB | 147.1 MB | -76.6% |
+| Full PPO update | 3.886 s | 3.794 s | -2.4% |
+| Full-update throughput | 11,014 env-steps/s | 11,281 env-steps/s | +2.4% |
+| Rollout only | 2.098 s | 2.059 s | -1.9% |
+
+The small throughput delta is within the expected variation of a CPU timing
+run; the meaningful outcome is that rebuilding minibatch histories did not
+materially slow the update while reducing the compiled memory estimate by about
+482 MB per lineage.
+
+Correctness coverage includes an exact reconstruction test with six reset
+boundaries across two environments and a reversed minibatch order. The targeted
+PPO and self-play suites passed after the change, including the mirrored
+Brandao-set update path.
+
 ## Appendix: measurement scripts
 
 Save the scripts in one scratch directory, for example /tmp/vsss_perf. Several scripts import from that directory, and `hlo2.py` reads the XLA dump written there. Run them from the repository root with the project virtual environment:

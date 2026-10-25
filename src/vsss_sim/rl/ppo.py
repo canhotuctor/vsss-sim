@@ -6,6 +6,7 @@ minibatch updates. Python is only needed between PPO updates for logging.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -16,7 +17,11 @@ import optax
 from flax import linen as nn
 from flax.training.train_state import TrainState
 
-from ..envs.brandao_observation import mirror_x_axis_observation
+from ..envs.brandao_observation import (
+    FRAME_FEATURES,
+    HISTORY_LENGTH,
+    mirror_x_axis_observation,
+)
 from ..envs.jumanji import State as EnvState
 from ..envs.jumanji import VSSJumanjiEnv
 from ..envs.match_referee import RefereeEvent
@@ -303,6 +308,60 @@ class _TrainingBatch(NamedTuple):
     mirrored_old_value: jax.Array | None = None
     mirrored_advantage: jax.Array | None = None
     mirrored_target: jax.Array | None = None
+
+
+def _reconstruct_brandao_observations(
+    initial_observation: jax.Array,
+    rollout_frames: jax.Array,
+    episode_ends: jax.Array,
+    indices: jax.Array,
+) -> jax.Array:
+    """Rebuild selected eight-frame Brandao observations from one stored frame.
+
+    ``rollout_frames[t]`` is the newest frame of the pre-action observation at
+    step ``t``.  The initial history supplies step zero, and an episode ending
+    at step ``t - 1`` makes every frame of observation ``t`` the reset frame.
+    """
+    rollout_length, num_envs = episode_ends.shape
+    initial_frames = jnp.moveaxis(
+        initial_observation.reshape(
+            num_envs, 3, HISTORY_LENGTH, FRAME_FEATURES
+        ),
+        2,
+        0,
+    )
+    frames = rollout_frames.reshape(
+        rollout_length, num_envs, 3, FRAME_FEATURES
+    )
+    all_frames = jnp.concatenate((initial_frames, frames[1:]), axis=0)
+
+    previous_episode_ends = jnp.concatenate(
+        (jnp.zeros_like(episode_ends[:1]), episode_ends[:-1]), axis=0
+    )
+    step_numbers = jnp.arange(rollout_length, dtype=jnp.int32)
+
+    def track_episode_start(
+        episode_start: jax.Array, data: tuple[jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        step, previous_episode_end = data
+        episode_start = jnp.where(previous_episode_end, step, episode_start)
+        return episode_start, episode_start
+
+    _, episode_starts = jax.lax.scan(
+        track_episode_start,
+        jnp.full((num_envs,), -(HISTORY_LENGTH - 1), dtype=jnp.int32),
+        (step_numbers, previous_episode_ends),
+    )
+    steps, envs = indices // num_envs, indices % num_envs
+    history_offsets = jnp.arange(HISTORY_LENGTH, dtype=jnp.int32)
+    source_steps = jnp.maximum(
+        steps[:, None] - (HISTORY_LENGTH - 1) + history_offsets[None, :],
+        episode_starts[steps, envs][:, None],
+    ) + (HISTORY_LENGTH - 1)
+    frames = all_frames[source_steps, envs[:, None]]
+    return jnp.swapaxes(frames, 1, 2).reshape(
+        (indices.shape[0], 3, HISTORY_LENGTH * FRAME_FEATURES)
+    )
 
 
 def _normal_log_prob(
@@ -888,7 +947,14 @@ class PPO:
                 opponent_generations=next_opponent_generations,
             )
             transition_data = _Transition(
-                observation=carry.observation,
+                # Consecutive Brandao histories overlap in seven of eight
+                # frames. Keep only the newest frame and rebuild histories
+                # for the selected optimization minibatch.
+                observation=(
+                    carry.observation[..., -FRAME_FEATURES:]
+                    if self.is_shared_agent_policy
+                    else carry.observation
+                ),
                 raw_action=raw_action,
                 old_log_prob=log_prob,
                 old_value=value,
@@ -990,8 +1056,40 @@ class PPO:
         train_state: TrainState,
         batch: _TrainingBatch,
         key: jax.Array,
+        reconstruct_observation: Callable[[jax.Array], jax.Array] | None = None,
     ) -> tuple[TrainState, dict[str, jax.Array], jax.Array]:
-        def minibatch_step(state: TrainState, minibatch: _TrainingBatch):
+        def minibatch_step(state: TrainState, indices: jax.Array):
+            if reconstruct_observation is None:
+                minibatch = jax.tree_util.tree_map(lambda value: value[indices], batch)
+            else:
+                minibatch = _TrainingBatch(
+                    observation=reconstruct_observation(indices),
+                    raw_action=batch.raw_action[indices],
+                    old_log_prob=batch.old_log_prob[indices],
+                    old_value=batch.old_value[indices],
+                    advantage=batch.advantage[indices],
+                    target=batch.target[indices],
+                    mirrored_old_log_prob=(
+                        batch.mirrored_old_log_prob[indices]
+                        if batch.mirrored_old_log_prob is not None
+                        else None
+                    ),
+                    mirrored_old_value=(
+                        batch.mirrored_old_value[indices]
+                        if batch.mirrored_old_value is not None
+                        else None
+                    ),
+                    mirrored_advantage=(
+                        batch.mirrored_advantage[indices]
+                        if batch.mirrored_advantage is not None
+                        else None
+                    ),
+                    mirrored_target=(
+                        batch.mirrored_target[indices]
+                        if batch.mirrored_target is not None
+                        else None
+                    ),
+                )
             (_, metrics), grads = jax.value_and_grad(self._loss, has_aux=True)(
                 state.params, minibatch
             )
@@ -1026,15 +1124,12 @@ class PPO:
             epoch_key, permutation_key = jax.random.split(epoch_key)
             batch_size = batch.observation.shape[0]
             minibatch_size = batch_size // self.config.num_minibatches
-            permutation = jax.random.permutation(permutation_key, batch_size)
-            shuffled = jax.tree_util.tree_map(lambda x: x[permutation], batch)
-            minibatches = jax.tree_util.tree_map(
-                lambda x: x.reshape(
-                    (self.config.num_minibatches, minibatch_size) + x.shape[1:]
-                ),
-                shuffled,
+            minibatch_indices = jax.random.permutation(
+                permutation_key, batch_size
+            ).reshape(
+                self.config.num_minibatches, minibatch_size
             )
-            state, metrics = jax.lax.scan(minibatch_step, state, minibatches)
+            state, metrics = jax.lax.scan(minibatch_step, state, minibatch_indices)
             return (state, epoch_key), metrics
 
         (train_state, key), metrics = jax.lax.scan(
@@ -1053,6 +1148,7 @@ class PPO:
         opponent_probabilities: jax.Array | None = None,
         opponent_generations: jax.Array | None = None,
     ) -> tuple[RunnerState, dict[str, jax.Array]]:
+        initial_observation = runner.observation
         rollout_runner, trajectory = self._collect_rollout(
             runner, opponent_pool, opponent_probabilities, opponent_generations
         )
@@ -1113,10 +1209,25 @@ class PPO:
         batch = jax.tree_util.tree_map(
             lambda x: x.reshape((self.config.batch_size,) + x.shape[2:]), batch
         )
+        if self.is_shared_agent_policy:
+            rollout_frames = trajectory.observation
+            episode_ends_for_observation = trajectory.episode_end
+
+            def reconstruct_observation(indices: jax.Array) -> jax.Array:
+                return _reconstruct_brandao_observations(
+                    initial_observation,
+                    rollout_frames,
+                    episode_ends_for_observation,
+                    indices,
+                )
+
+        else:
+            reconstruct_observation = None
         train_state, metrics, key = self._optimize(
             rollout_runner.train_state,
             batch,
             rollout_runner.key,
+            reconstruct_observation,
         )
         runner = rollout_runner._replace(train_state=train_state, key=key)
 

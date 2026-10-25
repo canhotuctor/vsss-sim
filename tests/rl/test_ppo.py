@@ -4,10 +4,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vsss_sim.envs.brandao_observation import mirror_x_axis_observation
+from vsss_sim.envs.brandao_observation import (
+    FRAME_FEATURES,
+    HISTORY_LENGTH,
+    mirror_x_axis_observation,
+)
 from vsss_sim.envs.jumanji import VSSJumanjiEnv
 from vsss_sim.rl import PPO, PPOConfig, compute_gae
-from vsss_sim.rl.ppo import _TrainingBatch, create_policy_model
+from vsss_sim.rl.ppo import (
+    _reconstruct_brandao_observations,
+    _TrainingBatch,
+    create_policy_model,
+)
 
 
 def test_config_rejects_non_divisible_minibatches():
@@ -72,6 +80,52 @@ def test_gae_bootstraps_truncation_but_stops_episode_recursion():
         advantages[0, 0], first_delta + 0.9 * 0.95 * final_delta, rtol=1e-6
     )
     np.testing.assert_allclose(targets, advantages + values, rtol=1e-6)
+
+
+def test_compact_brandao_rollout_reconstruction_preserves_reset_history():
+    num_envs = 2
+    rollout_length = 16
+    initial_history = np.arange(
+        num_envs * 3 * HISTORY_LENGTH * FRAME_FEATURES, dtype=np.float32
+    ).reshape((num_envs, 3, HISTORY_LENGTH, FRAME_FEATURES))
+    episode_ends = np.zeros((rollout_length, num_envs), dtype=bool)
+    episode_ends[[1, 4, 11], 0] = True
+    episode_ends[[3, 8, 12], 1] = True
+
+    history = initial_history.copy()
+    expected = np.empty((rollout_length, num_envs, 3, 424), dtype=np.float32)
+    rollout_frames = np.empty(
+        (rollout_length, num_envs, 3, FRAME_FEATURES), dtype=np.float32
+    )
+    for step in range(rollout_length):
+        expected[step] = history.reshape((num_envs, 3, 424))
+        rollout_frames[step] = history[:, :, -1, :]
+        for env in range(num_envs):
+            frame_value = np.float32(10_000 + 10 * step + env)
+            next_frame = np.full((3, FRAME_FEATURES), frame_value, dtype=np.float32)
+            if episode_ends[step, env]:
+                history[env] = np.broadcast_to(
+                    next_frame[:, None, :], (3, HISTORY_LENGTH, FRAME_FEATURES)
+                )
+            else:
+                history[env] = np.concatenate(
+                    (history[env, :, 1:, :], next_frame[:, None, :]), axis=1
+                )
+
+    indices = jnp.asarray(
+        np.arange(rollout_length * num_envs - 1, -1, -1), dtype=jnp.int32
+    )
+    reconstructed = jax.jit(_reconstruct_brandao_observations)(
+        jnp.asarray(initial_history.reshape((num_envs, 3, 424))),
+        jnp.asarray(rollout_frames),
+        jnp.asarray(episode_ends),
+        indices,
+    )
+
+    np.testing.assert_array_equal(
+        reconstructed,
+        expected.reshape((rollout_length * num_envs, 3, 424))[np.asarray(indices)],
+    )
 
 
 def test_actions_are_bounded():
