@@ -208,19 +208,18 @@ class VSSEnv(VSSBaseEnv):
         obs_current = self._get_obs()
         yellow_actions = self._opponent_policy(obs_current).reshape(config.N_ROBOTS, 2)
         all_actions = np.stack([blue_actions, yellow_actions], axis=0)
-        if int(np.asarray(self._referee_state.phase)) == MatchPhase.STOPPED:
+        stopped = int(np.asarray(self._referee_state.phase)) == MatchPhase.STOPPED
+        if stopped:
             all_actions = np.zeros_like(all_actions)
 
         if self.render_mode == "human":
             goal = self._step_physics_substeps(all_actions)
         else:
             goal = self._step_physics(all_actions)
+        goal = 0 if stopped else goal
         self._step_count += 1
-        kickoff_key = (
-            jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
-            if goal != 0
-            else jax.random.PRNGKey(0)
-        )
+        # Also supplies unbiased tie-breaking for simultaneous referee calls.
+        kickoff_key = jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
         transition = self._compiled_match_step(
             MatchStepInput(
                 simulation_before=simulation_before,

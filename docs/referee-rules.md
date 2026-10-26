@@ -39,6 +39,14 @@ directly comparable.
   from the ball can be called anywhere on the field. Ball-between pushes are
   permitted. Ordinary personal fouls award a free kick; goalkeeper blocking
   and the specific area/possession violations retain their prescribed restarts.
+- **Team symmetry:** awarded restart positions and robot IDs rotate by 180
+  degrees when teams swap. This includes supporting players and defenders;
+  reflecting only x changes the ordered observations seen by a shared policy.
+  If both teams qualify for the same referee call in one control interval,
+  seeded equal-probability priority resolves the ambiguity, rather than always
+  selecting array index zero. Exact midfield-axis ties for free-ball
+  quadrants use seeded neutral choices, retained throughout the stoppage. Goals discarded during a stopped frame cannot
+  reach adapter goal metrics or terminate a training episode.
 - **12, free kicks:** TL uses the same marked spot as PK. The kicker is
   behind the ball, supporting attackers are in their own half, and defenders
   touch their goal-area boundary with axis-aligned footprints.

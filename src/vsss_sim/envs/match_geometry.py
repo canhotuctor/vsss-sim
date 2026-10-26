@@ -117,7 +117,10 @@ def _convex_polygons_contact(first, second, tolerance=1e-6):
         (jnp.roll(first, -1, axis=0) - first, jnp.roll(second, -1, axis=0) - second)
     )
     axes = jnp.stack((-edges[:, 1], edges[:, 0]), axis=-1)
-    a, b = first @ axes.T, second @ axes.T
+    # Reduced-precision CUDA dot products can miss touching footprints at
+    # the 0.1 mm solver tolerance. Keep contact projections in full float32.
+    a = jnp.matmul(first, axes.T, precision=jax.lax.Precision.HIGHEST)
+    b = jnp.matmul(second, axes.T, precision=jax.lax.Precision.HIGHEST)
     margin = tolerance * jnp.linalg.norm(axes, axis=-1)
     return jnp.all(
         (jnp.max(a, axis=0) + margin >= jnp.min(b, axis=0))

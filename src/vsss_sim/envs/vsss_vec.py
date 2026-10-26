@@ -216,15 +216,10 @@ class VSSVecEnv(VectorEnv):
         simulation_after_physics, info_phys = self._batched_step(
             simulation_before, all_actions_j
         )
-        goals = np.asarray(info_phys["goal"], dtype=np.int32)  # (B,)
+        goals = np.where(np.asarray(stopped), 0, np.asarray(info_phys["goal"], dtype=np.int32))  # (B,)
         self._step_count += 1
-        scored_mask = goals != 0
-        if scored_mask.any():
-            kickoff_keys = self._split_keys(self.num_envs)
-        else:
-            kickoff_keys = jnp.broadcast_to(
-                jax.random.PRNGKey(0), (self.num_envs, 2)
-            )
+        # Independent seeded keys are also needed when both teams foul.
+        kickoff_keys = self._split_keys(self.num_envs)
         transition = self._batched_match_step(
             MatchStepInput(
                 simulation_before=simulation_before,

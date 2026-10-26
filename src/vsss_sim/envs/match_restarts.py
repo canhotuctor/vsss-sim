@@ -22,6 +22,9 @@ def _restart_positions(
     half_length = jnp.float32(config.FIELD_LENGTH / 2.0)
     half_width = jnp.float32(config.FIELD_WIDTH / 2.0)
     robot_margin = jnp.float32(config.ROBOT_RADIUS)
+    # Rotate both coordinates for the awarded team. Reflecting only x swaps
+    # robot roles in policy observations and lets a blue-only learner exploit
+    # different restart states when its checkpoint is used as yellow.
     formation_team = jnp.where(restart_team < 0, config.TEAM_BLUE, restart_team)
     direction = jnp.where(formation_team == config.TEAM_BLUE, 1.0, -1.0)
 
@@ -66,8 +69,8 @@ def _restart_positions(
     penalty_defending = jnp.stack(
         (
             jnp.asarray([direction * (half_length - robot_margin), 0.0]),
-            jnp.asarray([penalty_support_x, -0.20]),
-            jnp.asarray([penalty_support_x, 0.20]),
+            jnp.asarray([penalty_support_x, -direction * 0.20]),
+            jnp.asarray([penalty_support_x, direction * 0.20]),
         )
     )
     penalty_robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), jnp.float32)
@@ -85,15 +88,15 @@ def _restart_positions(
     goal_kick_team = jnp.stack(
         (
             goal_kick_kicker,
-            jnp.asarray([own_goal_x + direction * 0.30, -0.40]),
-            jnp.asarray([own_goal_x + direction * 0.30, 0.40]),
+            jnp.asarray([own_goal_x + direction * 0.30, -direction * 0.40]),
+            jnp.asarray([own_goal_x + direction * 0.30, direction * 0.40]),
         )
     )
     goal_kick_opponents = jnp.stack(
         (
-            jnp.asarray([-direction * (config.ROBOT_SIZE / 2.0), 0.30]),
-            jnp.asarray([direction * 0.28, -0.35]),
-            jnp.asarray([direction * 0.28, 0.35]),
+            jnp.asarray([-direction * (config.ROBOT_SIZE / 2.0), direction * 0.30]),
+            jnp.asarray([direction * 0.28, -direction * 0.35]),
+            jnp.asarray([direction * 0.28, direction * 0.35]),
         )
     )
     goal_kick_robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), jnp.float32)
@@ -110,8 +113,8 @@ def _restart_positions(
     free_kick_team = jnp.stack(
         (
             free_kick_kicker,
-            jnp.stack((support_x, jnp.clip(free_kick_ball[1] - 0.30, -0.55, 0.55))),
-            jnp.stack((support_x, jnp.clip(free_kick_ball[1] + 0.30, -0.55, 0.55))),
+            jnp.stack((support_x, jnp.clip(free_kick_ball[1] - direction * 0.30, -0.55, 0.55))),
+            jnp.stack((support_x, jnp.clip(free_kick_ball[1] + direction * 0.30, -0.55, 0.55))),
         )
     )
     defending_goalkeeper = jnp.asarray(
@@ -122,8 +125,8 @@ def _restart_positions(
     free_kick_defending = jnp.stack(
         (
             defending_goalkeeper,
-            jnp.asarray([defensive_x, -0.25]),
-            jnp.asarray([defensive_x, 0.25]),
+            jnp.asarray([defensive_x, -direction * 0.25]),
+            jnp.asarray([defensive_x, direction * 0.25]),
         )
     )
     free_kick_robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), jnp.float32)
@@ -177,7 +180,7 @@ def _restart_positions(
     center_formation = jnp.asarray(
         [
             [[-0.28, 0.0], [-0.40, -0.30], [-0.40, 0.30]],
-            [[0.28, 0.0], [0.40, -0.30], [0.40, 0.30]],
+            [[0.28, 0.0], [0.40, 0.30], [0.40, -0.30]],
         ]
     )
     free_ball_mark = jnp.where(free_ball_stage >= 2, jnp.zeros(2), free_ball_mark)

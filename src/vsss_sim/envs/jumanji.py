@@ -270,7 +270,9 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             dt=self.control_dt,
             sub_steps=self.physics_substeps,
         )
-        goal = physics_info["goal"]
+        # A whistle freezes this interval; the referee discards its physics.
+        # Keep training goal metrics and terminations consistent with scoring.
+        goal = jnp.where(state.referee_state.phase == MatchPhase.STOPPED, 0, physics_info["goal"])
         match_step = self._match_rules.step(
             MatchStepInput(
                 simulation_before=state.simulation,

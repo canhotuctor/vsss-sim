@@ -148,8 +148,11 @@ def _illegal_push(simulation_before, simulation_after, initiated=None):
     return initiated & ~jnp.stack(legal_ball_push)
 
 
-def _free_ball_quadrant(ball: jax.Array) -> jax.Array:
-    return (ball[0] >= 0.0).astype(jnp.int32) + 2 * (ball[1] >= 0.0).astype(jnp.int32)
+def _free_ball_quadrant(ball: jax.Array, key: jax.Array) -> jax.Array:
+    """Resolve exact axis ties without preferring a fixed field corner."""
+    ties = jax.random.randint(jax.random.fold_in(key, 2046), (2,), 0, 2)
+    sides = jnp.where(ball[:2] == 0.0, ties, (ball[:2] > 0.0).astype(jnp.int32))
+    return sides[0] + 2 * sides[1]
 
 
 def _resolve_referee(
@@ -158,9 +161,20 @@ def _resolve_referee(
     previous: RefereeState,
     goal: jax.Array,
     dt: jax.Array | None = None,
+    tie_break_key: jax.Array | None = None,
 ) -> _RefereeDecision:
     """Resolve fouls, goalkeeper possession, and ball-stoppage restarts."""
     dt = jnp.float32(config.DT) if dt is None else jnp.asarray(dt, dtype=jnp.float32)
+    # Both teams can initiate separate fouls in one control interval. A plain
+    # argmax always chooses team zero in that case. Use the match's seeded key to
+    # give either eligible team equal priority, preserving unique decisions.
+    key = jax.random.PRNGKey(0) if tie_break_key is None else tie_break_key
+    priority_team = jax.random.randint(jax.random.fold_in(key, 1053), (), 0, config.N_TEAMS)
+
+    def choose_team(candidates):
+        return jnp.where(
+            jnp.all(candidates), priority_team, jnp.argmax(candidates.astype(jnp.int32))
+        )
     areas_before = _goal_area_membership(simulation_before.robots)
     areas_after = _goal_area_membership(simulation.robots)
     area_seconds = jnp.where(
@@ -237,8 +251,8 @@ def _resolve_referee(
     primary_attackers = jnp.stack(primary_attackers)
     has_attacking_violation = jnp.any(attacking_violations)
     has_defending_violation = jnp.any(defending_violations)
-    attacking_team = 1 - jnp.argmax(attacking_violations.astype(jnp.int32))
-    defending_team = jnp.argmax(defending_violations.astype(jnp.int32))
+    attacking_team = 1 - choose_team(attacking_violations)
+    defending_team = choose_team(defending_violations)
 
     # The goalkeeper is the longest-standing robot in its own goal area.
     goalkeeper_indices = []
@@ -285,7 +299,7 @@ def _resolve_referee(
     )
     goalkeeper_timeouts = hold_seconds >= _RULE_TIMEOUT_SECONDS - 1e-6
     has_goalkeeper_timeout = jnp.any(goalkeeper_timeouts)
-    timeout_team = jnp.argmax(goalkeeper_timeouts.astype(jnp.int32))
+    timeout_team = choose_team(goalkeeper_timeouts)
 
     ball_side = jnp.argmax(ball_areas.astype(jnp.int32))
     goalkeeper_index = goalkeeper_indices[ball_side]
@@ -335,11 +349,11 @@ def _resolve_referee(
     push_hits = _illegal_push(simulation_before, simulation, initiated)
     push_by_team = jnp.any(push_hits, axis=(1, 2))
     has_personal_foul = jnp.any(push_by_team)
-    personal_foul_team = jnp.argmax(push_by_team.astype(jnp.int32))
+    personal_foul_team = choose_team(push_by_team)
 
     goal_event = goal != 0
     has_goalkeeper_block = jnp.any(goalkeeper_blocks)
-    goalkeeper_blocking_team = jnp.argmax(goalkeeper_blocks.astype(jnp.int32))
+    goalkeeper_blocking_team = choose_team(goalkeeper_blocks)
     event = jnp.where(
         goal_event,
         jnp.int32(RefereeEvent.GOAL),
@@ -451,7 +465,7 @@ def _resolve_referee(
     stopped_quadrant = jnp.where(
         previous.field_impasse_seconds > 0,
         previous.field_impasse_quadrant,
-        _free_ball_quadrant(simulation.ball),
+        _free_ball_quadrant(simulation.ball, key),
     )
     quadrant = jnp.where(
         event == RefereeEvent.FIELD_IMPASSE,

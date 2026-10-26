@@ -239,6 +239,7 @@ class MatchRules:
             referee_state,
             effective_goal,
             reward_context.dt,
+            tie_break_key=context.kickoff_key,
         )
         event = jnp.where(resuming, jnp.int32(RefereeEvent.NONE), decision.event).astype(jnp.int32)
         offending_team = jnp.where(resuming, jnp.int32(-1), decision.offending_team)
