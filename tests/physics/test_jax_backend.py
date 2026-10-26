@@ -1,6 +1,7 @@
 """Tests for the JAX physics engine."""
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from vsss_sim import config
@@ -283,3 +284,34 @@ class TestStep:
         s2, info = step_jit(s, a)
         assert s2.robots.shape == s.robots.shape
         assert "goal" in info
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_step_with_frames_matches_step_and_exposes_each_substep(seed):
+    state = jb.reset_random(jax.random.PRNGKey(seed))
+    actions = jax.random.uniform(jax.random.PRNGKey(seed + 10), (2, 3, 2), minval=-1, maxval=1)
+
+    expected, info = jb.step(state, actions)
+    final, frame_info, frames = jb.step_with_frames(state, actions)
+
+    for name in ("ball", "robots", "wheel_speeds", "t"):
+        np.testing.assert_allclose(getattr(final, name), getattr(expected, name), atol=1e-6)
+    assert int(frame_info["goal"]) == int(info["goal"])
+    assert frames.robots.shape == (config.SUB_STEPS,) + state.robots.shape
+    np.testing.assert_allclose(frames.robots[-1], final.robots, atol=1e-6)
+    np.testing.assert_allclose(frames.ball[-1], final.ball, atol=1e-6)
+    # Each sub-step moves the driven robots: the frames are distinct states.
+    assert np.all(np.abs(np.diff(np.asarray(frames.robots[..., :2]), axis=0)).sum(axis=(1, 2, 3)) > 0)
+
+
+def test_step_with_frames_freezes_after_a_goal():
+    state = jb.empty_state()._replace(ball=jnp.asarray([0.74, 0.0, 1.2, 0.0]))
+
+    final, info, frames = jb.step_with_frames(state, jnp.zeros((2, 3, 2)))
+
+    goals = np.asarray(info["goals"])
+    assert int(info["goal"]) == 1 and np.count_nonzero(goals) == 1
+    first = int(np.flatnonzero(goals)[0])
+    for later in range(first + 1, config.SUB_STEPS):
+        np.testing.assert_array_equal(frames.ball[later], frames.ball[first])
+    np.testing.assert_array_equal(final.ball, frames.ball[first])

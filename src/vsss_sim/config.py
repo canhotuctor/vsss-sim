@@ -30,6 +30,19 @@ class RewardProfile(str, Enum):
     DEFAULT = "default"
     BRANDAO_REWARD = "brandao_reward"
 
+
+class RefereeMode(str, Enum):
+    """Referee calls enforced during a match.
+
+    OFF        : goals only; play never stops for fouls or stoppages.
+    SIMPLIFIED : free balls for a stuck ball anywhere, plus the two-robot
+                 goal-area fouls (Rules 9.2.1 and 9.2.2).
+    FULL       : every implemented rulebook call (default).
+    """
+    OFF = "off"
+    SIMPLIFIED = "simplified"
+    FULL = "full"
+
 # Field (all dimensions in metres)
 FIELD_LENGTH: float = 1.50   # x-axis extent (150 cm)
 FIELD_WIDTH: float = 1.30    # y-axis extent (130 cm)
@@ -92,15 +105,15 @@ ROBOT_MAX_WHEEL_SPEED: float = ROBOT_MAX_MOTOR_SPEED * ROBOT_WHEEL_RADIUS  # ≈
 # Maximum wheel-speed change rate (m/s²). Wheel commands are slewed toward the
 # target each physics sub-step at this rate, modelling motor torque limits and
 # producing smoother (less jerky) trajectories. 1 g ≈ 9.81 m/s² is a typical
-# bound for VSSS-class robots; 0 → max takes ~133 ms (~8 control steps).
+# bound for VSSS-class robots; 0 → max takes ~133 ms (~8 physics sub-steps).
 ROBOT_WHEEL_ACCEL_LIMIT: float = 1.0 * 9.81  # m/s² (≈ 1 g)
 
 # Simulation
-FPS: float = 15.0           # control loop frequency in-game (Hz)
+FPS: float = 10.0           # control loop frequency in-game (Hz)
 DT: float = 1.0 / FPS       # control loop timestep in-game (s)
-SUB_STEPS: int = 4          # number of physics sub-steps per control loop step
+SUB_STEPS: int = 6          # physics sub-steps per control step (60 Hz physics)
 
-MAX_EPISODE_STEPS: int = 300  # 20 s at 15 Hz (config.FPS control steps)
+MAX_EPISODE_STEPS: int = 200  # 20 s at 10 Hz (config.FPS control steps)
 KICKOFF_CLEAR_DIST: float = 0.20  # minimum robot distance from centre at kickoff
 
 # Reward shaping

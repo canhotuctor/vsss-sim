@@ -13,7 +13,7 @@ import numpy as np
 from flax import serialization
 
 from vsss_sim import config
-from vsss_sim.config import InitMode, RewardProfile
+from vsss_sim.config import InitMode, RefereeMode, RewardProfile
 from vsss_sim.envs import VSSEnv
 from vsss_sim.envs.brandao_observation import (
     advance_history,
@@ -57,13 +57,10 @@ def load_snapshot(snapshot_path: Path):
     return model, params, metadata, experiment_config
 
 
-def resolve_simulation_timing(
-    experiment_config: dict, policy_architecture: str
-) -> tuple[float, int]:
+def resolve_simulation_timing(experiment_config: dict) -> tuple[float, int]:
     """Resolve the archived control cadence, including legacy config defaults."""
-    is_brandao = policy_architecture in ("brandao_shared", "brandao_sets")
-    default_rate_hz = 10.0 if is_brandao else config.FPS
-    default_substeps = 6 if is_brandao else config.SUB_STEPS
+    default_rate_hz = config.FPS
+    default_substeps = config.SUB_STEPS
 
     if experiment_config.get("control_rate_hz") is not None:
         control_rate_hz = experiment_config["control_rate_hz"]
@@ -127,6 +124,11 @@ def main() -> None:
     parser.add_argument(
         "--reward-profile", choices=tuple(profile.value for profile in RewardProfile)
     )
+    parser.add_argument(
+        "--referee-mode",
+        choices=tuple(mode.value for mode in RefereeMode),
+        help="Referee calls; defaults to the experiment's mode, or full.",
+    )
     args = parser.parse_args()
     if args.episodes < 1:
         parser.error("episodes must be positive")
@@ -143,15 +145,16 @@ def main() -> None:
     )
     policy_architecture = metadata.get("policy_architecture", "joint")
     try:
-        control_rate_hz, physics_substeps = resolve_simulation_timing(
-            experiment_config, policy_architecture
-        )
+        control_rate_hz, physics_substeps = resolve_simulation_timing(experiment_config)
     except ValueError as error:
         parser.error(str(error))
     policy_episode_steps = max_episode_steps
     init_mode = args.init_mode or experiment_config.get("init_mode", InitMode.KICKOFF.value)
     reward_profile = args.reward_profile or experiment_config.get(
         "reward_profile", RewardProfile.DEFAULT.value
+    )
+    referee_mode = args.referee_mode or experiment_config.get(
+        "referee_mode", RefereeMode.FULL.value
     )
     env = VSSEnv(
         opponent_policy=args.opponent,
@@ -162,13 +165,28 @@ def main() -> None:
         max_episode_steps=max_episode_steps,
         init_mode=init_mode,
         reward_profile=reward_profile,
+        referee_mode=referee_mode,
     )
     key = jax.random.PRNGKey(args.seed)
+    # Compile per-decision work once; eager dispatch stalls the sub-step frames.
+    policy_apply = jax.jit(model.apply)
+    entity_ordered_actions = policy_architecture == "brandao_sets"
+
+    @jax.jit
+    def next_history(history, simulation, previous_actions, remaining, sample_key):
+        features = build_agent_features(
+            simulation,
+            previous_actions,
+            remaining,
+            sample_key,
+            entity_ordered_actions=entity_ordered_actions,
+        )
+        return advance_history(history, features, jnp.asarray(True))
 
     def action_for(observation: np.ndarray) -> np.ndarray:
         nonlocal key
         if policy_architecture in ("brandao_shared", "brandao_sets"):
-            first, second, _ = model.apply(
+            first, second, _ = policy_apply(
                 params, jnp.asarray(observation, dtype=jnp.float32)
             )
             if args.stochastic:
@@ -178,7 +196,7 @@ def main() -> None:
             else:
                 action = 2.0 * first / (first + second) - 1.0
             return np.asarray(jax.device_get(action), dtype=np.float32)
-        mean, log_std, _ = model.apply(params, jnp.asarray(observation, dtype=jnp.float32))
+        mean, log_std, _ = policy_apply(params, jnp.asarray(observation, dtype=jnp.float32))
         raw_action = mean
         if args.stochastic:
             key, sample_key = jax.random.split(key)
@@ -190,7 +208,7 @@ def main() -> None:
         f"— architecture={policy_architecture}, opponent={args.opponent}, "
         f"control={control_rate_hz:g} Hz × {physics_substeps} substeps, "
         f"speedup cap={args.speedup_rate:g}x, init={init_mode}, "
-        f"stochastic={args.stochastic}"
+        f"referee={referee_mode}, stochastic={args.stochastic}"
     )
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
@@ -208,7 +226,7 @@ def main() -> None:
                     previous_actions,
                     jnp.float32(1.0),
                     observation_key,
-                    entity_ordered_actions=policy_architecture == "brandao_sets",
+                    entity_ordered_actions=entity_ordered_actions,
                 )
                 history = initialize_history(first_features)
                 policy_steps = 0
@@ -239,15 +257,8 @@ def main() -> None:
                             1.0 - policy_steps / policy_episode_steps
                         )
                         observation_key, sample_key = jax.random.split(observation_key)
-                        features = build_agent_features(
-                            env._state,
-                            previous_actions,
-                            remaining,
-                            sample_key,
-                            entity_ordered_actions=policy_architecture == "brandao_sets",
-                        )
-                        history = advance_history(
-                            history, features, jnp.asarray(True)
+                        history = next_history(
+                            history, env._state, previous_actions, remaining, sample_key
                         )
                 steps = policy_steps
             else:

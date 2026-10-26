@@ -8,7 +8,7 @@ from pathlib import Path
 
 import jax
 
-from ..config import RewardProfile
+from ..config import MAX_EPISODE_STEPS, RefereeMode, RewardProfile
 from ..envs.jumanji import VSSJumanjiEnv
 from .ppo import PPO, PPOConfig
 from .self_play import ExperimentConfig, run_experiment
@@ -61,12 +61,17 @@ def _legacy_train(args: argparse.Namespace) -> None:
         max_episode_steps=(
             args.max_episode_steps
             if args.max_episode_steps is not None
-            else (400 if policy_architecture in ("brandao_shared", "brandao_sets") else 300)
+            else (
+                400
+                if policy_architecture in ("brandao_shared", "brandao_sets")
+                else MAX_EPISODE_STEPS
+            )
         ),
         init_mode=args.init_mode,
         terminate_on_goal=policy_architecture in ("brandao_shared", "brandao_sets"),
         reward_profile=reward_profile,
         policy_architecture=policy_architecture,
+        referee_mode=args.referee_mode or RefereeMode.FULL.value,
     )
     trainer = PPO(env, config)
 
@@ -139,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(profile.value for profile in RewardProfile),
         help="Team reward rules; an override for experiment JSON when using --xp.",
     )
+    parser.add_argument(
+        "--referee-mode",
+        choices=tuple(mode.value for mode in RefereeMode),
+        help="Referee calls (default full); an override for experiment JSON when using --xp.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
@@ -160,6 +170,8 @@ def main() -> None:
         overrides["num_envs_per_lineage"] = args.num_envs_per_lineage
     if args.reward_profile is not None:
         overrides["reward_profile"] = args.reward_profile
+    if args.referee_mode is not None:
+        overrides["referee_mode"] = args.referee_mode
     if args.policy_architecture is not None:
         overrides["policy_architecture"] = args.policy_architecture
         if args.mirror_augmentation is None:

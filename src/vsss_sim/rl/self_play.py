@@ -15,7 +15,7 @@ import numpy as np
 from flax import serialization
 
 from .. import config as sim_config
-from ..config import InitMode, RewardProfile
+from ..config import InitMode, RefereeMode, RewardProfile
 from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
 from ..envs.jumanji import VSSJumanjiEnv
 from ..envs.match_referee import RefereeEvent
@@ -99,10 +99,11 @@ class ExperimentConfig:
     initial_policy_snapshot: str | None = None
     initial_opponent_snapshot: str | None = None
     active_pool_limit: int | None = None
-    max_episode_steps: int = 300
+    max_episode_steps: int = sim_config.MAX_EPISODE_STEPS
     terminate_on_goal: bool = False
     init_mode: str = "kickoff"
     reward_profile: str = RewardProfile.DEFAULT.value
+    referee_mode: str = RefereeMode.FULL.value
     policy_architecture: str = "joint"
     mirror_augmentation: bool | None = None
     opponent_update_threshold: float = 0.6
@@ -167,17 +168,9 @@ class ExperimentConfig:
                 "initial_opponent_snapshot is only supported for Brandao policies"
             )
         if self.control_rate_hz is None:
-            object.__setattr__(
-                self,
-                "control_rate_hz",
-                10.0 if is_brandao_policy else sim_config.FPS,
-            )
+            object.__setattr__(self, "control_rate_hz", sim_config.FPS)
         if self.physics_substeps is None:
-            object.__setattr__(
-                self,
-                "physics_substeps",
-                6 if is_brandao_policy else sim_config.SUB_STEPS,
-            )
+            object.__setattr__(self, "physics_substeps", sim_config.SUB_STEPS)
         if (
             self.control_rate_hz is None
             or isinstance(self.control_rate_hz, bool)
@@ -211,9 +204,8 @@ class ExperimentConfig:
                 raise ValueError(
                     "Brandao per-robot policies use the paper's 300/200/100 actor layers"
                 )
-            # Brandão's policy runs at 10 Hz and training episodes end at a
-            # goal or after 40 seconds.
-            if self.max_episode_steps == 300:
+            # Brandão's training episodes end at a goal or after 40 seconds.
+            if self.max_episode_steps == sim_config.MAX_EPISODE_STEPS:
                 object.__setattr__(self, "max_episode_steps", 400)
             if not self.terminate_on_goal:
                 object.__setattr__(self, "terminate_on_goal", True)
@@ -234,6 +226,12 @@ class ExperimentConfig:
             choices = ", ".join(profile.value for profile in RewardProfile)
             raise ValueError(f"reward_profile must be one of: {choices}") from error
         object.__setattr__(self, "reward_profile", profile.value)
+        try:
+            referee_mode = RefereeMode(self.referee_mode)
+        except ValueError as error:
+            choices = ", ".join(mode.value for mode in RefereeMode)
+            raise ValueError(f"referee_mode must be one of: {choices}") from error
+        object.__setattr__(self, "referee_mode", referee_mode.value)
         # Reuse the trainer's validation before initializing a device or allocating state.
         self.ppo_config()
 
@@ -427,6 +425,7 @@ def _make_env(config: ExperimentConfig) -> Any:
         policy_architecture=config.policy_architecture,
         control_rate_hz=config.control_rate_hz,
         physics_substeps=config.physics_substeps,
+        referee_mode=config.referee_mode,
     )
 
 

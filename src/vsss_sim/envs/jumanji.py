@@ -18,7 +18,7 @@ from jumanji.env import Environment
 from jumanji.types import TimeStep, restart, termination, transition, truncation
 
 from .. import config
-from ..config import InitMode, RewardProfile
+from ..config import InitMode, RefereeMode, RewardProfile
 from ..perspective import switch_team_perspective
 from ..physics import jax_backend as physics
 from .brandao_observation import (
@@ -75,6 +75,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         policy_architecture: str = "joint",
         control_rate_hz: float | None = None,
         physics_substeps: int | None = None,
+        referee_mode: RefereeMode | str = RefereeMode.FULL,
     ) -> None:
         if opponent_policy not in ("stationary", "random"):
             raise ValueError(
@@ -99,7 +100,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             "brandao_sets",
         )
         if control_rate_hz is None:
-            control_rate_hz = 10.0 if self.individual_agent_rewards else config.FPS
+            control_rate_hz = config.FPS
         if isinstance(control_rate_hz, bool):
             raise ValueError("control_rate_hz must be a positive finite number")
         try:
@@ -111,7 +112,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         if not math.isfinite(control_rate_hz) or control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be a positive finite number")
         if physics_substeps is None:
-            physics_substeps = 6 if self.individual_agent_rewards else config.SUB_STEPS
+            physics_substeps = config.SUB_STEPS
         if (
             isinstance(physics_substeps, bool)
             or not isinstance(physics_substeps, (int, float))
@@ -144,6 +145,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             init_mode=self.init_mode,
             kickoff_on_goal=not self.terminate_on_goal,
             individual_agent_rewards=self.individual_agent_rewards,
+            referee_mode=referee_mode,
         )
         self._reset_simulation = (
             physics.reset_kickoff

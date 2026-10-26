@@ -11,7 +11,7 @@
   "seed": 2600,
   "snapshot_interval": 10,
   "active_pool_limit": null,
-  "max_episode_steps": 300,
+  "max_episode_steps": 200,
   "init_mode": "kickoff",
   "output_root": "outputs/experiments",
   "evaluation_matches": 100,

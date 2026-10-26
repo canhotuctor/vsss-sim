@@ -131,8 +131,9 @@ def test_push_into_area_is_exempt_until_defender_leaves():
     continued = step(contest, referee=entered.referee_state)
     assert int(continued.event) == RefereeEvent.NONE
     assert bool(continued.referee_state.defender_pushed_in[0, 1])
-    # Without a preceding forced entry the same second-player touch is a penalty.
-    assert int(step(contest).event) == RefereeEvent.DEFENDER_GOAL_AREA
+    # Without a preceding forced entry the same second-player touch is a
+    # defender foul; the attackers play the advantage before the penalty.
+    assert int(step(contest).referee_state.advantage_team) == 1
     left = contest._replace(robots=contest.robots.at[0, 1, :2].set(jnp.asarray([-0.4, 0.3])))
     assert not bool(
         step(left, referee=continued.referee_state).referee_state.defender_pushed_in[0, 1]
@@ -146,7 +147,8 @@ def test_voluntary_area_entry_near_an_opponent_is_not_a_push_exemption():
     before = before._replace(robots=robots)
     after = before._replace(robots=robots.at[0, 1, 0].set(-0.66))
     result = step(before, after)
-    assert int(result.event) == RefereeEvent.DEFENDER_GOAL_AREA
+    assert int(result.event) == RefereeEvent.NONE
+    assert int(result.referee_state.advantage_team) == 1
 
 
 @pytest.mark.parametrize("kind", ["possession", "impasse"])

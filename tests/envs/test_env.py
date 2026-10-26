@@ -28,6 +28,66 @@ def env_random_opp():
 
 
 # ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+class TestRendering:
+    def test_human_mode_draws_every_substep_of_the_same_physics(self, monkeypatch):
+        pytest.importorskip("pygame")
+        from vsss_sim.rendering import VSSRenderer
+
+        frames = []
+        monkeypatch.setattr(
+            VSSRenderer, "render",
+            lambda self, ball, robots, score, **kwargs: frames.append(np.array(robots)),
+        )
+        human = VSSEnv(opponent_policy="stationary", render_mode="human")
+        plain = VSSEnv(opponent_policy="stationary")
+        action = np.full(6, 0.8, dtype=np.float32)
+        human.reset(seed=3)
+        plain.reset(seed=3)
+
+        human.step(action)
+        plain.step(action)
+
+        assert len(frames) == config.SUB_STEPS
+        assert all(not np.allclose(a, b) for a, b in zip(frames, frames[1:]))
+        np.testing.assert_allclose(frames[-1], np.asarray(plain._state.robots), atol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(human._state.robots), np.asarray(plain._state.robots), atol=1e-6
+        )
+        human.close()
+        plain.close()
+
+    def test_frame_pacing_absorbs_slow_frames_and_restarts_after_stalls(self, monkeypatch):
+        pytest.importorskip("pygame")
+        from types import SimpleNamespace
+
+        from vsss_sim.rendering import pygame as rendering
+
+        now, sleeps = [0.0], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        monkeypatch.setattr(
+            rendering, "time", SimpleNamespace(perf_counter=lambda: now[0], sleep=sleep)
+        )
+        renderer = rendering.VSSRenderer(render_mode="human", fps=100.0)
+
+        renderer._pace(1)
+        now[0] += 0.015  # a slow frame
+        renderer._pace(1)
+        renderer._pace(1)
+        assert sleeps == pytest.approx([0.01, 0.005])
+
+        now[0] += 1.0  # a stall: restart the schedule rather than racing ahead
+        renderer._pace(2)
+        assert sleeps[-1] == pytest.approx(0.02)
+
+
+# ---------------------------------------------------------------------------
 # Spaces
 # ---------------------------------------------------------------------------
 

@@ -90,6 +90,40 @@ def test_brandao_set_architecture_enables_invariant_encoder_and_mirror_augmentat
     assert env.action_spec.shape == (3, 2)
 
 
+@pytest.mark.parametrize(
+    "policy_architecture, episode_steps",
+    [("joint", 200), ("brandao_shared", 400), ("brandao_sets", 400)],
+)
+def test_every_architecture_defaults_to_10hz_control(policy_architecture, episode_steps):
+    config = ExperimentConfig(
+        experiment_name="cadence",
+        num_generations=1,
+        policy_architecture=policy_architecture,
+    )
+    env = _make_env(config)
+
+    assert (config.control_rate_hz, config.physics_substeps) == (10.0, 6)
+    assert (env.control_rate_hz, env.physics_substeps) == (10.0, 6)
+    assert config.max_episode_steps == episode_steps
+
+
+@pytest.mark.parametrize("referee_mode", ["off", "simplified", "full"])
+def test_referee_mode_round_trips_and_reaches_environment(referee_mode):
+    config = ExperimentConfig(
+        experiment_name="referee", num_generations=1, referee_mode=referee_mode
+    )
+    restored = ExperimentConfig.from_dict(config.to_dict())
+
+    assert restored.referee_mode == referee_mode
+    assert _make_env(restored)._match_rules.referee_mode.value == referee_mode
+
+
+def test_experiment_config_defaults_to_full_referee_and_rejects_unknown_modes():
+    assert ExperimentConfig(experiment_name="referee", num_generations=1).referee_mode == "full"
+    with pytest.raises(ValueError, match="referee_mode"):
+        ExperimentConfig(experiment_name="referee", num_generations=1, referee_mode="strict")
+
+
 def test_experiment_config_rejects_unknown_reward_profile():
     with pytest.raises(ValueError, match="reward_profile"):
         ExperimentConfig(
@@ -491,7 +525,7 @@ def test_short_evaluation_writes_long_match_metrics(tmp_path):
     )
     result = json.loads(result_path.read_text())
 
-    assert result["control_steps"] == 15
+    assert result["control_steps"] == 10  # one second at the default 10 Hz
     assert result["reward_profile"] == "brandao_reward"
     assert [item["opponent_type"] for item in result["results"]] == [
         "history",

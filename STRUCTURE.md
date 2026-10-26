@@ -208,19 +208,19 @@ For `VSSVecEnv`, every state and interface shape above gains a leading batch dim
 For native PPO, `jax.vmap` adds that dimension to `VSSJumanjiEnv.State`, while `lax.scan` adds
 the rollout dimension `T` to stored transitions.
 
-## 6. Physics step: 15 Hz control, 4 sub-steps
+## 6. Physics step: 10 Hz control, 6 sub-steps
 
-A policy selects target wheel speeds once per 1/15-second control step. The physics engine
-splits that interval into four smaller steps for smoother acceleration and more reliable
-collision handling. These are the joint-policy defaults; the Brandão policies use 10 Hz control
-with six sub-steps. Environments and experiment configurations set both values explicitly with
-`control_rate_hz` and `physics_substeps`.
+A policy selects target wheel speeds once per 1/10-second control step. The physics engine
+splits that interval into six smaller steps (60 Hz physics) for smoother acceleration and more
+reliable collision handling. Every policy architecture uses these defaults. Environments and
+experiment configurations set both values explicitly with `control_rate_hz` and
+`physics_substeps`.
 
 ```mermaid
 flowchart TD
     command["Normalized wheel commands<br/>clip to [-1, 1]"]
     target["Scale by max wheel speed"]
-    repeat{{"Repeat 4 physics sub-steps"}}
+    repeat{{"Repeat 6 physics sub-steps"}}
     slew["Slew current wheel speeds<br/>toward targets using acceleration limit"]
     drive["Differential-drive kinematics<br/>left/right wheels -> vx, vy, omega"]
     integrateRobots["Integrate robot position + heading"]
@@ -232,17 +232,19 @@ flowchart TD
     ballChamfers["Resolve ball-corner chamfers"]
     ballrobots["Resolve ball-robot collisions<br/>circle vs oriented box"]
     robotrobots["Resolve robot-robot collisions<br/>oriented box SAT"]
-    done["Advance simulation time by 1/15 s<br/>return first goal event"]
+    done["Advance simulation time by 1/10 s<br/>return first goal event"]
 
     command --> target --> repeat
     repeat --> slew --> drive --> integrateRobots --> friction --> integrateBall
     integrateBall --> walls --> robotChamfers --> ballwalls --> ballChamfers --> ballrobots --> robotrobots
     robotrobots -->|"next sub-step"| repeat
-    repeat -->|"after 4"| done
+    repeat -->|"after 6"| done
 ```
 
 State is an immutable float32 `NamedTuple` PyTree. `step` returns a new state, uses
 `lax.fori_loop` for substeps, and can be transformed directly with `jax.jit` and `jax.vmap`.
+`step_with_frames` runs the same sub-steps with `lax.scan` and also returns the state after each
+one, which human rendering draws.
 
 ## 7. Match and reset lifecycle
 
@@ -265,8 +267,7 @@ stateDiagram-v2
     Truncated --> EpisodeReset: caller reset or autoreset
 ```
 
-`max_episode_steps` is 300 for the joint policy (20 s at 15 Hz) and 400 for the Brandão policies
-(40 s at 10 Hz).
+`max_episode_steps` is 200 for the joint policy (20 s) and 400 for the Brandão policies (40 s).
 
 `InitMode.KICKOFF` uses the standard formation with jitter. `InitMode.RANDOM` samples the ball
 and all robots across the field with random headings; overlaps are allowed and left for physics
@@ -277,8 +278,9 @@ to resolve.
 These details matter when comparing trajectories across execution paths:
 
 - `VSSEnv` supports rendering; `VSSVecEnv` currently does not.
-- Human rendering advances and draws each physics sub-step. Non-human stepping runs one engine
-  call for the whole control step.
+- Every mode runs one engine call per control step. Human rendering uses `step_with_frames`
+  to draw each physics sub-step of that call, paced against wall-clock deadlines so a slow
+  frame shortens the following ones rather than slowing playback.
 - A goal kickoff creates fresh placement but preserves match score and simulation time in all
   environment adapters. Episode step counts continue through in-match kickoffs.
 - Shared `MatchRules` computes reward from the post-physics state before kickoff, then returns an
@@ -294,31 +296,41 @@ These details matter when comparing trajectories across execution paths:
 ### Referee events and restarts
 
 `match_referee.py` infers rulebook calls from the 2D state before and after physics. It carries
-per-match timers in `RefereeState`, and the PPO metrics count each event per rollout. When
+per-match timers in `RefereeState`, and the PPO metrics count each event per rollout. Every rule
+timer is 5 s, and a ball at or below 0.1 m/s counts as stuck (VSSReferee's threshold). When
 several calls apply in the same step, the first row below wins.
 
 | Event | Condition | Restart |
 |---|---|---|
 | `GOAL` | ball crosses a goal line | kickoff for the conceding team, or episode end |
-| `DEFENDER_GOAL_AREA` | a second defender takes part in play inside its own goal area | penalty kick for the attackers |
+| `DEFENDER_GOAL_AREA` | a second defender takes part in play inside its own goal area; the attackers play on until the attack ends without a goal, 5 s pass, or another call stops play | penalty kick for the attackers |
 | `ATTACKER_GOAL_AREA` | two attackers in the opponent's goal area during a contested ball | goal kick for the defenders |
-| `GOALKEEPER_BLOCK` | an attacker in the goal area closes on the goalkeeper without a ball contest | goal kick for the defenders |
-| `GOALKEEPER_TIMEOUT` | goalkeeper holds the ball uncontested for 10 s | penalty kick for the attackers |
-| `PERSONAL_FOUL` | a robot pushes an opponent during a goal-area play | penalty kick, goal kick, or free kick, depending on where the offender stands |
-| `GOAL_AREA_IMPASSE` | contested ball stuck in a goal area for 10 s | goal kick for the area's team |
-| `GOAL_AREA_STOPPED_BALL` | uncontested ball at rest (below 1 mm/s) in a goal area for 5 s | penalty kick against the area's team |
-| `FIELD_IMPASSE` | ball at rest (below 1 mm/s) outside the goal areas for 5 s | free ball in the ball's quadrant |
+| `GOALKEEPER_BLOCK` | an attacker in the goal area commits a personal foul (next row) on the goalkeeper; ordinary contact with the goalkeeper plays on | goal kick for the defenders |
+| `GOALKEEPER_TIMEOUT` | goalkeeper holds the ball uncontested for 5 s | penalty kick for the attackers |
+| `PERSONAL_FOUL` | an avoidable, one-sided collision anywhere: a fresh impact at 0.6 m/s or more on a robot within 20 cm of the ball, or at 0.9 m/s or more anywhere, or a push or pin lasting 1 s; never during a ball dispute | free kick for the fouled team |
+| `GOAL_AREA_IMPASSE` | contested ball stuck in a goal area for 5 s | goal kick for the area's team |
+| `GOAL_AREA_STOPPED_BALL` | uncontested ball stuck in a goal area for 5 s | penalty kick against the area's team |
+| `FIELD_IMPASSE` | ball stuck outside the goal areas for 5 s | free ball in the ball's quadrant |
+
+A personal foul also needs the victim to have spent 0.2 s in the offender's forward lane, so a
+robot that cuts across a driving opponent cannot draw it. Drive speeds come from wheel speeds.
+
+`RefereeMode` selects which calls apply. `full` (default) uses every row above. `simplified`
+keeps only the two-robot goal-area fouls and frees a ball stuck anywhere, including inside a goal
+area, with `FIELD_IMPASSE`. `off` stops play only for goals. All adapters and experiment
+configurations accept `referee_mode`.
 
 `match_restarts.py` places deterministic formations for each restart. A free kick is taken from
-the foul spot. Its formation is spread so no robot starts within 10 cm of the ball, any two robots
-start at least one robot diagonal apart, and every robot is inside the walls and corner chamfers.
-After a whistle the match is `STOPPED` for one control step: all wheel commands are zeroed, that
+the TL mark, which is also the penalty mark. Its formation is spread so no robot starts within
+10 cm of the ball, any two robots start at least one robot diagonal apart, and every robot is
+inside the walls and corner chamfers. After a whistle the match is `STOPPED` for one control step: all wheel commands are zeroed, that
 step's physics result is discarded, and reward is zero.
 
 Under the Brandão reward profile, fouls (both goal-area violations, goalkeeper timeout, personal
-foul, goalkeeper block, and goal-area stopped ball) replace the step reward with −1 for the
-offending team and +1 for the other. The default profile instead adds ±1 when a penalty kick is
-awarded.
+foul, goalkeeper block, and goal-area stopped ball) replace the offending team's step reward
+with −1. The default profile instead adds −1 when the team concedes a penalty kick. Only the
+offender is penalized: the fouled team keeps its ordinary reward, since the restart is its
+gain. A defender foul's reward arrives when its penalty is awarded, after the advantage.
 
 ## 8. Source map
 
