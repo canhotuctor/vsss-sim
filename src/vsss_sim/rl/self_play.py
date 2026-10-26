@@ -106,6 +106,9 @@ class ExperimentConfig:
     policy_architecture: str = "joint"
     mirror_augmentation: bool | None = None
     opponent_update_threshold: float = 0.6
+    opponent_evaluation_interval: int = 1
+    opponent_update_score: str = "evaluation"
+    opponent_evaluation_matches: int | None = None
     output_root: str = "output/experiments"
     evaluation_matches: int = 100
     evaluation_seconds: int = 120
@@ -127,6 +130,7 @@ class ExperimentConfig:
             "update_epochs",
             "num_minibatches",
             "snapshot_interval",
+            "opponent_evaluation_interval",
             "max_episode_steps",
             "evaluation_matches",
             "evaluation_seconds",
@@ -145,6 +149,10 @@ class ExperimentConfig:
             raise ValueError(
                 "generation_offset requires an initial_policy_snapshot"
             )
+        if self.opponent_evaluation_matches is not None and self.opponent_evaluation_matches < 1:
+            raise ValueError("opponent_evaluation_matches must be at least 1 when provided")
+        if self.opponent_update_score not in ("evaluation", "training_rollout"):
+            raise ValueError("opponent_update_score must be evaluation or training_rollout")
         if self.opponent_update_threshold < 0.0:
             raise ValueError("opponent_update_threshold must be non-negative")
         if self.init_mode not in ("kickoff", "random"):
@@ -485,6 +493,13 @@ def _snapshot_generations(config: ExperimentConfig) -> set[int]:
             config.snapshot_interval,
         )
     )
+    if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
+        # A promotion archives its candidate even between regular checkpoints.
+        generations.update(range(
+            config.generation_offset + config.opponent_evaluation_interval,
+            config.generation_offset + config.num_generations + 1,
+            config.opponent_evaluation_interval,
+        ))
     generations.add(config.generation_offset + config.num_generations)
     return generations
 
@@ -653,7 +668,10 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
     trainer = PPO(env, config.ppo_config())
     opponent_evaluator = (
         _make_candidate_evaluator(env, trainer.model, config.policy_architecture)
-        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+        if (
+            config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+            and config.opponent_update_score == "evaluation"
+        )
         else None
     )
     archives = [
@@ -844,6 +862,12 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
     while completed < config.num_generations:
         until_snapshot = config.snapshot_interval - completed % config.snapshot_interval
         chunk_size = min(until_snapshot, config.num_generations - completed)
+        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
+            until_evaluation = (
+                config.opponent_evaluation_interval
+                - completed % config.opponent_evaluation_interval
+            )
+            chunk_size = min(chunk_size, until_evaluation)
         started = time.perf_counter()
         runners, history = trainer.train_lineages(
             runners,
@@ -960,6 +984,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                         else None
                     ),
                     "opponent_evaluated": False,
+                    "opponent_update_score": config.opponent_update_score,
                     "opponent_evaluation_sample_count": 0,
                     "opponent_evaluation_mean_goals_for": None,
                     "opponent_evaluation_mean_goals_against": None,
@@ -999,10 +1024,12 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
 
         should_snapshot = completed % config.snapshot_interval == 0
         is_final = completed == config.num_generations
-        if should_snapshot or is_final:
-            snapshot_generation = config.generation_offset + completed
+        snapshot_generation = config.generation_offset + completed
+
+        def save_snapshots(lineages):
             snapshot_started = time.perf_counter()
-            for lineage, archive in enumerate(archives):
+            for lineage in lineages:
+                archive = archives[lineage]
                 params = _extract_lineage(runners.train_state.params, lineage)
                 archive.save(
                     params,
@@ -1027,115 +1054,142 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                 },
             )
 
-            if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
-                replaced_any = False
-                for lineage, archive in enumerate(archives):
-                    candidate_params = _extract_lineage(
-                        runners.train_state.params, lineage
+        if should_snapshot or is_final:
+            save_snapshots(range(config.num_lineages))
+
+        should_evaluate = (
+            config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+            and (completed % config.opponent_evaluation_interval == 0 or is_final)
+        )
+        if should_evaluate:
+            replaced_any = False
+            for lineage, archive in enumerate(archives):
+                candidate_params = _extract_lineage(
+                    runners.train_state.params, lineage
+                )
+                opponent_generation = selected_opponent_generations[lineage]
+                evaluation_started = time.perf_counter()
+                record = metric_records[(snapshot_generation, lineage)]
+                evaluation_seed = None
+                if config.opponent_update_score == "training_rollout":
+                    scores = np.stack(
+                        (record["blue_goals_by_env"], record["yellow_goals_by_env"]),
+                        axis=1,
                     )
-                    opponent_generation = selected_opponent_generations[lineage]
+                else:
                     opponent_params = archive.load(
                         candidate_params,
                         opponent_generation,
                         expected_hidden_sizes=config.hidden_sizes,
                         expected_policy_architecture=config.policy_architecture,
                     )
+                    evaluation_matches = (
+                        config.opponent_evaluation_matches or config.evaluation_matches
+                    )
                     evaluation_seed = (
-                        config.seed
-                        + snapshot_generation * config.evaluation_matches
+                        config.seed + snapshot_generation * evaluation_matches
                         + lineage * 10_000_000
                     )
                     evaluation_seeds = jnp.arange(
-                        evaluation_seed,
-                        evaluation_seed + config.evaluation_matches,
+                        evaluation_seed, evaluation_seed + evaluation_matches,
                         dtype=jnp.uint32,
                     )
                     scores = opponent_evaluator(
                         candidate_params, opponent_params, evaluation_seeds
                     )
                     jax.block_until_ready(scores)
-                    evaluation = _opponent_evaluation_summary(
-                        np.asarray(scores), config.opponent_update_threshold
-                    )
-                    replaced = bool(evaluation["opponent_replaced"])
-                    if replaced:
-                        selected_opponent_generations[lineage] = snapshot_generation
-                        replaced_any = True
-                    record = metric_records[(snapshot_generation, lineage)]
-                    record.update(
-                        {
-                            "opponent_generation": opponent_generation,
-                            "opponent_evaluated": True,
-                            "opponent_evaluation_sample_count": evaluation[
-                                "evaluation_sample_count"
-                            ],
-                            "opponent_evaluation_mean_goals_for": evaluation[
-                                "mean_goals_for"
-                            ],
-                            "opponent_evaluation_mean_goals_against": evaluation[
-                                "mean_goals_against"
-                            ],
-                            "opponent_evaluation_mean_goal_delta": evaluation[
-                                "mean_goal_delta"
-                            ],
-                            "opponent_replaced": replaced,
-                            "selected_opponent_generation": (
-                                selected_opponent_generations[lineage]
-                            ),
-                        }
-                    )
-                    _write_json_line(
-                        performance_path,
-                        {
-                            "event": "opponent_evaluation",
-                            "generation": snapshot_generation,
-                            "lineage": lineage,
-                            "opponent_generation": opponent_generation,
-                            **evaluation,
-                            "update_threshold": config.opponent_update_threshold,
-                            "selected_opponent_generation": (
-                                selected_opponent_generations[lineage]
-                            ),
-                            "evaluation_seed": evaluation_seed,
-                            "policy_action_mode": "deterministic_mean",
-                        },
-                    )
+                evaluation = _opponent_evaluation_summary(
+                    np.asarray(scores), config.opponent_update_threshold
+                )
+                replaced = bool(evaluation["opponent_replaced"])
+                if replaced:
+                    if not (should_snapshot or is_final):
+                        save_snapshots([lineage])
+                    selected_opponent_generations[lineage] = snapshot_generation
+                    replaced_any = True
+                record = metric_records[(snapshot_generation, lineage)]
+                record.update(
+                    {
+                        "opponent_generation": opponent_generation,
+                        "opponent_evaluated": True,
+                        "opponent_evaluation_sample_count": evaluation[
+                            "evaluation_sample_count"
+                        ],
+                        "opponent_evaluation_mean_goals_for": evaluation[
+                            "mean_goals_for"
+                        ],
+                        "opponent_evaluation_mean_goals_against": evaluation[
+                            "mean_goals_against"
+                        ],
+                        "opponent_evaluation_mean_goal_delta": evaluation[
+                            "mean_goal_delta"
+                        ],
+                        "opponent_replaced": replaced,
+                        "selected_opponent_generation": (
+                            selected_opponent_generations[lineage]
+                        ),
+                    }
+                )
+                _write_json_line(
+                    performance_path,
+                    {
+                        "event": "opponent_evaluation",
+                        "seconds": time.perf_counter() - evaluation_started,
+                        "generation": snapshot_generation,
+                        "lineage": lineage,
+                        "opponent_generation": opponent_generation,
+                        **evaluation,
+                        "update_threshold": config.opponent_update_threshold,
+                        "selected_opponent_generation": (
+                            selected_opponent_generations[lineage]
+                        ),
+                        "evaluation_seed": evaluation_seed,
+                        "score_source": config.opponent_update_score,
+                        "policy_action_mode": (
+                            "training_stochastic" if config.opponent_update_score == "training_rollout"
+                            else "deterministic_mean"
+                        ),
+                    },
+                )
 
-                if replaced_any and not is_final:
-                    pool_load_started = time.perf_counter()
-                    pools, probabilities, generation_ids, pool_generations = (
-                        _brandao_opponent_pools(
-                            archives,
-                            _extract_lineage(runners.train_state.params, 0),
-                            config,
-                            selected_opponent_generations,
-                        )
-                    )
-                    _write_json_line(
-                        performance_path,
-                        {
-                            "event": "active_pool_reload",
-                            "generation": snapshot_generation,
-                            "seconds": time.perf_counter() - pool_load_started,
-                            "active_snapshots_per_lineage": len(pool_generations[0]),
-                        },
-                    )
-            elif not is_final:
+            if replaced_any and not is_final:
                 pool_load_started = time.perf_counter()
-                pools, probabilities, generation_ids, pool_generations = _active_pools(
-                    archives,
-                    _extract_lineage(runners.train_state.params, 0),
-                    config,
+                pools, probabilities, generation_ids, pool_generations = (
+                    _brandao_opponent_pools(
+                        archives,
+                        _extract_lineage(runners.train_state.params, 0),
+                        config,
+                        selected_opponent_generations,
+                    )
                 )
                 _write_json_line(
                     performance_path,
                     {
                         "event": "active_pool_reload",
-                        "generation": config.generation_offset + completed,
+                        "generation": snapshot_generation,
                         "seconds": time.perf_counter() - pool_load_started,
                         "active_snapshots_per_lineage": len(pool_generations[0]),
                     },
                 )
+        elif (
+            should_snapshot and not is_final
+            and config.policy_architecture not in _BRANDAO_POLICY_ARCHITECTURES
+        ):
+            pool_load_started = time.perf_counter()
+            pools, probabilities, generation_ids, pool_generations = _active_pools(
+                archives,
+                _extract_lineage(runners.train_state.params, 0),
+                config,
+            )
+            _write_json_line(
+                performance_path,
+                {
+                    "event": "active_pool_reload",
+                    "generation": config.generation_offset + completed,
+                    "seconds": time.perf_counter() - pool_load_started,
+                    "active_snapshots_per_lineage": len(pool_generations[0]),
+                },
+            )
 
         for record in metric_records.values():
             record["run_elapsed_seconds"] = time.perf_counter() - run_started

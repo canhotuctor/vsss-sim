@@ -502,3 +502,30 @@ def test_short_evaluation_writes_long_match_metrics(tmp_path):
         summary = item["summary"]
         assert summary["matches"] == 1
         assert summary["wins"] + summary["draws"] + summary["losses"] == 1
+
+
+def test_rollout_promotion_happens_before_regular_snapshot(tmp_path, monkeypatch):
+    def no_evaluator(*args):
+        raise AssertionError("rollout promotion must not create fresh match evaluator")
+
+    monkeypatch.setattr("vsss_sim.rl.self_play._make_candidate_evaluator", no_evaluator)
+    config = ExperimentConfig(
+        experiment_name="rollout-promotion", num_generations=2,
+        num_envs_per_lineage=2, rollout_length=2, update_epochs=1,
+        num_minibatches=1, snapshot_interval=50, max_episode_steps=2,
+        policy_architecture="brandao_shared", init_mode="random",
+        opponent_update_score="training_rollout", opponent_update_threshold=0.0,
+        output_root=str(tmp_path),
+    )
+    directory = run_experiment(config)
+    rows = [json.loads(line) for line in (directory / "metrics.jsonl").read_text().splitlines()]
+    assert [row["opponent_generation"] for row in rows] == [0, 1]
+    assert [row["selected_opponent_generation"] for row in rows] == [1, 2]
+    for row in rows:
+        assert row["opponent_evaluation_sample_count"] == 2
+        assert row["opponent_evaluation_mean_goal_delta"] == pytest.approx(row["mean_goal_delta_per_env"])
+        assert row["opponent_replaced"]
+    archive = SnapshotArchive(tmp_path, config.experiment_name, 0)
+    assert [item["generation"] for item in archive.list_snapshots()] == [0, 1, 2]
+    events = [json.loads(line) for line in (directory / "performance.jsonl").read_text().splitlines()]
+    assert len([event for event in events if event["event"] == "active_pool_reload"]) == 1
