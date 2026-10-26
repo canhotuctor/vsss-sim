@@ -1,6 +1,7 @@
 """Tests for the JAX physics engine."""
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from vsss_sim import config
@@ -107,9 +108,40 @@ class TestRobotWallCollisions:
     def test_velocity_zeroed_at_wall(self):
         s = jb.empty_state()
         s = s._replace(robots=s.robots.at[0, 0, 0].set(config.FIELD_LENGTH))
+        s = s._replace(robots=s.robots.at[0, 0, 1].set(config.GOAL_WIDTH))
         s = s._replace(robots=s.robots.at[0, 0, 3].set(1.0))  # moving further out
         s = jb._robot_wall_collisions(s)
         assert float(s.robots[0, 0, 3]) == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("side", [-1, 1])
+    @pytest.mark.parametrize("theta", [0.0, np.pi / 4])
+    def test_goal_pocket_and_walls(self, side, theta):
+        half_l = config.FIELD_LENGTH / 2
+        extent = config.ROBOT_SIZE / 2 * (abs(np.cos(theta)) + abs(np.sin(theta)))
+        s = jb.empty_state()
+        robot = jnp.array([side * (half_l + 0.01), 0.0, theta, side * 0.5, 0.0, 0.0])
+        s = s._replace(robots=s.robots.at[0, 0].set(robot))
+        collide = jax.jit(jb._robot_wall_collisions)
+        entered = collide(s).robots[0, 0]
+        assert float(entered[0]) == pytest.approx(float(robot[0]))
+        assert float(entered[3]) == pytest.approx(side * 0.5)
+
+        back = collide(s._replace(robots=s.robots.at[0, 0, 0].set(side * (half_l + 0.2))))
+        assert float(back.robots[0, 0, 0]) == pytest.approx(side * (half_l + config.GOAL_DEPTH - extent))
+        assert float(back.robots[0, 0, 3]) == 0.0
+
+        side_hit = s.robots.at[0, 0, 1].set(config.GOAL_WIDTH / 2 - extent / 2)
+        side_hit = side_hit.at[0, 0, 4].set(0.5)
+        bounded = collide(s._replace(robots=side_hit)).robots[0, 0]
+        assert float(bounded[1]) == pytest.approx(config.GOAL_WIDTH / 2 - extent)
+        assert float(bounded[4]) == 0.0
+        assert float(bounded[0]) == pytest.approx(float(robot[0]))
+
+        post_hit = s.robots.at[0, 0, 0].set(side * (half_l - extent / 2))
+        post_hit = post_hit.at[0, 0, 1].set(config.GOAL_WIDTH / 2 - extent / 2)
+        blocked = collide(s._replace(robots=post_hit)).robots[0, 0]
+        assert float(blocked[0]) == pytest.approx(side * (half_l - extent))
+        assert float(blocked[3]) == 0.0
 
 
 class TestBallWallCollisions:
@@ -227,6 +259,23 @@ class TestStep:
 
     def _zero_actions(self):
         return jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32)
+
+    @pytest.mark.parametrize("side", [-1, 1])
+    def test_robot_can_drive_into_goal_and_back_out(self, side):
+        s = self._make_state()
+        positions = jnp.array([[[-0.4, -0.4], [-0.2, -0.4], [0.0, -0.4]],
+                               [[0.2, -0.4], [0.4, -0.4], [0.0, 0.4]]])
+        robots = s.robots.at[:, :, :2].set(positions)
+        robots = robots.at[0, 0, :3].set(jnp.array(
+            [side * (config.FIELD_LENGTH / 2 - 0.1), 0.0, 0.0]))
+        s = s._replace(robots=robots)
+        actions = self._zero_actions().at[0, 0, :].set(side)
+        for _ in range(30):
+            s, _ = jb.step(s, actions)
+        assert side * float(s.robots[0, 0, 0]) > config.FIELD_LENGTH / 2
+        for _ in range(30):
+            s, _ = jb.step(s, -actions)
+        assert side * float(s.robots[0, 0, 0]) < config.FIELD_LENGTH / 2 - 0.05
 
     def test_step_advances_time(self):
         s = self._make_state()
