@@ -133,7 +133,7 @@ def reset_random(key: jnp.ndarray) -> SimState:
 # ---------------------------------------------------------------------------
 
 def _robot_wall_collisions(state: SimState) -> SimState:
-    """Clamp robots (OBB) inside field boundaries; zero outward velocity."""
+    """Keep robot footprints inside the field and the two goal pockets."""
     half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     half = jnp.float32(config.ROBOT_SIZE / 2.0)
@@ -141,7 +141,6 @@ def _robot_wall_collisions(state: SimState) -> SimState:
     theta = state.robots[:, :, 2]
     extent = half * (jnp.abs(jnp.cos(theta)) + jnp.abs(jnp.sin(theta)))
 
-    lim_x = half_l - extent
     lim_y = half_w - extent
 
     x = state.robots[:, :, 0]
@@ -149,13 +148,24 @@ def _robot_wall_collisions(state: SimState) -> SimState:
     vx = state.robots[:, :, 3]
     vy = state.robots[:, :, 4]
 
+    # Once the centre is behind the goal line, the pocket side walls confine
+    # the robot. At the entrance its entire footprint must fit between posts.
+    half_goal = jnp.float32(config.GOAL_WIDTH / 2.0)
+    in_pocket = (jnp.abs(x) > half_l) & (jnp.abs(y) < half_goal)
+    pocket_y = half_goal - extent
+    new_y = jnp.where(in_pocket, jnp.clip(y, -pocket_y, pocket_y),
+                      jnp.clip(y, -lim_y, lim_y))
+    fits_opening = jnp.abs(new_y) + extent <= half_goal
+    lim_x = half_l - extent + jnp.where(in_pocket | fits_opening, config.GOAL_DEPTH, 0.0)
+    # Side-wall contact applies only behind the goal line.
+    effective_lim_y = jnp.where(in_pocket, pocket_y, lim_y)
+
     exceeded_neg_x = x < -lim_x
     exceeded_pos_x = x > lim_x
-    exceeded_neg_y = y < -lim_y
-    exceeded_pos_y = y > lim_y
+    exceeded_neg_y = y < -effective_lim_y
+    exceeded_pos_y = y > effective_lim_y
 
     new_x = jnp.clip(x, -lim_x, lim_x)
-    new_y = jnp.clip(y, -lim_y, lim_y)
 
     new_vx = jnp.where(exceeded_neg_x & (vx < 0), 0.0, vx)
     new_vx = jnp.where(exceeded_pos_x & (new_vx > 0), 0.0, new_vx)
