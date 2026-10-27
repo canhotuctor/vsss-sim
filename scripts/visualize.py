@@ -22,6 +22,7 @@ from vsss_sim.envs.brandao_observation import (
     initialize_history,
 )
 from vsss_sim.envs.match_referee import MatchPhase
+from vsss_sim.perspective import switch_team_perspective
 from vsss_sim.rl.ppo import create_policy_model
 
 
@@ -114,11 +115,20 @@ def main() -> None:
         default=1.0,
         help="Maximum playback speed relative to real time (default: 1.0x).",
     )
-    parser.add_argument(
+    opponent_group = parser.add_mutually_exclusive_group()
+    opponent_group.add_argument(
         "--opponent", choices=("stationary", "random"), default="stationary"
     )
+    opponent_group.add_argument(
+        "--opponent-snapshot",
+        type=Path,
+        help="Saved .msgpack policy to play as yellow instead of a fixed opponent.",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--stochastic", action="store_true")
+    parser.add_argument(
+        "--stochastic", action="store_true",
+        help="Sample actions for both saved policies (default: deterministic).",
+    )
     parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--init-mode", choices=tuple(mode.value for mode in InitMode))
     parser.add_argument(
@@ -144,8 +154,21 @@ def main() -> None:
         else experiment_config.get("max_episode_steps", config.MAX_EPISODE_STEPS)
     )
     policy_architecture = metadata.get("policy_architecture", "joint")
+    opponent_model = opponent_params = opponent_metadata = None
+    if args.opponent_snapshot is not None:
+        opponent_model, opponent_params, opponent_metadata, opponent_config = load_snapshot(
+            args.opponent_snapshot
+        )
     try:
         control_rate_hz, physics_substeps = resolve_simulation_timing(experiment_config)
+        if opponent_metadata is not None:
+            opponent_timing = resolve_simulation_timing(opponent_config)
+            if opponent_timing != (control_rate_hz, physics_substeps):
+                print(
+                    "Note: opponent was trained with control timing "
+                    f"{opponent_timing[0]:g} Hz × {opponent_timing[1]} substeps; "
+                    "the blue policy's timing is used for this match."
+                )
     except ValueError as error:
         parser.error(str(error))
     policy_episode_steps = max_episode_steps
@@ -156,8 +179,14 @@ def main() -> None:
     referee_mode = args.referee_mode or experiment_config.get(
         "referee_mode", RefereeMode.FULL.value
     )
+    # The environment invokes the opponent once per control step. For a
+    # saved policy, compute its action from the same pre-step state as blue.
+    pending_yellow_action = np.zeros((config.N_ROBOTS, 2), dtype=np.float32)
+    def saved_opponent(_observation):
+        return pending_yellow_action
+
     env = VSSEnv(
-        opponent_policy=args.opponent,
+        opponent_policy=saved_opponent if opponent_metadata is not None else args.opponent,
         render_mode="human",
         control_rate_hz=control_rate_hz,
         physics_substeps=physics_substeps,
@@ -167,45 +196,75 @@ def main() -> None:
         reward_profile=reward_profile,
         referee_mode=referee_mode,
     )
+    # Capture baseline actions too: each team's Brandão history includes its
+    # own previously applied commands, including STOPPED-frame zeroing.
+    opponent_callback = env._opponent_policy
+    actual_yellow_action = np.zeros_like(pending_yellow_action)
+    def record_opponent(observation):
+        nonlocal actual_yellow_action
+        actual_yellow_action = np.asarray(
+            opponent_callback(observation), dtype=np.float32
+        ).reshape(config.N_ROBOTS, 2)
+        return actual_yellow_action
+    env._opponent_policy = record_opponent
+
     key = jax.random.PRNGKey(args.seed)
-    # Compile per-decision work once; eager dispatch stalls the sub-step frames.
-    policy_apply = jax.jit(model.apply)
-    entity_ordered_actions = policy_architecture == "brandao_sets"
-
-    @jax.jit
-    def next_history(history, simulation, previous_actions, remaining, sample_key):
-        features = build_agent_features(
-            simulation,
-            previous_actions,
-            remaining,
-            sample_key,
-            entity_ordered_actions=entity_ordered_actions,
-        )
-        return advance_history(history, features, jnp.asarray(True))
-
-    def action_for(observation: np.ndarray) -> np.ndarray:
-        nonlocal key
-        if policy_architecture in ("brandao_shared", "brandao_sets"):
-            first, second, _ = policy_apply(
-                params, jnp.asarray(observation, dtype=jnp.float32)
+    blue_apply = jax.jit(model.apply)
+    yellow_apply = jax.jit(opponent_model.apply) if opponent_model is not None else None
+    opponent_architecture = (
+        opponent_metadata.get("policy_architecture", "joint")
+        if opponent_metadata is not None else None
+    )
+    # Separate histories are necessary when one policy uses entity ordering
+    # and the other uses the original shared-policy action ordering.
+    history_orders = {
+        architecture == "brandao_sets"
+        for architecture in (policy_architecture, opponent_architecture)
+        if architecture in ("brandao_shared", "brandao_sets")
+    }
+    history_advance = {}
+    for entity_ordered in history_orders:
+        def next_history(history, simulation, previous_actions, remaining, sample_key,
+                         entity_ordered=entity_ordered):
+            features = build_agent_features(
+                simulation, previous_actions, remaining, sample_key,
+                entity_ordered_actions=entity_ordered,
             )
+            return advance_history(history, features, jnp.asarray(True))
+        history_advance[entity_ordered] = jax.jit(next_history)
+
+    def action_for(apply, policy_params, architecture, observation):
+        nonlocal key
+        first, second, _ = apply(
+            policy_params, jnp.asarray(observation, dtype=jnp.float32)
+        )
+        if architecture in ("brandao_shared", "brandao_sets"):
             if args.stochastic:
                 key, sample_key = jax.random.split(key)
-                sample = jax.random.beta(sample_key, first, second)
-                action = 2.0 * sample - 1.0
+                action = 2.0 * jax.random.beta(sample_key, first, second) - 1.0
             else:
                 action = 2.0 * first / (first + second) - 1.0
-            return np.asarray(jax.device_get(action), dtype=np.float32)
-        mean, log_std, _ = policy_apply(params, jnp.asarray(observation, dtype=jnp.float32))
-        raw_action = mean
-        if args.stochastic:
-            key, sample_key = jax.random.split(key)
-            raw_action = mean + jnp.exp(log_std) * jax.random.normal(sample_key, mean.shape)
-        return np.asarray(jax.device_get(jnp.tanh(raw_action)), dtype=np.float32)
+        else:
+            raw_action = first
+            if args.stochastic:
+                key, sample_key = jax.random.split(key)
+                raw_action = first + jnp.exp(second) * jax.random.normal(
+                    sample_key, first.shape
+                )
+            action = jnp.tanh(raw_action)
+        return np.asarray(jax.device_get(action), dtype=np.float32).reshape(
+            config.N_ROBOTS, 2
+        )
 
+    opponent_label = args.opponent
+    if opponent_metadata is not None:
+        opponent_label = (
+            f"saved generation={opponent_metadata['generation']} "
+            f"lineage={opponent_metadata['lineage']} architecture={opponent_architecture}"
+        )
     print(
         f"snapshot generation={metadata['generation']} lineage={metadata['lineage']} "
-        f"— architecture={policy_architecture}, opponent={args.opponent}, "
+        f"— architecture={policy_architecture}, opponent={opponent_label}, "
         f"control={control_rate_hz:g} Hz × {physics_substeps} substeps, "
         f"speedup cap={args.speedup_rate:g}x, init={init_mode}, "
         f"referee={referee_mode}, stochastic={args.stochastic}"
@@ -218,64 +277,71 @@ def main() -> None:
             observation, _ = env.reset(seed=args.seed + episode)
             reward_total = 0.0
             score_blue = score_yellow = 0
-            if policy_architecture in ("brandao_shared", "brandao_sets"):
-                previous_actions = jnp.zeros((2, 3, 2), dtype=jnp.float32)
-                observation_key = jax.random.PRNGKey(args.seed + episode)
-                first_features = build_agent_features(
-                    env._state,
-                    previous_actions,
-                    jnp.float32(1.0),
-                    observation_key,
-                    entity_ordered_actions=entity_ordered_actions,
+            previous_actions = jnp.zeros((2, 3, 2), dtype=jnp.float32)
+            observation_key = jax.random.PRNGKey(args.seed + episode)
+            histories = {
+                entity_ordered: initialize_history(build_agent_features(
+                    env._state, previous_actions, jnp.float32(1.0), observation_key,
+                    entity_ordered_actions=entity_ordered,
+                ))
+                for entity_ordered in history_orders
+            }
+            steps = 0
+            done = False
+            while steps < policy_episode_steps and not done:
+                if policy_architecture in ("brandao_shared", "brandao_sets"):
+                    blue_observation = flatten_history(
+                        histories[policy_architecture == "brandao_sets"], config.TEAM_BLUE
+                    )
+                else:
+                    blue_observation = observation
+                blue_action = action_for(
+                    blue_apply, params, policy_architecture, blue_observation
                 )
-                history = initialize_history(first_features)
-                policy_steps = 0
-                done = False
-                while policy_steps < policy_episode_steps and not done:
-                    robot_observation = flatten_history(history, config.TEAM_BLUE)
-                    blue_action = action_for(robot_observation)
-                    # VSSEnv zeroes every command on a STOPPED step; record what
-                    # was applied, as VSSJumanjiEnv does during training.
-                    stopped = int(np.asarray(env._referee_state.phase)) == MatchPhase.STOPPED
-                    observation, reward, terminated, truncated, info = env.step(
-                        blue_action.reshape(-1)
-                    )
-                    reward_total += float(reward)
-                    goal = int(info.get("goal", 0))
-                    if goal:
-                        goals_blue += goal == 1
-                        goals_yellow += goal == -1
-                    score_blue = int(info["score_blue"])
-                    score_yellow = int(info["score_yellow"])
-                    done = bool(goal or terminated or truncated)
-                    previous_actions = previous_actions.at[config.TEAM_BLUE].set(
-                        np.zeros_like(blue_action) if stopped else blue_action
-                    )
-                    policy_steps += 1
-                    if not done and policy_steps < policy_episode_steps:
-                        remaining = jnp.float32(
-                            1.0 - policy_steps / policy_episode_steps
+                if opponent_metadata is not None:
+                    if opponent_architecture in ("brandao_shared", "brandao_sets"):
+                        yellow_observation = flatten_history(
+                            histories[opponent_architecture == "brandao_sets"],
+                            config.TEAM_YELLOW,
                         )
-                        observation_key, sample_key = jax.random.split(observation_key)
-                        history = next_history(
+                    else:
+                        yellow_observation = switch_team_perspective(observation)
+                    pending_yellow_action = action_for(
+                        yellow_apply, opponent_params, opponent_architecture,
+                        yellow_observation,
+                    )
+
+                # VSSEnv applies zero commands on a STOPPED step, just as the
+                # training environment does when it constructs its history.
+                stopped = int(np.asarray(env._referee_state.phase)) == MatchPhase.STOPPED
+                observation, reward, terminated, truncated, info = env.step(
+                    blue_action.reshape(-1)
+                )
+                reward_total += float(reward)
+                goal = int(info.get("goal", 0))
+                goals_blue += goal == 1
+                goals_yellow += goal == -1
+                score_blue = int(info["score_blue"])
+                score_yellow = int(info["score_yellow"])
+                steps += 1
+                done = bool(terminated or truncated or (
+                    goal and policy_architecture in ("brandao_shared", "brandao_sets")
+                ))
+                if stopped:
+                    previous_actions = jnp.zeros_like(previous_actions)
+                else:
+                    previous_actions = jnp.asarray(
+                        np.stack([blue_action, actual_yellow_action]), dtype=jnp.float32
+                    )
+                if not done and steps < policy_episode_steps and histories:
+                    remaining = jnp.float32(1.0 - steps / policy_episode_steps)
+                    observation_key, sample_key = jax.random.split(observation_key)
+                    histories = {
+                        order: history_advance[order](
                             history, env._state, previous_actions, remaining, sample_key
                         )
-                steps = policy_steps
-            else:
-                steps = 0
-                done = False
-                while not done:
-                    observation, reward, terminated, truncated, info = env.step(
-                        action_for(observation)
-                    )
-                    reward_total += float(reward)
-                    steps += 1
-                    goal = int(info.get("goal", 0))
-                    goals_blue += goal == 1
-                    goals_yellow += goal == -1
-                    score_blue = int(info["score_blue"])
-                    score_yellow = int(info["score_yellow"])
-                    done = bool(terminated or truncated)
+                        for order, history in histories.items()
+                    }
 
             episode_rewards.append(reward_total)
             episode_lengths.append(steps)
