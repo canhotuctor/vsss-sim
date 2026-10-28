@@ -34,6 +34,11 @@ except ImportError:
     gfxdraw = None  # type: ignore[assignment]
 
 
+# After a longer stall (e.g. JIT compilation), restart the frame schedule
+# instead of racing through the backlog.
+_MAX_PACING_LAG = 0.25  # s
+
+
 def _require_pygame() -> None:
     if not _PYGAME_AVAILABLE:
         raise ImportError(
@@ -53,6 +58,10 @@ class VSSRenderer:
         Pixels per metre (default: ``config.RENDER_SCALE``).
     margin : int
         Border width in pixels (default: ``config.RENDER_MARGIN``).
+    fps : float, optional
+        Human-mode playback rate in simulated physics sub-steps per wall-clock
+        second: the frame rate when each frame shows one sub-step. ``None``
+        renders as fast as possible.
     """
 
     def __init__(
@@ -79,12 +88,13 @@ class VSSRenderer:
 
         self._surface: Optional[pygame.Surface] = None
         self._screen: Optional[pygame.Surface] = None
-        self._clock: Optional[pygame.time.Clock] = None
+        self._next_frame_t: Optional[float] = None
 
         # Measured simulated substeps per wall-clock second, over recent frames.
         self._speedup_samples: deque[tuple[float, int]] = deque(maxlen=30)
         self._last_render_t: Optional[float] = None
         self._hud_font: Optional[pygame.font.Font] = None
+        self._score_font: Optional[pygame.font.Font] = None
 
     # Coordinate helpers
 
@@ -106,8 +116,6 @@ class VSSRenderer:
         if self.render_mode == "human":
             self._screen = pygame.display.set_mode((self._win_w, self._win_h))
             pygame.display.set_caption("VSSS Simulator")
-            if self._fps is not None:
-                self._clock = pygame.time.Clock()
         self._surface = pygame.Surface((self._win_w, self._win_h))
 
     # Drawing primitives
@@ -274,16 +282,32 @@ class VSSRenderer:
         score_blue: int,
         score_yellow: int,
     ) -> None:
-        try:
-            font = pygame.font.SysFont("monospace", 22, bold=True)
-        except Exception:
-            return
-        text = font.render(
+        if self._score_font is None:
+            try:
+                self._score_font = pygame.font.SysFont("monospace", 22, bold=True)
+            except Exception:
+                return
+        text = self._score_font.render(
             f"Blue {score_blue}  :  {score_yellow} Yellow",
             True,
             config.COLOR_FIELD_LINES,
         )
         surf.blit(text, (self._win_w // 2 - text.get_width() // 2, 8))
+
+    def _pace(self, simulated_substeps: int) -> None:
+        """Hold the displayed frame for the wall time of its sub-steps.
+
+        Deadlines accumulate, so a slow frame (policy inference, display sync)
+        is absorbed by shorter following frames rather than slowing playback.
+        Every frame is still shown.
+        """
+        now = time.perf_counter()
+        if self._next_frame_t is None or now - self._next_frame_t > _MAX_PACING_LAG:
+            self._next_frame_t = now
+        self._next_frame_t += simulated_substeps / self._fps
+        delay = self._next_frame_t - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
 
     def _update_speedup_sample(self, simulated_substeps: int) -> None:
         """Record elapsed wall time and simulated steps since the prior frame."""
@@ -406,8 +430,8 @@ class VSSRenderer:
                     raise SystemExit(0)
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     raise SystemExit(0)
-            if self._clock is not None:
-                self._clock.tick(int(self._fps))
+            if self._fps is not None:
+                self._pace(simulated_substeps)
             return None
 
         raw = pygame.surfarray.array3d(surf)   # (W, H, 3)

@@ -30,6 +30,10 @@ On a goal, the continuous Brandão reward is replaced by:
 
 The goal value is +1 for blue and −1 for yellow. In per-robot mode this same goal value is assigned to each robot. Reward uses the post-physics state before any kickoff; the next observation uses the state carried into the next step.
 
+## Fouls
+
+A referee foul committed by blue replaces the continuous reward with −1, given to every robot. As in the paper, the fouled team gets no bonus: it keeps its continuous reward, and the restart is its gain. The fouls are both goal-area violations, goalkeeper timeout, personal foul, goalkeeper block, and goal-area stopped ball; the paper penalized only the penalty foul, and the referee mode decides which can occur. A defender foul is penalized when its penalty is awarded, after the attackers' advantage.
+
 ## Configuration
 
 The training CLI accepts a reward profile:
@@ -38,5 +42,3 @@ The training CLI accepts a reward profile:
     python scripts/train_jax.py --xp experiment26 --reward-profile brandao_reward
 
 Experiment configurations store the resolved profile. Older configurations without the field default to default for joint policies and brandao_reward for Brandão per-robot policies. The direct Jumanji environment requires brandao_reward when using either Brandão policy.
-
-The simulator does not detect fouls, so the paper's foul penalty is not implemented.

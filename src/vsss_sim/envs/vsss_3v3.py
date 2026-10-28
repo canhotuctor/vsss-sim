@@ -11,7 +11,7 @@ import numpy as np
 
 from .. import config, physics
 from ..agents import random_policy, stationary_policy
-from ..config import InitMode, RewardProfile
+from ..config import InitMode, RefereeMode, RewardProfile
 from .base import VSSBaseEnv
 from .match_rules import (
     MatchPhase,
@@ -38,6 +38,7 @@ class VSSEnv(VSSBaseEnv):
         speedup_rate: float = 1.0,
         init_mode: InitMode | str = InitMode.KICKOFF,
         reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
+        referee_mode: RefereeMode | str = RefereeMode.FULL,
     ) -> None:
         if isinstance(control_rate_hz, bool):
             raise ValueError("control_rate_hz must be a positive finite number")
@@ -66,16 +67,16 @@ class VSSEnv(VSSBaseEnv):
         self._physics_substeps = int(substeps_value)
         self._base_render_fps = self._control_rate_hz * self._physics_substeps
         self._speedup_rate = speedup_rate
-        # At >1x, group simulated substeps into each displayed frame. Keep
-        # display flips at normal refresh cadence so vsync cannot pin sim time
-        # to one physics substep per monitor refresh.
-        target_render_fps = self._base_render_fps * min(1.0, self._speedup_rate)
+        # Human mode paces frames by simulated time: sub-steps per wall second.
+        # At >1x, frames group several sub-steps so display refresh cannot pin
+        # simulated time to one physics sub-step per monitor refresh.
+        target_substep_rate = self._base_render_fps * self._speedup_rate
         self._render_substep_accumulator = 0.0
         self._render_substeps_since_frame = 0
         super().__init__(
             render_mode=render_mode,
             max_episode_steps=max_episode_steps,
-            render_fps=target_render_fps if render_mode == "human" else None,
+            render_fps=target_substep_rate if render_mode == "human" else None,
         )
 
         self._init_mode = InitMode(init_mode)
@@ -83,6 +84,7 @@ class VSSEnv(VSSBaseEnv):
             reward_profile=reward_profile,
             max_episode_steps=max_episode_steps,
             init_mode=self._init_mode,
+            referee_mode=referee_mode,
         )
         self._compiled_match_step = jax.jit(self._match_rules.step)
         self._referee_state = initial_referee_state()
@@ -122,39 +124,30 @@ class VSSEnv(VSSBaseEnv):
         return int(info_phys["goal"])
 
     def _step_physics_substeps(self, all_actions: np.ndarray) -> int:
-        """Advance one control interval and render at the requested cadence.
+        """Advance one control interval and draw its physics sub-steps.
 
-        At normal speed, render intermediate substeps. At higher speeds, batch
-        the physics and sample fewer states so display refresh does not cap the
-        simulation to one substep per screen frame.
+        A single engine call returns every intermediate state, so rendered
+        matches follow exactly the physics of ``_step_physics``. At normal
+        speed every sub-step is drawn; at higher speeds frames are sampled.
         """
-        j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
-        if self._speedup_rate >= self._physics_substeps:
-            self._state, info_phys = physics.step(
-                self._state,
-                j_actions,
-                dt=self._control_dt,
-                sub_steps=self._physics_substeps,
-            )
-            goal = int(info_phys["goal"])
-            self._render_after_physics(self._physics_substeps, goal)
-            return goal
+        self._state, info_phys, frames = physics.step_with_frames(
+            self._state,
+            jnp.asarray(all_actions, dtype=jnp.float32),
+            dt=self._control_dt,
+            sub_steps=self._physics_substeps,
+        )
+        balls, robots = np.asarray(frames.ball), np.asarray(frames.robots)
+        goals = np.asarray(info_phys["goals"])
+        for index in range(self._physics_substeps):
+            self._render_after_physics(1, int(goals[index]), (balls[index], robots[index]))
+        return int(info_phys["goal"])
 
-        sub_dt = self._control_dt / self._physics_substeps
-        goal = 0
-
-        for _ in range(self._physics_substeps):
-            self._state, info_phys = physics.step(
-                self._state, j_actions, dt=sub_dt, sub_steps=1
-            )
-            g = int(info_phys["goal"])
-            if goal == 0:
-                goal = g
-            self._render_after_physics(1, g)
-
-        return goal
-
-    def _render_after_physics(self, simulated_substeps: int, goal: int) -> None:
+    def _render_after_physics(
+        self,
+        simulated_substeps: int,
+        goal: int,
+        frame: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    ) -> None:
         """Render sparsely while preserving the simulation-time speed target."""
         self._render_substeps_since_frame += simulated_substeps
         should_render = self._speedup_rate <= 1.0
@@ -169,7 +162,7 @@ class VSSEnv(VSSBaseEnv):
                 else:
                     self._render_substep_accumulator = 0.0
         if should_render:
-            self._render_current_state(self._render_substeps_since_frame)
+            self._render_current_state(self._render_substeps_since_frame, frame)
             self._render_substeps_since_frame = 0
 
     # Gymnasium interface
@@ -259,7 +252,12 @@ class VSSEnv(VSSBaseEnv):
 
         return self._render_current_state(simulated_substeps=1)
 
-    def _render_current_state(self, simulated_substeps: int) -> Optional[np.ndarray]:
+    def _render_current_state(
+        self,
+        simulated_substeps: int,
+        frame: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    ) -> Optional[np.ndarray]:
+        """Draw ``frame`` (ball, robots) from a sub-step, or the current state."""
         if self._renderer is None:
             from ..rendering import VSSRenderer
             self._renderer = VSSRenderer(
@@ -269,9 +267,14 @@ class VSSEnv(VSSBaseEnv):
                 control_dt=self._control_dt,
             )
 
+        ball, robots = (
+            (np.asarray(self._state.ball), np.asarray(self._state.robots))
+            if frame is None
+            else frame
+        )
         return self._renderer.render(
-            np.asarray(self._state.ball),
-            np.asarray(self._state.robots),
+            ball,
+            robots,
             np.asarray(self._state.score),
             step=self._step_count,
             episode=self._episode_count,

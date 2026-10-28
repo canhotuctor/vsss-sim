@@ -21,3 +21,7 @@
 **Command cadence** — How often the policy supplies commands during an experiment.
 
 **Physics substeps** — The integration steps taken within one command interval.
+
+**Referee mode** — Which referee calls apply in a match: `full`, `simplified` (two-robot goal-area fouls and free balls), or `off` (goals only).
+
+**Advantage** — Play continuing after a defender foul so the attackers can still score; the penalty is awarded only if the attack ends without a goal.

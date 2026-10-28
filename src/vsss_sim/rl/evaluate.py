@@ -151,6 +151,7 @@ def evaluate_experiment(
         policy_architecture=config.policy_architecture,
         control_rate_hz=config.control_rate_hz,
         physics_substeps=config.physics_substeps,
+        referee_mode=config.referee_mode,
     )
     model = create_policy_model(config.policy_architecture, config.hidden_sizes)
     observation_size = (
@@ -318,6 +319,7 @@ def evaluate_experiment_exhaustive_history(
         policy_architecture=config.policy_architecture,
         control_rate_hz=config.control_rate_hz,
         physics_substeps=config.physics_substeps,
+        referee_mode=config.referee_mode,
     )
     model = create_policy_model(config.policy_architecture, config.hidden_sizes)
     observation_size = (

@@ -76,3 +76,9 @@ class TestSimConstants:
 
     def test_max_steps_positive(self):
         assert config.MAX_EPISODE_STEPS > 0
+
+    def test_default_cadence_is_10hz_with_60hz_physics(self):
+        assert config.FPS == pytest.approx(10.0)
+        assert config.FPS * config.SUB_STEPS == pytest.approx(60.0)
+        # The default episode lasts 20 seconds.
+        assert config.MAX_EPISODE_STEPS * config.DT == pytest.approx(20.0)

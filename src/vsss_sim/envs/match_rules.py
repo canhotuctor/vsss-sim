@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from .. import config, physics
-from ..config import InitMode, RewardProfile
+from ..config import InitMode, RefereeMode, RewardProfile
 from .match_referee import (
     MatchPhase,
     RefereeEvent,
@@ -204,6 +204,7 @@ class MatchRules:
         init_mode: InitMode | str = InitMode.KICKOFF,
         kickoff_on_goal: bool = True,
         individual_agent_rewards: bool = False,
+        referee_mode: RefereeMode | str = RefereeMode.FULL,
     ) -> None:
         if max_episode_steps < 1:
             raise ValueError("max_episode_steps must be at least 1")
@@ -212,6 +213,7 @@ class MatchRules:
         self.init_mode = InitMode(init_mode)
         self.kickoff_on_goal = bool(kickoff_on_goal)
         self.individual_agent_rewards = bool(individual_agent_rewards)
+        self.referee_mode = RefereeMode(referee_mode)
 
     def observation(self, simulation: physics.SimState) -> jax.Array:
         return build_observation(simulation)
@@ -240,6 +242,7 @@ class MatchRules:
             effective_goal,
             reward_context.dt,
             tie_break_key=context.kickoff_key,
+            mode=self.referee_mode,
         )
         event = jnp.where(resuming, jnp.int32(RefereeEvent.NONE), decision.event).astype(jnp.int32)
         offending_team = jnp.where(resuming, jnp.int32(-1), decision.offending_team)
@@ -262,14 +265,15 @@ class MatchRules:
                 | (event == RefereeEvent.GOALKEEPER_BLOCK)
                 | (event == RefereeEvent.GOAL_AREA_STOPPED_BALL)
             )
-            foul_reward = jnp.where(offending_team == config.TEAM_BLUE, -1.0, 1.0).astype(
-                jnp.float32
+            # Only the offender is penalized, as in Brandão et al. The fouled
+            # team already gains its restart; a bonus would pay for drawing fouls.
+            reward = jnp.where(
+                foul_event & (offending_team == config.TEAM_BLUE), jnp.float32(-1.0), reward
             )
-            reward = jnp.where(foul_event, foul_reward, reward)
         else:
             penalty_reward = jnp.where(
-                restart == RestartType.PENALTY_KICK,
-                jnp.where(offending_team == config.TEAM_BLUE, -1.0, 1.0),
+                (restart == RestartType.PENALTY_KICK) & (offending_team == config.TEAM_BLUE),
+                -1.0,
                 0.0,
             ).astype(jnp.float32)
             reward = reward + penalty_reward

@@ -17,12 +17,14 @@ from .jax_backend import (
     reset_kickoff,
     reset_random,
     step,
+    step_with_frames,
 )
 
 __all__ = [
     "SimState",
     "empty_state",
     "step",
+    "step_with_frames",
     "reset_kickoff",
     "reset_random",
     "_diff_drive",

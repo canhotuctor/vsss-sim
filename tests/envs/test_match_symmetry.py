@@ -81,12 +81,15 @@ def test_brandao_restart_features_are_equal_in_each_teams_canonical_view(restart
 
 
 def simultaneous_fouls():
+    """Blue robot 0 and yellow robot 1 each ram a stationary opponent in their lane."""
     before = physics.empty_state()
     robots = before.robots.at[..., :2].set(jnp.asarray([
         [[-.20, -.25], [0, .25], [-.60, .50]],
         [[0, -.25], [.20, .25], [.60, -.50]],
     ], dtype=jnp.float32))
-    before = before._replace(robots=robots)
+    robots = robots.at[1, 1, 2].set(jnp.pi)
+    wheels = before.wheel_speeds.at[0, 0].set(1.2).at[1, 1].set(1.2)
+    before = before._replace(robots=robots, wheel_speeds=wheels)
     after = before._replace(robots=robots.at[0, 0, 0].set(-.075).at[1, 1, 0].set(.075))
     return before, after
 
@@ -96,10 +99,12 @@ def test_simultaneous_call_ties_use_seeded_color_neutral_priority(both):
     before, after = simultaneous_fouls()
     if not both:
         after = after._replace(robots=after.robots.at[1, 1, 0].set(.20))
+    referee = initial_referee_state()
+    referee = referee._replace(lane_seconds=referee.lane_seconds.at[0, 0, 0].set(.3).at[1, 1, 1].set(.3))
     rules = MatchRules()
     def call(key):
         return rules.step(MatchStepInput(before, after, jnp.int32(0), jnp.int32(1), key,
-                                         initial_referee_state(), jnp.float32(.1)))
+                                         referee, jnp.float32(.1)))
     result = jax.jit(jax.vmap(call))(jax.random.split(jax.random.PRNGKey(17), 512))
     assert np.all(np.asarray(result.event) == RefereeEvent.PERSONAL_FOUL)
     offenders = np.asarray(result.offending_team)
@@ -175,3 +180,25 @@ def test_free_ball_axis_choice_is_retained_until_stoppage_ends():
     calls = jax.jit(jax.vmap(lambda key: _resolve_referee(sim, sim, referee, jnp.int32(0), jnp.float32(.1), key)))(keys)
     assert np.all(np.asarray(calls.event) == RefereeEvent.FIELD_IMPASSE)
     np.testing.assert_array_equal(calls.quadrant, int(first.state.field_impasse_quadrant))
+
+
+@pytest.mark.parametrize("referee_mode", ["off", "simplified", "full"])
+def test_every_adapter_passes_its_referee_mode_to_match_rules(referee_mode):
+    adapters = (
+        VSSEnv(referee_mode=referee_mode),
+        VSSVecEnv(num_envs=1, referee_mode=referee_mode),
+        VSSJumanjiEnv(referee_mode=referee_mode),
+    )
+    for env in adapters:
+        assert env._match_rules.referee_mode.value == referee_mode
+
+
+def test_every_adapter_defaults_to_10hz_with_six_substeps():
+    assert VSSEnv()._control_dt == pytest.approx(0.1)
+    assert VSSEnv()._physics_substeps == 6
+    for architecture in ("joint", "brandao_shared", "brandao_sets"):
+        env = VSSJumanjiEnv(
+            policy_architecture=architecture,
+            reward_profile="brandao_reward" if architecture != "joint" else "default",
+        )
+        assert (env.control_rate_hz, env.physics_substeps) == (10.0, 6)

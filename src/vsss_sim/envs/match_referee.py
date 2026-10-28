@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 
 from .. import config, physics
+from ..config import RefereeMode
 from .match_geometry import (
     _PLAY_INVOLVEMENT_DISTANCE,
-    _ball_between,
     _ball_goal_area_membership,
     _goal_area_membership,
     _robot_ball_contacts,
@@ -19,11 +19,26 @@ from .match_geometry import (
     _robot_contacts,
 )
 
-_BALL_STUCK_SPEED = 0.01
-_FREE_BALL_STOPPED_SPEED = 0.001  # m/s (1 mm/s)
+# VSSReferee's ballMinSpeedForStuck: a slower ball is stuck for every stoppage rule.
+_BALL_STUCK_SPEED = 0.1  # m/s
+_BALL_MOVEMENT_SPEED = 0.001  # m/s; actual movement clears free-ball recurrence
 _FREE_BALL_TIMEOUT_SECONDS = 5.0
 _RULE_TIMEOUT_SECONDS = 5.0
 _BALL_MOVEMENT_TOLERANCE = 0.001
+
+# Rule 9.1 calls only collisions that disrupt play or can damage a robot. The
+# 2D kinematic engine cannot see intent, so a personal foul needs an avoidable,
+# clearly one-sided impact or a sustained push. Drive speeds come from wheels.
+_FOUL_IMPACT_SPEED = 0.6  # m/s into a victim involved in the play
+_FOUL_HARD_IMPACT_SPEED = 0.9  # m/s anywhere: potential to damage
+_FOUL_FAULT_MARGIN = 0.3  # m/s by which the offender out-drives the victim
+_FOUL_PLAY_DISTANCE = 0.20  # victim centre to ball
+_FOUL_DISPUTE_DISTANCE = 0.10  # both robots this close to the ball: play on
+_FOUL_LANE_RANGE = 0.35  # forward reach of the offender's lane
+_FOUL_LANE_SECONDS = 0.2  # stop from full speed at 1 g, plus one decision
+_FOUL_PUSH_SECONDS = 1.0
+_FOUL_PUSH_SPEED = 0.1  # m/s of drive into the opponent that counts as pushing
+_FOUL_LANE_MIN_SPEED = 0.05  # m/s; a robot this slow has no lane
 
 
 class RefereeEvent(IntEnum):
@@ -58,7 +73,12 @@ class MatchPhase(IntEnum):
 
 
 class RefereeState(NamedTuple):
-    """Per-match history for goal-area rules, possession, and impasses."""
+    """Per-match history for goal-area rules, possession, impasses, and contact.
+
+    ``lane_seconds`` and ``push_seconds`` are indexed [team, robot, opponent].
+    ``advantage_team`` is the attacking team playing on after a defender foul,
+    or -1.
+    """
 
     goal_area_seconds: jax.Array
     goalkeeper_hold_seconds: jax.Array
@@ -72,6 +92,10 @@ class RefereeState(NamedTuple):
     free_ball_quadrant: jax.Array
     free_ball_origin: jax.Array
     phase: jax.Array
+    lane_seconds: jax.Array
+    push_seconds: jax.Array
+    advantage_team: jax.Array
+    advantage_seconds: jax.Array
 
 
 class _RefereeDecision(NamedTuple):
@@ -98,6 +122,10 @@ def initial_referee_state() -> RefereeState:
         free_ball_quadrant=jnp.int32(-1),
         free_ball_origin=jnp.zeros((2,), dtype=jnp.float32),
         phase=jnp.asarray(MatchPhase.PLAYING, dtype=jnp.int32),
+        lane_seconds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, config.N_ROBOTS), jnp.float32),
+        push_seconds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, config.N_ROBOTS), jnp.float32),
+        advantage_team=jnp.int32(-1),
+        advantage_seconds=jnp.zeros((), dtype=jnp.float32),
     )
 
 
@@ -131,21 +159,74 @@ def _initiated_contacts(simulation_before, simulation_after, contacts):
     return jnp.stack(hits)
 
 
-def _illegal_push(simulation_before, simulation_after, initiated=None):
-    """Approximate disruptive personal contact anywhere on the field (9.1)."""
-    if initiated is None:
-        contacts = _robot_contacts(simulation_after.robots)
-        initiated = _initiated_contacts(simulation_before, simulation_after, contacts)
-    legal_ball_push = []
+def _personal_fouls(simulation_before, simulation_after, previous, contacts, dt):
+    """Avoidable, one-sided contact that disrupts play or can damage (9.1).
+
+    A call needs the victim to have been in the offender's lane for the time
+    needed to stop, no ball dispute between the pair, and either a fresh impact
+    (fast near the ball, or very fast anywhere) or a sustained push or pin.
+    Returns fouls and the updated lane and push timers, each indexed
+    [team, offender, victim].
+    """
+    before, after = simulation_before.robots, simulation_after.robots
+    speed = 0.5 * jnp.sum(simulation_after.wheel_speeds, axis=-1)
+    heading = jnp.stack((jnp.cos(after[..., 2]), jnp.sin(after[..., 2])), axis=-1)
+    drive = speed[..., None] * heading
+    lane_direction = jnp.sign(speed)[..., None] * heading
+    ball_distance = _robot_ball_distance(after, simulation_after.ball)
+    contacts_before = _robot_contacts(before)
+    fouls, lanes, pushes = [], [], []
     for team in range(config.N_TEAMS):
-        legal_ball_push.append(
-            _ball_between(
-                simulation_after.robots[team, :, None, :],
-                simulation_after.robots[1 - team, None, :, :],
-                simulation_after.ball,
+        offset = before[1 - team, None, :, :2] - before[team, :, None, :2]
+        direction = offset / jnp.maximum(jnp.linalg.norm(offset, axis=-1, keepdims=True), 1e-8)
+        offender_drive = jnp.sum(drive[team, :, None, :] * direction, axis=-1)
+        victim_drive = -jnp.sum(drive[1 - team, None, :, :] * direction, axis=-1)
+        touching = contacts[team, :, 1 - team, :]
+        fresh = touching & ~contacts_before[team, :, 1 - team, :]
+
+        lane = lane_direction[team, :, None, :]
+        ahead = jnp.sum(offset * lane, axis=-1)
+        lateral = jnp.abs(lane[..., 0] * offset[..., 1] - lane[..., 1] * offset[..., 0])
+        in_lane = (
+            (ahead > 0.0)
+            & (ahead < _FOUL_LANE_RANGE)
+            & (lateral < config.ROBOT_SIZE)
+            & (jnp.abs(speed[team]) > _FOUL_LANE_MIN_SPEED)[:, None]
+        )
+        # A victim that only just crossed the lane leaves the offender no time
+        # to stop. The timer holds through contact so a pin keeps its history.
+        avoidable = previous.lane_seconds[team] >= _FOUL_LANE_SECONDS - 1e-6
+        lanes.append(
+            jnp.where(
+                touching,
+                previous.lane_seconds[team],
+                jnp.where(in_lane, previous.lane_seconds[team] + dt, 0.0),
             )
         )
-    return initiated & ~jnp.stack(legal_ball_push)
+        pushing = (
+            touching
+            & (offender_drive > _FOUL_PUSH_SPEED)
+            & (offender_drive > victim_drive + _FOUL_PUSH_SPEED)
+        )
+        push = jnp.where(pushing, previous.push_seconds[team] + dt, 0.0)
+        pushes.append(push)
+
+        at_fault = offender_drive - victim_drive >= _FOUL_FAULT_MARGIN
+        involved = ball_distance[1 - team][None, :] <= _FOUL_PLAY_DISTANCE
+        dispute = (ball_distance[team][:, None] <= _FOUL_DISPUTE_DISTANCE) & (
+            ball_distance[1 - team][None, :] <= _FOUL_DISPUTE_DISTANCE
+        )
+        impact = (
+            fresh
+            & at_fault
+            & (
+                ((offender_drive >= _FOUL_IMPACT_SPEED) & involved)
+                | (offender_drive >= _FOUL_HARD_IMPACT_SPEED)
+            )
+        )
+        pin = push >= _FOUL_PUSH_SECONDS - 1e-6
+        fouls.append(avoidable & ~dispute & (impact | pin))
+    return jnp.stack(fouls), jnp.stack(lanes), jnp.stack(pushes)
 
 
 def _free_ball_quadrant(ball: jax.Array, key: jax.Array) -> jax.Array:
@@ -155,6 +236,24 @@ def _free_ball_quadrant(ball: jax.Array, key: jax.Array) -> jax.Array:
     return sides[0] + 2 * sides[1]
 
 
+def _goal_only_decision(goal: jax.Array) -> _RefereeDecision:
+    """Decision for a match without a referee: only goals stop play."""
+    goal_event = goal != 0
+    conceding_team = jnp.where(goal == 1, config.TEAM_YELLOW, config.TEAM_BLUE)
+    return _RefereeDecision(
+        event=jnp.where(
+            goal_event, jnp.int32(RefereeEvent.GOAL), jnp.int32(RefereeEvent.NONE)
+        ),
+        offending_team=jnp.int32(-1),
+        restart=jnp.where(
+            goal_event, jnp.int32(RestartType.KICKOFF), jnp.int32(RestartType.NONE)
+        ),
+        restart_team=jnp.where(goal_event, conceding_team, -1).astype(jnp.int32),
+        quadrant=jnp.int32(-1),
+        state=initial_referee_state(),
+    )
+
+
 def _resolve_referee(
     simulation_before: physics.SimState,
     simulation: physics.SimState,
@@ -162,8 +261,18 @@ def _resolve_referee(
     goal: jax.Array,
     dt: jax.Array | None = None,
     tie_break_key: jax.Array | None = None,
+    mode: RefereeMode | str = RefereeMode.FULL,
 ) -> _RefereeDecision:
-    """Resolve fouls, goalkeeper possession, and ball-stoppage restarts."""
+    """Resolve fouls, goalkeeper possession, and ball-stoppage restarts.
+
+    ``mode`` is static. OFF reports goals only; SIMPLIFIED keeps the two-robot
+    goal-area fouls and frees a stuck ball anywhere; FULL applies every call.
+    """
+    mode = RefereeMode(mode)
+    if mode is RefereeMode.OFF:
+        return _goal_only_decision(goal)
+    full = mode is RefereeMode.FULL
+    never = jnp.asarray(False)
     dt = jnp.float32(config.DT) if dt is None else jnp.asarray(dt, dtype=jnp.float32)
     # Both teams can initiate separate fouls in one control interval. A plain
     # argmax always chooses team zero in that case. Use the match's seeded key to
@@ -254,6 +363,27 @@ def _resolve_referee(
     attacking_team = 1 - choose_team(attacking_violations)
     defending_team = choose_team(defending_violations)
 
+    # Rule 9.2.2 awards the penalty unless the attackers score. Play on while
+    # the attack lasts; the timer bounds an attack that never resolves.
+    advantage_pending = previous.advantage_team >= 0
+    defender_foul = advantage_pending | has_defending_violation
+    advantage_team = jnp.where(
+        advantage_pending, previous.advantage_team, 1 - defending_team
+    ).astype(jnp.int32)
+    advantage_seconds = jnp.where(
+        advantage_pending, previous.advantage_seconds + dt, jnp.zeros_like(dt)
+    )
+    attack_continues = ball_areas[1 - advantage_team]
+    advantage_expired = advantage_seconds >= _RULE_TIMEOUT_SECONDS - 1e-6
+
+    if full:
+        push_hits, lane_seconds, push_seconds = _personal_fouls(
+            simulation_before, simulation, previous, contacts, dt
+        )
+    else:
+        push_hits = jnp.zeros_like(previous.lane_seconds, dtype=jnp.bool_)
+        lane_seconds = push_seconds = jnp.zeros_like(previous.lane_seconds)
+
     # The goalkeeper is the longest-standing robot in its own goal area.
     goalkeeper_indices = []
     goalkeeper_present = []
@@ -264,8 +394,6 @@ def _resolve_referee(
         stay = area_seconds[team, :, team]
         goalkeeper_index = jnp.argmax(jnp.where(own_area, stay, -1.0))
         has_goalkeeper = jnp.any(own_area)
-        goalkeeper = simulation.robots[team, goalkeeper_index]
-        opponents = simulation.robots[1 - team]
         opponent_near_ball = jnp.any(near_ball[1 - team])
         keeper_touches_ball = ball_contacts[team, goalkeeper_index]
         # Possession must end with the ball outside the area. Dribbling or
@@ -276,13 +404,10 @@ def _resolve_referee(
             & ~opponent_near_ball
             & (keeper_touches_ball | (previous.goalkeeper_hold_seconds[team] > 0))
         )
+        # Contact with the goalkeeper is ordinary play. Only a personal foul
+        # by an attacker in the area (Rules 9.2.1 and 14) is a block.
         attacker_in_area = areas_after[1 - team, :, team]
-        blocks = (
-            attacker_in_area
-            & has_goalkeeper
-            & initiated[1 - team, :, goalkeeper_index]
-            & ~_ball_between(opponents, goalkeeper, simulation.ball)
-        )
+        blocks = attacker_in_area & has_goalkeeper & push_hits[1 - team, :, goalkeeper_index]
         goalkeeper_indices.append(goalkeeper_index)
         goalkeeper_present.append(has_goalkeeper)
         goalkeeper_holds.append(holds_ball)
@@ -298,7 +423,7 @@ def _resolve_referee(
         jnp.zeros_like(previous.goalkeeper_hold_seconds),
     )
     goalkeeper_timeouts = hold_seconds >= _RULE_TIMEOUT_SECONDS - 1e-6
-    has_goalkeeper_timeout = jnp.any(goalkeeper_timeouts)
+    has_goalkeeper_timeout = jnp.any(goalkeeper_timeouts) if full else never
     timeout_team = choose_team(goalkeeper_timeouts)
 
     ball_side = jnp.argmax(ball_areas.astype(jnp.int32))
@@ -311,27 +436,24 @@ def _resolve_referee(
         & attacker_near_impasse_ball
     )
     ball_speed = jnp.linalg.norm(simulation.ball[2:4])
-    goal_area_ball_is_stuck = ball_speed <= _BALL_STUCK_SPEED
-    field_ball_is_stopped = ball_speed < _FREE_BALL_STOPPED_SPEED
-    impasse = jnp.where(
-        ball_in_goal_area,
-        goal_area_ball_is_stuck & goal_area_contest,
-        field_ball_is_stopped,
-    )
+    ball_is_stuck = ball_speed <= _BALL_STUCK_SPEED
+    # Simplified matches free a stuck ball anywhere, goal areas included. Full
+    # matches apply the goal-area impasse and stopped-ball rules there instead.
+    field_stoppage = ~ball_in_goal_area if full else jnp.asarray(True)
     goal_area_impasse_seconds = jnp.where(
-        impasse & ball_in_goal_area,
+        ball_in_goal_area & ball_is_stuck & goal_area_contest,
         previous.goal_area_impasse_seconds + dt,
         jnp.zeros_like(previous.goal_area_impasse_seconds),
     )
     field_impasse_seconds = jnp.where(
-        impasse & ~ball_in_goal_area,
+        field_stoppage & ball_is_stuck,
         previous.field_impasse_seconds + dt,
         jnp.zeros_like(previous.field_impasse_seconds),
     )
-    # A ball left at rest in a goal area without a contest is the defending
-    # team's fault: its goalkeeper had the free-ball timeout to clear it.
+    # A ball stuck in a goal area without a contest is the defending team's
+    # fault: its goalkeeper had the free-ball timeout to clear it.
     goal_area_stopped_seconds = jnp.where(
-        ball_in_goal_area & field_ball_is_stopped & ~goal_area_contest,
+        ball_in_goal_area & ball_is_stuck & ~goal_area_contest,
         previous.goal_area_stopped_seconds + dt,
         jnp.zeros_like(previous.goal_area_stopped_seconds),
     )
@@ -340,25 +462,39 @@ def _resolve_referee(
     ) & ball_in_goal_area
     field_impasse = (
         field_impasse_seconds >= _FREE_BALL_TIMEOUT_SECONDS - 1e-6
-    ) & ~ball_in_goal_area
+    ) & field_stoppage
     goal_area_stopped_ball = (
         goal_area_stopped_seconds >= _FREE_BALL_TIMEOUT_SECONDS - 1e-6
     ) & ball_in_goal_area
+    if not full:
+        goal_area_impasse = goal_area_stopped_ball = never
 
-    # Only physical, initiated contact qualifies; proximity is not a foul.
-    push_hits = _illegal_push(simulation_before, simulation, initiated)
     push_by_team = jnp.any(push_hits, axis=(1, 2))
     has_personal_foul = jnp.any(push_by_team)
     personal_foul_team = choose_team(push_by_team)
 
     goal_event = goal != 0
-    has_goalkeeper_block = jnp.any(goalkeeper_blocks)
+    has_goalkeeper_block = jnp.any(goalkeeper_blocks) if full else never
     goalkeeper_blocking_team = choose_team(goalkeeper_blocks)
+    other_call = (
+        has_attacking_violation
+        | has_goalkeeper_block
+        | has_goalkeeper_timeout
+        | has_personal_foul
+        | goal_area_impasse
+        | goal_area_stopped_ball
+        | field_impasse
+    )
+    # The earlier defender foul takes precedence over any later stoppage.
+    award_penalty = (
+        defender_foul & ~goal_event & (~attack_continues | advantage_expired | other_call)
+    )
+    play_on = defender_foul & ~goal_event & ~award_penalty
     event = jnp.where(
         goal_event,
         jnp.int32(RefereeEvent.GOAL),
         jnp.where(
-            has_defending_violation,
+            award_penalty,
             jnp.int32(RefereeEvent.DEFENDER_GOAL_AREA),
             jnp.where(
                 has_attacking_violation,
@@ -394,7 +530,7 @@ def _resolve_referee(
 
     offending_team = jnp.where(
         event == RefereeEvent.DEFENDER_GOAL_AREA,
-        defending_team,
+        1 - advantage_team,
         jnp.where(
             event == RefereeEvent.ATTACKER_GOAL_AREA,
             attacking_team,
@@ -460,7 +596,7 @@ def _resolve_referee(
     restart_team = jnp.where(restart == RestartType.NONE, -1, restart_team).astype(jnp.int32)
     moved_since_free_ball = (
         jnp.linalg.norm(simulation.ball[:2] - previous.free_ball_origin) > _BALL_MOVEMENT_TOLERANCE
-    ) | (ball_speed >= _FREE_BALL_STOPPED_SPEED)
+    ) | (ball_speed >= _BALL_MOVEMENT_SPEED)
     previous_count = jnp.where(moved_since_free_ball, 0, previous.free_ball_count)
     stopped_quadrant = jnp.where(
         previous.field_impasse_seconds > 0,
@@ -521,6 +657,12 @@ def _resolve_referee(
             whistle,
             jnp.int32(MatchPhase.STOPPED),
             jnp.int32(MatchPhase.PLAYING),
+        ),
+        lane_seconds=jnp.where(goal_event | whistle, jnp.zeros_like(lane_seconds), lane_seconds),
+        push_seconds=jnp.where(goal_event | whistle, jnp.zeros_like(push_seconds), push_seconds),
+        advantage_team=jnp.where(play_on, advantage_team, -1).astype(jnp.int32),
+        advantage_seconds=jnp.where(
+            play_on, advantage_seconds, jnp.zeros_like(advantage_seconds)
         ),
     )
     return _RefereeDecision(

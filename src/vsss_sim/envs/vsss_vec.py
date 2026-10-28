@@ -16,7 +16,7 @@ from gymnasium import spaces
 from gymnasium.vector import VectorEnv
 
 from .. import config, physics
-from ..config import InitMode, RewardProfile
+from ..config import InitMode, RefereeMode, RewardProfile
 from .match_rules import (
     MatchPhase,
     MatchRules,
@@ -53,6 +53,7 @@ class VSSVecEnv(VectorEnv):
         max_episode_steps: int = config.MAX_EPISODE_STEPS,
         init_mode: InitMode | str = InitMode.KICKOFF,
         reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
+        referee_mode: RefereeMode | str = RefereeMode.FULL,
     ) -> None:
         super().__init__()
 
@@ -72,6 +73,7 @@ class VSSVecEnv(VectorEnv):
             reward_profile=reward_profile,
             max_episode_steps=max_episode_steps,
             init_mode=self._init_mode,
+            referee_mode=referee_mode,
         )
 
         obs_dim = 4 + config.N_TEAMS * config.N_ROBOTS * 7

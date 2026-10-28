@@ -9,10 +9,12 @@ from vsss_sim import config
 from vsss_sim.config import RewardProfile
 from vsss_sim.envs.match_geometry import (
     _goal_area_membership,
+    _robot_contacts,
     _robot_goal_area_fraction,
 )
 from vsss_sim.envs.match_restarts import _restart_positions
 from vsss_sim.envs.match_rules import (
+    MatchPhase,
     MatchRules,
     MatchStepInput,
     RefereeEvent,
@@ -91,40 +93,150 @@ def test_goal_area_membership_includes_any_footprint_contact(
     assert bool(membership[config.TEAM_BLUE, 0, 0]) is expected_membership
 
 
-@pytest.mark.parametrize("offending_team", [config.TEAM_BLUE, config.TEAM_YELLOW])
-def test_personal_foul_identifies_the_team_that_advances_into_the_opponent(
+def _contact_scene(
     offending_team: int,
+    offender_speed: float,
+    victim_speed: float = 0.0,
+    ball: tuple[float, float, float, float] = (0.0, 0.5, 0.0, 0.0),
+    lane_seconds: float = 0.3,
+    push_seconds: float = 0.0,
+    start_gap: float = 0.09,
 ):
-    before = _simulation()
-    robots_before = before.robots
-    goal_area_x = -0.66 if offending_team == config.TEAM_BLUE else 0.66
-    direction = 1.0 if offending_team == config.TEAM_BLUE else -1.0
-    victim_x = goal_area_x + direction * 0.075
-    robots_before = robots_before.at[offending_team, 0, 0:2].set(
-        [goal_area_x - direction * 0.09, 0.0]
-    )
-    robots_before = robots_before.at[1 - offending_team, 0, 0:2].set([victim_x, 0.0])
-    robots_after = robots_before.at[offending_team, 0, 0:2].set([goal_area_x, 0.0])
-    after = before._replace(robots=robots_after)
+    """Robot 0 of ``offending_team`` drives along x into the opponent's robot 0.
 
-    result = MatchRules().step(_context(before._replace(robots=robots_before), after))
+    Speeds are wheel drives toward the other robot; the referee state carries
+    how long the victim has been in the offender's lane.
+    """
+    direction = 1.0 if offending_team == config.TEAM_BLUE else -1.0
+    before = _simulation(ball=ball)
+    victim_x = direction * 0.10
+    offender_x = victim_x - direction * (config.ROBOT_SIZE + start_gap)
+    facing = 0.0 if direction > 0 else np.pi
+    robots = before.robots.at[offending_team, 0, :3].set([offender_x, 0.0, facing])
+    robots = robots.at[1 - offending_team, 0, :3].set([victim_x, 0.0, facing + np.pi])
+    wheels = jnp.zeros_like(before.wheel_speeds)
+    wheels = wheels.at[offending_team, 0].set(offender_speed)
+    wheels = wheels.at[1 - offending_team, 0].set(victim_speed)
+    before = before._replace(robots=robots, wheel_speeds=wheels)
+    after = before._replace(
+        robots=robots.at[offending_team, 0, 0].set(victim_x - direction * config.ROBOT_SIZE)
+    )
+    referee = initial_referee_state()
+    referee = referee._replace(
+        lane_seconds=referee.lane_seconds.at[offending_team, 0, 0].set(lane_seconds),
+        push_seconds=referee.push_seconds.at[offending_team, 0, 0].set(push_seconds),
+    )
+    return before, after, referee
+
+
+def _call(before, after, referee, **rules):
+    return MatchRules(**rules).step(_context(before, after)._replace(referee_state=referee))
+
+
+@pytest.mark.parametrize("offending_team", [config.TEAM_BLUE, config.TEAM_YELLOW])
+def test_avoidable_hard_impact_is_a_personal_foul_anywhere(offending_team: int):
+    result = _call(*_contact_scene(offending_team, offender_speed=1.2))
 
     assert int(result.event) == RefereeEvent.PERSONAL_FOUL
     assert int(result.offending_team) == offending_team
     assert int(result.restart_team) == 1 - offending_team
+    assert int(result.restart) == RestartType.FREE_KICK
 
 
-def test_personal_contact_at_midfield_is_called_independently_of_ball_area():
-    before = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
-    robots_before = before.robots.at[config.TEAM_BLUE, 0, 0:2].set([0.15, 0.0])
-    robots_before = robots_before.at[config.TEAM_YELLOW, 0, 0:2].set([0.12, 0.0])
-    robots_after = robots_before.at[config.TEAM_BLUE, 0, 0:2].set([0.05, 0.0])
-    after = before._replace(robots=robots_after)
+@pytest.mark.parametrize("offending_team", [config.TEAM_BLUE, config.TEAM_YELLOW])
+@pytest.mark.parametrize("ball_near_victim, expected", [
+    (True, RefereeEvent.PERSONAL_FOUL), (False, RefereeEvent.NONE),
+])
+def test_moderate_impact_is_a_foul_only_on_a_victim_involved_in_play(
+    offending_team: int, ball_near_victim: bool, expected: RefereeEvent
+):
+    direction = 1.0 if offending_team == config.TEAM_BLUE else -1.0
+    ball = (direction * 0.20, 0.0, 0.0, 0.0) if ball_near_victim else (0.0, 0.5, 0.0, 0.0)
 
-    result = MatchRules().step(_context(before._replace(robots=robots_before), after))
+    result = _call(*_contact_scene(offending_team, offender_speed=0.7, ball=ball))
+
+    assert int(result.event) == expected
+
+
+@pytest.mark.parametrize(
+    "scene",
+    [
+        # The victim only just entered the lane: the offender could not stop.
+        dict(offender_speed=1.2, lane_seconds=0.1),
+        # Both drive into each other: no clear fault.
+        dict(offender_speed=1.2, victim_speed=1.0),
+        # Leaning into a resting contact.
+        dict(offender_speed=0.05, start_gap=0.0),
+        # Both robots dispute a ball beside them.
+        dict(offender_speed=1.2, ball=(0.0625, 0.065, 0.0, 0.0)),
+    ],
+    ids=["lane-cut", "mutual", "creep", "dispute"],
+)
+def test_unavoidable_mutual_slow_or_disputed_contact_plays_on(scene: dict):
+    result = _call(*_contact_scene(config.TEAM_BLUE, **scene))
+
+    assert int(result.event) == RefereeEvent.NONE
+
+
+@pytest.mark.parametrize("pushed, expected", [
+    (0.95, RefereeEvent.PERSONAL_FOUL), (0.85, RefereeEvent.NONE),
+])
+def test_sustained_push_becomes_a_foul_after_one_second(pushed: float, expected: RefereeEvent):
+    before, after, referee = _contact_scene(
+        config.TEAM_BLUE, offender_speed=0.5, start_gap=0.0, push_seconds=pushed
+    )
+    after = after._replace(robots=before.robots)
+
+    result = _call(before, after, referee)
+
+    assert int(result.event) == expected
+    if expected == RefereeEvent.NONE:
+        assert float(result.referee_state.push_seconds[0, 0, 0]) == pytest.approx(0.95)
+
+
+def _drive_until_call(simulation, actions, steps=6):
+    rules = MatchRules()
+    referee = initial_referee_state()
+    for index in range(steps):
+        after, info = physics.step(simulation, actions)
+        result = rules.step(
+            _context(simulation, after, goal=int(info["goal"]))._replace(referee_state=referee)
+        )
+        if int(result.event) != RefereeEvent.NONE:
+            return result
+        simulation, referee = result.simulation, result.referee_state
+    return result
+
+
+def test_ramming_a_robot_that_stood_in_the_lane_is_a_foul():
+    simulation = _simulation(ball=(0.5, -0.5, 0.0, 0.0))
+    robots = simulation.robots.at[config.TEAM_BLUE, 0, :3].set([-0.30, 0.2, 0.0])
+    robots = robots.at[config.TEAM_YELLOW, 0, :3].set([0.0, 0.2, np.pi / 2])
+    actions = jnp.zeros((2, 3, 2)).at[config.TEAM_BLUE, 0].set(1.0)
+
+    result = _drive_until_call(simulation._replace(robots=robots), actions)
 
     assert int(result.event) == RefereeEvent.PERSONAL_FOUL
-    assert int(result.restart) == RestartType.FREE_KICK
+    assert int(result.offending_team) == config.TEAM_BLUE
+
+
+def test_cutting_across_a_driving_robot_does_not_draw_a_foul():
+    simulation = _simulation(ball=(0.5, -0.5, 0.0, 0.0))
+    robots = simulation.robots.at[config.TEAM_BLUE, 0, :3].set([-0.30, 0.2, 0.0])
+    robots = robots.at[config.TEAM_YELLOW, 0, :3].set([-0.05, 0.05, np.pi / 2])
+    actions = jnp.zeros((2, 3, 2)).at[:, 0].set(1.0)
+    simulation = simulation._replace(robots=robots)
+
+    rules = MatchRules()
+    referee = initial_referee_state()
+    touched = False
+    for _ in range(4):
+        after, info = physics.step(simulation, actions)
+        touched |= bool(_robot_contacts(after.robots)[0, 0, 1, 0])
+        result = rules.step(_context(simulation, after)._replace(referee_state=referee))
+        assert int(result.event) != RefereeEvent.PERSONAL_FOUL
+        simulation, referee = result.simulation, result.referee_state
+    assert touched
 
 
 @pytest.mark.parametrize(
@@ -150,34 +262,6 @@ def test_two_attackers_require_an_attack_but_not_an_opposing_defender(
     assert int(result.event) == expected_event
     if expected_event == RefereeEvent.ATTACKER_GOAL_AREA:
         assert int(result.offending_team) == config.TEAM_BLUE
-
-
-def test_foul_is_detected_near_goal_area_ball_when_robots_are_outside_area():
-    before = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
-    robots_before = before.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.48, 0.0])
-    robots_before = robots_before.at[config.TEAM_YELLOW, 0, 0:2].set([-0.58, 0.0])
-    robots_after = robots_before.at[config.TEAM_BLUE, 0, 0:2].set([-0.56, 0.0])
-    after = before._replace(robots=robots_after)
-    before = before._replace(robots=robots_before)
-
-    result = MatchRules().step(_context(before, after))
-
-    assert int(result.event) == RefereeEvent.PERSONAL_FOUL
-    assert int(result.offending_team) == config.TEAM_BLUE
-
-
-def test_contact_with_ball_between_robots_is_not_a_personal_foul():
-    before = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
-    robots_before = before.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.80, 0.0])
-    robots_before = robots_before.at[config.TEAM_YELLOW, 0, 0:2].set([-0.62, 0.0])
-    robots_after = robots_before.at[config.TEAM_BLUE, 0, 0:2].set([-0.70, 0.0])
-    before = before._replace(robots=robots_before)
-    after = before._replace(robots=robots_after)
-
-    result = MatchRules().step(_context(before, after))
-
-    assert int(result.event) == RefereeEvent.NONE
-    assert int(result.restart) == RestartType.NONE
 
 
 @pytest.mark.parametrize(
@@ -239,17 +323,82 @@ def test_two_defenders_without_an_attack_do_not_create_a_delayed_penalty():
     assert int(result.event) == RefereeEvent.NONE
 
 
-def test_defender_goal_area_violation_is_immediate_during_active_ball_contest():
+def _defender_foul_scene():
+    """A second blue defender touches the ball while yellow attacks blue's area."""
     simulation = _simulation(ball=(-0.66, 0.0, 0.0, 0.0))
     robots = simulation.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.70, 0.0])
     robots = robots.at[config.TEAM_BLUE, 1, 0:2].set([-0.62, 0.0])
     robots = robots.at[config.TEAM_YELLOW, 0, 0:2].set([-0.60, 0.0])
-    simulation = simulation._replace(robots=robots)
+    return simulation._replace(robots=robots)
 
-    result = MatchRules().step(_context(simulation, simulation))
+
+def test_defender_foul_plays_advantage_until_the_attack_ends():
+    simulation = _defender_foul_scene()
+    step = jax.jit(MatchRules().step)
+
+    foul = step(_context(simulation, simulation))
+    assert int(foul.event) == RefereeEvent.NONE
+    assert int(foul.referee_state.advantage_team) == config.TEAM_YELLOW
+    assert int(foul.referee_state.phase) == MatchPhase.PLAYING
+
+    cleared = simulation._replace(ball=simulation.ball.at[0].set(-0.40))
+    result = step(_context(simulation, cleared)._replace(referee_state=foul.referee_state))
 
     assert int(result.event) == RefereeEvent.DEFENDER_GOAL_AREA
     assert int(result.offending_team) == config.TEAM_BLUE
+    assert int(result.restart) == RestartType.PENALTY_KICK
+    assert int(result.restart_team) == config.TEAM_YELLOW
+    assert int(result.referee_state.advantage_team) == -1
+
+
+def test_goal_during_defender_foul_advantage_cancels_the_penalty():
+    simulation = _defender_foul_scene()
+    foul = MatchRules().step(_context(simulation, simulation))
+
+    result = MatchRules().step(
+        _context(simulation, simulation, goal=-1)._replace(referee_state=foul.referee_state)
+    )
+
+    assert int(result.event) == RefereeEvent.GOAL
+    assert result.simulation.score.tolist() == [2, 4]
+    assert int(result.referee_state.advantage_team) == -1
+
+
+def test_defender_foul_advantage_expires_after_five_seconds():
+    simulation = _defender_foul_scene()
+    referee = initial_referee_state()._replace(
+        advantage_team=jnp.int32(config.TEAM_YELLOW), advantage_seconds=jnp.float32(4.85)
+    )
+    almost = MatchRules().step(_context(simulation, simulation)._replace(referee_state=referee))
+    assert int(almost.event) == RefereeEvent.NONE
+
+    result = MatchRules().step(
+        _context(simulation, simulation)._replace(referee_state=almost.referee_state)
+    )
+
+    assert int(result.event) == RefereeEvent.DEFENDER_GOAL_AREA
+
+
+@pytest.mark.parametrize("pending, expected", [
+    (False, RefereeEvent.GOAL_AREA_IMPASSE), (True, RefereeEvent.DEFENDER_GOAL_AREA),
+])
+def test_pending_defender_foul_takes_precedence_over_a_later_call(
+    pending: bool, expected: RefereeEvent
+):
+    # Keeper and attacker contest a stuck ball; the second defender has left.
+    simulation = _defender_foul_scene()
+    simulation = simulation._replace(
+        robots=simulation.robots.at[config.TEAM_BLUE, 1, 0:2].set([-0.3, 0.3])
+    )
+    referee = initial_referee_state()._replace(goal_area_impasse_seconds=jnp.float32(4.99))
+    if pending:
+        referee = referee._replace(
+            advantage_team=jnp.int32(config.TEAM_YELLOW), advantage_seconds=jnp.float32(1.0)
+        )
+
+    result = MatchRules().step(_context(simulation, simulation)._replace(referee_state=referee))
+
+    assert int(result.event) == expected
 
 
 @pytest.mark.parametrize("reward_profile", list(RewardProfile))
@@ -275,10 +424,43 @@ def test_uncontested_stopped_ball_in_goal_area_awards_penalty_against_area_team(
 
 
 @pytest.mark.parametrize(
+    "reward_profile, individual_agent_rewards",
+    [
+        (RewardProfile.DEFAULT, False),
+        (RewardProfile.BRANDAO_REWARD, False),
+        (RewardProfile.BRANDAO_REWARD, True),
+    ],
+)
+def test_fouled_team_keeps_its_ordinary_reward(
+    reward_profile: RewardProfile, individual_agent_rewards: bool
+):
+    # Yellow leaves the ball stuck in its own area: a penalty for blue.
+    simulation = _simulation(ball=(0.66, 0.1, 0.0, 0.0))
+    rules = MatchRules(
+        reward_profile=reward_profile, individual_agent_rewards=individual_agent_rewards
+    )
+
+    def step(stopped_seconds):
+        referee = initial_referee_state()._replace(
+            goal_area_stopped_seconds=jnp.float32(stopped_seconds)
+        )
+        context = _context(simulation, simulation)._replace(
+            referee_state=referee, dt=jnp.float32(0.02)
+        )
+        return rules.step(context)
+
+    foul, ordinary = step(4.99), step(0.0)
+
+    assert int(foul.event) == RefereeEvent.GOAL_AREA_STOPPED_BALL
+    assert int(foul.offending_team) == config.TEAM_YELLOW
+    np.testing.assert_allclose(foul.reward, ordinary.reward)
+
+
+@pytest.mark.parametrize(
     "ball,robots",
     [
-        # Rolling ball: not at rest.
-        ((-0.66, 0.0, 0.05, 0.0), []),
+        # Rolling faster than the 0.1 m/s stuck-ball threshold.
+        ((-0.66, 0.0, 0.15, 0.0), []),
         # Contested ball: the goal-area impasse rule applies instead.
         ((-0.66, 0.0, 0.0, 0.0), [(config.TEAM_YELLOW, 0, -0.63, 0.0), (config.TEAM_BLUE, 0, -0.69, 0.0)]),
         # Ball at rest outside the goal areas: the free-ball rule applies instead.
@@ -349,24 +531,33 @@ def test_free_kick_formation_keeps_players_off_the_ball_and_each_other(restart_t
 
 
 @pytest.mark.parametrize(
-    "attacker_moves, expected_event",
-    [(False, RefereeEvent.NONE), (True, RefereeEvent.GOALKEEPER_BLOCK)],
+    "attacker_speed, ball, expected_event",
+    [
+        # Ordinary contact with the goalkeeper plays on.
+        (0.5, (0.0, 0.5, 0.0, 0.0), RefereeEvent.NONE),
+        # So does a hard contact while both dispute the ball.
+        (1.2, (-0.6225, 0.065, 0.0, 0.0), RefereeEvent.NONE),
+        # An avoidable hard hit on the goalkeeper inside its area is a block.
+        (1.2, (0.0, 0.5, 0.0, 0.0), RefereeEvent.GOALKEEPER_BLOCK),
+    ],
+    ids=["ordinary", "dispute", "hard-hit"],
 )
-def test_goalkeeper_block_requires_observed_closing_motion(
-    attacker_moves: bool, expected_event: RefereeEvent
+def test_goalkeeper_block_is_only_a_personal_foul_on_the_goalkeeper(
+    attacker_speed: float, ball: tuple, expected_event: RefereeEvent
 ):
-    before = _simulation()
-    robots_before = before.robots.at[config.TEAM_BLUE, 0, 0:2].set([-0.66, 0.0])
-    attacker_start = -0.44 if attacker_moves else -0.62
-    robots_before = robots_before.at[config.TEAM_YELLOW, 0, 0:2].set([attacker_start, 0.0])
-    robots_after = robots_before.at[config.TEAM_YELLOW, 0, 0:2].set([-0.62, 0.0])
-    after = before._replace(robots=robots_after)
-    context = _context(before._replace(robots=robots_before), after)
+    before = _simulation(ball=ball)
+    robots = before.robots.at[config.TEAM_BLUE, 0, :3].set([-0.66, 0.0, 0.0])
+    robots = robots.at[config.TEAM_YELLOW, 0, :3].set([-0.495, 0.0, np.pi])
+    wheels = before.wheel_speeds.at[config.TEAM_YELLOW, 0].set(attacker_speed)
+    before = before._replace(robots=robots, wheel_speeds=wheels)
+    after = before._replace(robots=robots.at[config.TEAM_YELLOW, 0, 0].set(-0.585))
+    referee = initial_referee_state()
+    referee = referee._replace(lane_seconds=referee.lane_seconds.at[1, 0, 0].set(0.3))
 
-    result = MatchRules().step(context)
+    result = _call(before, after, referee)
 
     assert int(result.event) == expected_event
-    if attacker_moves:
+    if expected_event == RefereeEvent.GOALKEEPER_BLOCK:
         assert int(result.offending_team) == config.TEAM_YELLOW
         assert int(result.restart) == RestartType.GOAL_KICK
 
@@ -496,3 +687,59 @@ def test_match_step_rules_jit_and_vmap():
 def test_unknown_reward_profile_is_rejected(profile: str):
     with pytest.raises(ValueError, match="RewardProfile"):
         MatchRules(reward_profile=profile)
+
+
+def test_off_referee_mode_only_stops_play_for_goals():
+    rules = dict(referee_mode="off")
+    assert int(_call(*_contact_scene(config.TEAM_BLUE, 1.2), **rules).event) == RefereeEvent.NONE
+    foul = _defender_foul_scene()
+    assert int(_call(foul, foul, initial_referee_state(), **rules).event) == RefereeEvent.NONE
+    stopped = _simulation()
+    referee = initial_referee_state()._replace(field_impasse_seconds=jnp.float32(4.99))
+    result = _call(stopped, stopped, referee, **rules)
+    assert int(result.event) == RefereeEvent.NONE
+    assert int(result.referee_state.phase) == MatchPhase.PLAYING
+
+    goal = MatchRules(referee_mode="off").step(_context(stopped, stopped, goal=1))
+
+    assert int(goal.event) == RefereeEvent.GOAL
+    assert int(goal.restart) == RestartType.KICKOFF
+    assert int(goal.restart_team) == config.TEAM_YELLOW
+
+
+def test_simplified_referee_mode_keeps_area_fouls_and_free_balls_only():
+    rules = dict(referee_mode="simplified")
+    assert int(_call(*_contact_scene(config.TEAM_BLUE, 1.2), **rules).event) == RefereeEvent.NONE
+    foul = _defender_foul_scene()
+    assert int(_call(foul, foul, initial_referee_state(), **rules).referee_state.advantage_team) == (
+        config.TEAM_YELLOW
+    )
+    holding = _simulation(ball=(-0.66, 0.0, 0.2, 0.0))
+    holding = holding._replace(robots=holding.robots.at[0, 0, :2].set(jnp.asarray([-0.70, 0.0])))
+    referee = initial_referee_state()._replace(goalkeeper_hold_seconds=jnp.asarray([4.99, 0.0]))
+    assert int(_call(holding, holding, referee).event) == RefereeEvent.GOALKEEPER_TIMEOUT
+    assert int(_call(holding, holding, referee, **rules).event) == RefereeEvent.NONE
+
+    # A stuck ball inside a goal area is freed rather than left to stall.
+    stuck = _simulation(ball=(-0.66, 0.1, 0.0, 0.0))
+    referee = initial_referee_state()._replace(
+        field_impasse_seconds=jnp.float32(4.99), field_impasse_quadrant=jnp.int32(2)
+    )
+    result = _call(stuck, stuck, referee, **rules)
+
+    assert int(result.event) == RefereeEvent.FIELD_IMPASSE
+    assert int(result.restart) == RestartType.FREE_BALL
+    np.testing.assert_allclose(result.simulation.ball[:2], [-0.375, 0.40])
+
+
+@pytest.mark.parametrize("referee_mode", ["simplified", "full"])
+@pytest.mark.parametrize("speed, stuck", [(0.08, True), (0.12, False)])
+def test_ball_slower_than_vssreferee_threshold_counts_as_stuck(
+    referee_mode: str, speed: float, stuck: bool
+):
+    simulation = _simulation(ball=(0.0, 0.2, speed, 0.0))
+
+    result = _call(simulation, simulation, initial_referee_state(), referee_mode=referee_mode)
+
+    expected = pytest.approx(config.DT) if stuck else 0.0
+    assert float(result.referee_state.field_impasse_seconds) == expected

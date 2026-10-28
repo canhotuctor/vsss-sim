@@ -438,7 +438,7 @@ def _ball_robot_collisions(state: SimState) -> SimState:
     All penetrations are computed simultaneously via vmap, then corrections are
     summed. Slightly less accurate than sequential resolution but equivalent
     throughput-wise on GPU and correct enough for RL over config.SUB_STEPS sub-steps.
-    (config.SUB_STEPS is 4 by default, but may be greater for higher accuracy.)
+    (config.SUB_STEPS is 6 by default, but may be greater for higher accuracy.)
     """
     robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
     m_b = jnp.float32(config.BALL_MASS)
@@ -681,6 +681,35 @@ def _substep(
     return state, goal
 
 
+def _control_inputs(
+    actions: jnp.ndarray, dt: float, sub_steps: int
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Wheel targets, sub-step duration, and slew limit for one control step."""
+    actions = jnp.clip(actions, -1.0, 1.0).astype(jnp.float32)
+    target_speeds = actions * jnp.float32(config.ROBOT_MAX_WHEEL_SPEED)
+    sub_dt = jnp.float32(dt / sub_steps)
+    max_delta = jnp.float32(config.ROBOT_WHEEL_ACCEL_LIMIT) * sub_dt
+    return target_speeds, sub_dt, max_delta
+
+
+def _control_substep(
+    carry: tuple[SimState, jnp.ndarray],
+    target_speeds: jnp.ndarray,
+    sub_dt: jnp.ndarray,
+    max_delta: jnp.ndarray,
+) -> tuple[tuple[SimState, jnp.ndarray], jnp.ndarray]:
+    """One sub-step of a control interval; the state freezes after a goal."""
+    state, goal_acc = carry
+    state, g = jax.lax.cond(
+        goal_acc == 0,
+        lambda current: _substep(current, target_speeds, sub_dt, max_delta),
+        lambda current: (current, jnp.int32(0)),
+        state,
+    )
+    goal_acc = jnp.where(goal_acc == 0, g, goal_acc)
+    return (state, goal_acc), g
+
+
 @partial(jax.jit, static_argnames=("sub_steps",))
 def step(
     state: SimState,
@@ -695,31 +724,54 @@ def step(
     state : SimState
     actions : (N_TEAMS, N_ROBOTS, 2) jnp.float32 — normalised wheel speeds in [-1, 1].
     dt : float — control timestep (default ``config.DT``).
-    sub_steps : int — physics sub-steps per control step (static, default 4).
+    sub_steps : int — physics sub-steps per control step (static, default 6).
 
     Returns
     -------
     new_state : SimState
     info : dict with ``"goal"`` (int32 scalar).
     """
-    actions = jnp.clip(actions, -1.0, 1.0).astype(jnp.float32)
-    target_speeds = actions * jnp.float32(config.ROBOT_MAX_WHEEL_SPEED)
-    sub_dt = jnp.float32(dt / sub_steps)
-    max_delta = jnp.float32(config.ROBOT_WHEEL_ACCEL_LIMIT) * sub_dt
+    inputs = _control_inputs(actions, dt, sub_steps)
 
     def body(_, carry):
-        state, goal_acc = carry
-        state, g = jax.lax.cond(
-            goal_acc == 0,
-            lambda current: _substep(current, target_speeds, sub_dt, max_delta),
-            lambda current: (current, jnp.int32(0)),
-            state,
-        )
-        goal_acc = jnp.where(goal_acc == 0, g, goal_acc)
-        return state, goal_acc
+        carry, _ = _control_substep(carry, *inputs)
+        return carry
 
     state, goal = jax.lax.fori_loop(
         0, sub_steps, body, (state, jnp.int32(0))
     )
     state = state._replace(t=state.t + jnp.float32(dt))
     return state, {"goal": goal}
+
+
+@partial(jax.jit, static_argnames=("sub_steps",))
+def step_with_frames(
+    state: SimState,
+    actions: jnp.ndarray,
+    dt: float = config.DT,
+    sub_steps: int = config.SUB_STEPS,
+) -> tuple[SimState, dict, SimState]:
+    """Advance one control timestep exactly like :func:`step`, keeping sub-steps.
+
+    Rendering uses this to draw every intermediate state from one engine call.
+
+    Returns
+    -------
+    new_state : SimState — identical to ``step``'s result.
+    info : dict with ``"goal"`` (first goal, int32 scalar) and ``"goals"``
+        (``(sub_steps,)`` per-sub-step goal events).
+    frames : SimState whose arrays gain a leading ``sub_steps`` axis: the state
+        after each sub-step. Sub-steps after a goal repeat the frozen state, and
+        ``t`` advances only on ``new_state``.
+    """
+    inputs = _control_inputs(actions, dt, sub_steps)
+
+    def body(carry, _):
+        carry, g = _control_substep(carry, *inputs)
+        return carry, (carry[0], g)
+
+    (state, goal), (frames, goals) = jax.lax.scan(
+        body, (state, jnp.int32(0)), None, length=sub_steps
+    )
+    state = state._replace(t=state.t + jnp.float32(dt))
+    return state, {"goal": goal, "goals": goals}, frames
