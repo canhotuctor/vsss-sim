@@ -13,7 +13,7 @@ import numpy as np
 from flax import serialization
 
 from vsss_sim import config
-from vsss_sim.config import InitMode, RefereeMode, RewardProfile
+from vsss_sim.config import InitMode, PhysicsBackend, RefereeMode, RewardProfile
 from vsss_sim.envs import VSSEnv
 from vsss_sim.envs.brandao_observation import (
     advance_history,
@@ -139,6 +139,11 @@ def main() -> None:
         choices=tuple(mode.value for mode in RefereeMode),
         help="Referee calls; defaults to the experiment's mode, or full.",
     )
+    parser.add_argument(
+        "--physics-backend",
+        choices=tuple(backend.value for backend in PhysicsBackend),
+        help="Physics engine; defaults to the experiment's engine, or jax.",
+    )
     args = parser.parse_args()
     if args.episodes < 1:
         parser.error("episodes must be positive")
@@ -179,6 +184,9 @@ def main() -> None:
     referee_mode = args.referee_mode or experiment_config.get(
         "referee_mode", RefereeMode.FULL.value
     )
+    physics_backend = args.physics_backend or experiment_config.get(
+        "physics_backend", PhysicsBackend.JAX.value
+    )
     # The environment invokes the opponent once per control step. For a
     # saved policy, compute its action from the same pre-step state as blue.
     pending_yellow_action = np.zeros((config.N_ROBOTS, 2), dtype=np.float32)
@@ -195,6 +203,7 @@ def main() -> None:
         init_mode=init_mode,
         reward_profile=reward_profile,
         referee_mode=referee_mode,
+        physics_backend=physics_backend,
     )
     # Capture baseline actions too: each team's Brandão history includes its
     # own previously applied commands, including STOPPED-frame zeroing.
@@ -267,7 +276,8 @@ def main() -> None:
         f"— architecture={policy_architecture}, opponent={opponent_label}, "
         f"control={control_rate_hz:g} Hz × {physics_substeps} substeps, "
         f"speedup cap={args.speedup_rate:g}x, init={init_mode}, "
-        f"referee={referee_mode}, stochastic={args.stochastic}"
+        f"referee={referee_mode}, physics={physics_backend}, "
+        f"stochastic={args.stochastic}"
     )
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []

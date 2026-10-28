@@ -16,7 +16,7 @@ from gymnasium import spaces
 from gymnasium.vector import VectorEnv
 
 from .. import config, physics
-from ..config import InitMode, RefereeMode, RewardProfile
+from ..config import InitMode, PhysicsBackend, RefereeMode, RewardProfile
 from .match_rules import (
     MatchPhase,
     MatchRules,
@@ -54,6 +54,7 @@ class VSSVecEnv(VectorEnv):
         init_mode: InitMode | str = InitMode.KICKOFF,
         reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
         referee_mode: RefereeMode | str = RefereeMode.FULL,
+        physics_backend: PhysicsBackend | str = PhysicsBackend.JAX,
     ) -> None:
         super().__init__()
 
@@ -90,13 +91,14 @@ class VSSVecEnv(VectorEnv):
             low=-1.0, high=1.0, shape=(num_envs, config.N_ROBOTS * 2), dtype=np.float32,
         )
 
+        engine = physics.get_backend(physics_backend)
         _reset_fn = (
-            physics.reset_kickoff
+            engine.reset_kickoff
             if self._init_mode == InitMode.KICKOFF
-            else physics.reset_random
+            else engine.reset_random
         )
         self._batched_reset = jax.jit(jax.vmap(_reset_fn))
-        self._batched_step = jax.jit(jax.vmap(physics.step))
+        self._batched_step = jax.jit(jax.vmap(engine.step))
         self._batched_match_step = jax.jit(jax.vmap(self._match_rules.step))
 
         self._rng = np.random.default_rng()

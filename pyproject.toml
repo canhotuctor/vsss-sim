@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 render = ["pygame>=2.4"]
+mjx    = ["mujoco-mjx>=3.17"]
 cuda   = ["jax[cuda12]>=0.4"]
 stoix  = [
     "jumanji>=1.0",

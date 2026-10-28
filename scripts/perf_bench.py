@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark JAX physics, Gymnasium vector stepping, and native PPO inference."""
+"""Benchmark physics engines, Gymnasium vector stepping, and native PPO inference."""
 from __future__ import annotations
 
 import argparse
@@ -60,13 +60,14 @@ def _measure_rows(steps: int, batch_sizes: list[int], operation) -> list[dict]:
     return rows
 
 
-def bench_jax_vmap(steps: int, batch_sizes: list[int]) -> list[dict]:
+def bench_physics_vmap(steps: int, batch_sizes: list[int], physics_backend: str) -> list[dict]:
     import jax
     import jax.numpy as jnp
 
     from vsss_sim import config
-    from vsss_sim.physics import jax_backend as backend
+    from vsss_sim.physics import get_backend
 
+    backend = get_backend(physics_backend)
     step = jax.jit(jax.vmap(backend.step))
 
     def operation(batch: int):
@@ -85,7 +86,7 @@ def bench_jax_vmap(steps: int, batch_sizes: list[int]) -> list[dict]:
     return _measure_rows(steps, batch_sizes, operation)
 
 
-def bench_vssvecenv(steps: int, batch_sizes: list[int]) -> list[dict]:
+def bench_vssvecenv(steps: int, batch_sizes: list[int], physics_backend: str) -> list[dict]:
     import numpy as np
 
     from vsss_sim import config
@@ -93,7 +94,9 @@ def bench_vssvecenv(steps: int, batch_sizes: list[int]) -> list[dict]:
 
     rows = []
     for batch in batch_sizes:
-        env = VSSVecEnv(num_envs=batch, opponent_policy="stationary")
+        env = VSSVecEnv(
+            num_envs=batch, opponent_policy="stationary", physics_backend=physics_backend
+        )
         env.reset(seed=0)
         actions = np.zeros((batch, config.N_ROBOTS * 2), dtype=np.float32)
         for _ in range(20):
@@ -152,21 +155,31 @@ def _print_table(title: str, rows: list[dict]) -> None:
 def main() -> None:
     import jax
 
+    from vsss_sim.config import PhysicsBackend
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 8, 32, 64, 128, 256])
     parser.add_argument("--device", choices=("cpu", "gpu", "default"), default="default")
+    parser.add_argument(
+        "--physics-backends",
+        nargs="+",
+        choices=tuple(backend.value for backend in PhysicsBackend),
+        default=[PhysicsBackend.JAX.value],
+        help="Physics engines to benchmark (default: jax).",
+    )
     args = parser.parse_args()
     if args.steps < 1 or not args.batches or any(batch < 1 for batch in args.batches):
         parser.error("steps and all batch sizes must be positive")
 
     print(f"JAX devices: {jax.devices()} | backend: {jax.default_backend()}")
     print(f"Measurements per batch: {args.steps}")
-    vmap_rows = bench_jax_vmap(args.steps, args.batches)
-    vec_rows = bench_vssvecenv(args.steps, args.batches)
+    for physics_backend in args.physics_backends:
+        vmap_rows = bench_physics_vmap(args.steps, args.batches, physics_backend)
+        vec_rows = bench_vssvecenv(args.steps, args.batches, physics_backend)
+        _print_table(f"Raw jax.vmap physics ({physics_backend})", vmap_rows)
+        _print_table(f"VSSVecEnv wrapper ({physics_backend})", vec_rows)
     inference_rows = bench_ppo_inference(args.steps, args.batches)
-    _print_table("Raw jax.vmap physics", vmap_rows)
-    _print_table("VSSVecEnv wrapper", vec_rows)
     _print_table("Native Flax PPO policy inference", inference_rows)
 
 

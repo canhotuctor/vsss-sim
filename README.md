@@ -5,7 +5,7 @@ This project implements VSSS, not RoboCup Small Size League (SSL).
 
 ## What it provides
 
-- JAX-based physics for CPU and CUDA devices.
+- JAX-based physics for CPU and CUDA devices, with an optional MuJoCo MJX engine.
 - Single-match and batched Gymnasium environments.
 - A Jumanji environment and native JAX PPO trainer.
 - Optional Pygame rendering.
@@ -17,6 +17,7 @@ Python 3.10 or newer is required.
     python -m pip install -e .
     python -m pip install -e '.[render]'   # optional renderer
     python -m pip install -e '.[jax-rl]'   # native JAX training
+    python -m pip install -e '.[mjx]'      # optional MuJoCo MJX physics
 
 ## Gymnasium quick start
 
@@ -33,6 +34,9 @@ Python 3.10 or newer is required.
 
 The action contains six normalized wheel speeds for the blue team. The yellow
 team uses the configured opponent policy.
+
+Every environment, experiment configuration, and the training CLI accept
+`physics_backend` (`--physics-backend`): `jax` (default) or `mjx`.
 
 ## Train with native JAX PPO
 

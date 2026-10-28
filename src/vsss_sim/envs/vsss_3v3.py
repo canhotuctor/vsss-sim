@@ -11,7 +11,7 @@ import numpy as np
 
 from .. import config, physics
 from ..agents import random_policy, stationary_policy
-from ..config import InitMode, RefereeMode, RewardProfile
+from ..config import InitMode, PhysicsBackend, RefereeMode, RewardProfile
 from .base import VSSBaseEnv
 from .match_rules import (
     MatchPhase,
@@ -39,6 +39,7 @@ class VSSEnv(VSSBaseEnv):
         init_mode: InitMode | str = InitMode.KICKOFF,
         reward_profile: RewardProfile | str = RewardProfile.DEFAULT,
         referee_mode: RefereeMode | str = RefereeMode.FULL,
+        physics_backend: PhysicsBackend | str = PhysicsBackend.JAX,
     ) -> None:
         if isinstance(control_rate_hz, bool):
             raise ValueError("control_rate_hz must be a positive finite number")
@@ -80,6 +81,7 @@ class VSSEnv(VSSBaseEnv):
         )
 
         self._init_mode = InitMode(init_mode)
+        self._physics = physics.get_backend(physics_backend)
         self._match_rules = MatchRules(
             reward_profile=reward_profile,
             max_episode_steps=max_episode_steps,
@@ -109,13 +111,13 @@ class VSSEnv(VSSBaseEnv):
             "reset_kickoff" if self._init_mode == InitMode.KICKOFF else "reset_random"
         )
         key = jax.random.PRNGKey(int(self._rng.integers(0, 2**31 - 1)))
-        self._state = getattr(physics, reset_fn_name)(key)
+        self._state = getattr(self._physics, reset_fn_name)(key)
         self._referee_state = initial_referee_state()
 
     def _step_physics(self, all_actions: np.ndarray) -> int:
         """Advance the physics by one control step. Returns the goal event."""
         j_actions = jnp.asarray(all_actions, dtype=jnp.float32)
-        self._state, info_phys = physics.step(
+        self._state, info_phys = self._physics.step(
             self._state,
             j_actions,
             dt=self._control_dt,
@@ -130,7 +132,7 @@ class VSSEnv(VSSBaseEnv):
         matches follow exactly the physics of ``_step_physics``. At normal
         speed every sub-step is drawn; at higher speeds frames are sampled.
         """
-        self._state, info_phys, frames = physics.step_with_frames(
+        self._state, info_phys, frames = self._physics.step_with_frames(
             self._state,
             jnp.asarray(all_actions, dtype=jnp.float32),
             dt=self._control_dt,

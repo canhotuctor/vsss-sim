@@ -15,7 +15,7 @@ import numpy as np
 from flax import serialization
 
 from .. import config as sim_config
-from ..config import InitMode, RefereeMode, RewardProfile
+from ..config import InitMode, PhysicsBackend, RefereeMode, RewardProfile
 from ..envs.brandao_observation import OBSERVATION_SIZE as BRANDAO_OBSERVATION_SIZE
 from ..envs.jumanji import VSSJumanjiEnv
 from ..envs.match_referee import RefereeEvent
@@ -118,6 +118,7 @@ class ExperimentConfig:
     )
     control_rate_hz: float | None = None
     physics_substeps: int | None = None
+    physics_backend: str = PhysicsBackend.JAX.value
     require_gpu: bool = False
 
     def __post_init__(self) -> None:
@@ -232,6 +233,12 @@ class ExperimentConfig:
             choices = ", ".join(mode.value for mode in RefereeMode)
             raise ValueError(f"referee_mode must be one of: {choices}") from error
         object.__setattr__(self, "referee_mode", referee_mode.value)
+        try:
+            physics_backend = PhysicsBackend(self.physics_backend)
+        except ValueError as error:
+            choices = ", ".join(backend.value for backend in PhysicsBackend)
+            raise ValueError(f"physics_backend must be one of: {choices}") from error
+        object.__setattr__(self, "physics_backend", physics_backend.value)
         # Reuse the trainer's validation before initializing a device or allocating state.
         self.ppo_config()
 
@@ -426,6 +433,7 @@ def _make_env(config: ExperimentConfig) -> Any:
         control_rate_hz=config.control_rate_hz,
         physics_substeps=config.physics_substeps,
         referee_mode=config.referee_mode,
+        physics_backend=config.physics_backend,
     )
 
 

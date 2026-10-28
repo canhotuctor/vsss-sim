@@ -22,6 +22,8 @@
 
 **Physics substeps** — The integration steps taken within one command interval.
 
+**Physics backend** — The engine that advances the simulation between commands: `jax` (default, the hand-written 2D engine) or `mjx` (a MuJoCo MJX rigid-body model).
+
 **Referee mode** — Which referee calls apply in a match: `full`, `simplified` (two-robot goal-area fouls and free balls), or `off` (goals only).
 
 **Advantage** — Play continuing after a defender foul so the attackers can still score; the penalty is awarded only if the attack ends without a goal.

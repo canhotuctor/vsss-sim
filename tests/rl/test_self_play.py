@@ -124,6 +124,23 @@ def test_experiment_config_defaults_to_full_referee_and_rejects_unknown_modes():
         ExperimentConfig(experiment_name="referee", num_generations=1, referee_mode="strict")
 
 
+def test_experiment_config_defaults_to_jax_physics_and_rejects_unknown_engines():
+    assert ExperimentConfig(experiment_name="physics", num_generations=1).physics_backend == "jax"
+    with pytest.raises(ValueError, match="physics_backend"):
+        ExperimentConfig(experiment_name="physics", num_generations=1, physics_backend="bullet")
+
+
+def test_mjx_physics_backend_round_trips_and_reaches_environment():
+    pytest.importorskip("mujoco")
+    config = ExperimentConfig(
+        experiment_name="physics", num_generations=1, physics_backend="mjx"
+    )
+    restored = ExperimentConfig.from_dict(config.to_dict())
+
+    assert restored.physics_backend == "mjx"
+    assert _make_env(restored).physics_backend.value == "mjx"
+
+
 def test_experiment_config_rejects_unknown_reward_profile():
     with pytest.raises(ValueError, match="reward_profile"):
         ExperimentConfig(

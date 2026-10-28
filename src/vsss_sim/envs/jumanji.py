@@ -18,9 +18,9 @@ from jumanji.env import Environment
 from jumanji.types import TimeStep, restart, termination, transition, truncation
 
 from .. import config
-from ..config import InitMode, RefereeMode, RewardProfile
+from ..config import InitMode, PhysicsBackend, RefereeMode, RewardProfile
 from ..perspective import switch_team_perspective
-from ..physics import jax_backend as physics
+from ..physics import SimState, get_backend
 from .brandao_observation import (
     FRAME_FEATURES,
     HISTORY_LENGTH,
@@ -48,7 +48,7 @@ _ACTION_DIM = config.N_ROBOTS * 2
 class State(NamedTuple):
     """Complete JAX environment state; safe to pass through ``jit`` and ``vmap``."""
 
-    simulation: physics.SimState
+    simulation: SimState
     referee_state: RefereeState
     key: chex.PRNGKey
     step_count: jax.Array
@@ -76,6 +76,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         control_rate_hz: float | None = None,
         physics_substeps: int | None = None,
         referee_mode: RefereeMode | str = RefereeMode.FULL,
+        physics_backend: PhysicsBackend | str = PhysicsBackend.JAX,
     ) -> None:
         if opponent_policy not in ("stationary", "random"):
             raise ValueError(
@@ -147,10 +148,12 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
             individual_agent_rewards=self.individual_agent_rewards,
             referee_mode=referee_mode,
         )
+        self.physics_backend = PhysicsBackend(physics_backend)
+        self._physics = get_backend(self.physics_backend)
         self._reset_simulation = (
-            physics.reset_kickoff
+            self._physics.reset_kickoff
             if self.init_mode == InitMode.KICKOFF
-            else physics.reset_random
+            else self._physics.reset_random
         )
         super().__init__()
 
@@ -266,7 +269,7 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
         step_count = state.step_count + jnp.int32(1)
         # Keep the control interval and physics integration cadence explicit
         # so archived experiments can replay their exact simulator timing.
-        simulation_after_physics, physics_info = physics.step(
+        simulation_after_physics, physics_info = self._physics.step(
             state.simulation,
             actions,
             dt=self.control_dt,

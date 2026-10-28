@@ -6,6 +6,9 @@ jax>=0.4
 # Optional: rendering (pip install vsss-sim[render])
 # pygame>=2.4
 
+# Optional: MuJoCo MJX physics backend (pip install vsss-sim[mjx])
+# mujoco-mjx>=3.17
+
 # Development / testing
 pytest>=7.4
 pytest-cov>=4.1

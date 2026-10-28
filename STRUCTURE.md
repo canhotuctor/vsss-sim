@@ -10,8 +10,10 @@ interface, native PPO data flow, data shapes, physics, reset semantics, and refe
 ## 1. System map
 
 The simulator provides Gymnasium single-match and batched interfaces for interactive use and
-external clients, plus a fully JAX-native PPO path for training. All three use the same JAX
-physics implementation; native PPO runs the policy, environment, rollout, and optimizer on device.
+external clients, plus a fully JAX-native PPO path for training. All three use the same physics
+engine, selected with `physics_backend`: the default hand-written JAX engine or the optional
+MuJoCo MJX engine (section 6). Native PPO runs the policy, environment, rollout, and optimizer on
+device.
 
 ```mermaid
 flowchart LR
@@ -23,7 +25,7 @@ flowchart LR
         base["VSSBaseEnv<br/>spaces + observation builder"]
         opponent["Opponent policy<br/>stationary / random / callable"]
         renderer["Pygame renderer<br/>human / rgb_array"]
-        physics["JAX physics<br/>functional state, JIT"]
+        physics["Physics engine<br/>JAX (default) or MJX<br/>functional state, JIT"]
         env --> base
         env --> opponent
         env --> renderer
@@ -64,7 +66,7 @@ sequenceDiagram
     participant P as Blue policy
     participant E as VSSEnv
     participant O as Opponent policy
-    participant X as JAX physics engine
+    participant X as Physics engine (JAX or MJX)
     participant M as Shared MatchRules
     participant R as Renderer
 
@@ -246,6 +248,23 @@ State is an immutable float32 `NamedTuple` PyTree. `step` returns a new state, u
 `step_with_frames` runs the same sub-steps with `lax.scan` and also returns the state after each
 one, which human rendering draws.
 
+### MJX engine
+
+`physics_backend="mjx"` replaces the engine with `physics/mjx_backend.py`, a planar MuJoCo MJX
+model that takes and returns the same `SimState`. Resets, wheel-speed slewing, sub-step frames,
+goal freezing, and everything downstream of physics behave the same; only motion and contact
+resolution inside each sub-step differ. Install it with `pip install -e '.[mjx]'`.
+
+| | JAX engine | MJX engine |
+|---|---|---|
+| Robot motion | wheel speeds set velocities directly | wheel velocity actuators with a 1 g traction force limit and lateral grip; contacts can turn, push, and stall robots |
+| Contacts | positional correction and impulses | frictionless soft contacts on explicit pairs, damped to match restitution: ball 0.8, robot-robot about 0.2, robot-wall about 0 |
+| Integration | one update per sub-step (60 Hz) | `MJXOptions.steps_per_substep` MuJoCo steps per sub-step (default 4, so 240 Hz) |
+| Goal | whole ball past the line, inside the mouth | same, testing the ball centre against the mouth because soft rails let the ball sink in slightly |
+
+Contact stiffness scales with the MuJoCo timestep, which must stay below the 10 ms grip time
+constant. `dt` is therefore a static argument of the MJX `step`.
+
 ## 7. Match and reset lifecycle
 
 There are two different resets: a goal creates a new kickoff *inside* the same match, while the
@@ -352,6 +371,7 @@ flowchart TD
     ppo["rl/ppo.py<br/>Flax actor-critic, GAE, PPO scans"]
     physicsapi["physics/__init__.py<br/>public physics API"]
     jax["physics/jax_backend.py<br/>JAX physics engine"]
+    mjxengine["physics/mjx_backend.py<br/>optional MuJoCo MJX engine"]
     agents["agents/<br/>opponent policies"]
     render["rendering/pygame.py"]
     trainjax["scripts/train_jax.py<br/>compile, execute, benchmark"]
@@ -378,8 +398,9 @@ flowchart TD
     base --> single
     agents --> single
     single --> physicsapi --> jax
-    vector --> jax
-    jumanji --> jax
+    physicsapi --> mjxengine
+    vector --> physicsapi
+    jumanji --> physicsapi
     ppo --> jumanji
     trainjax --> ppo
     trainjax --> selfplay
@@ -390,5 +411,6 @@ flowchart TD
     tests -. verify .-> jumanji
     tests -. verify .-> ppo
     tests -. verify .-> jax
+    tests -. verify .-> mjxengine
     report -. documents .-> selfplay
 ```

@@ -43,6 +43,16 @@ class RefereeMode(str, Enum):
     SIMPLIFIED = "simplified"
     FULL = "full"
 
+
+class PhysicsBackend(str, Enum):
+    """Engine that advances the simulation between control steps.
+
+    JAX : hand-written 2D JAX engine (default).
+    MJX : MuJoCo MJX rigid-body engine; requires ``vsss-sim[mjx]``.
+    """
+    JAX = "jax"
+    MJX = "mjx"
+
 # Field (all dimensions in metres)
 FIELD_LENGTH: float = 1.50   # x-axis extent (150 cm)
 FIELD_WIDTH: float = 1.30    # y-axis extent (130 cm)
