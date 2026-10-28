@@ -137,16 +137,19 @@ class VSSEnv(VSSBaseEnv):
             sub_steps=self._physics_substeps,
         )
         balls, robots = np.asarray(frames.ball), np.asarray(frames.robots)
+        heights = np.asarray(frames.ball_vertical[:, 0])
         goals = np.asarray(info_phys["goals"])
         for index in range(self._physics_substeps):
-            self._render_after_physics(1, int(goals[index]), (balls[index], robots[index]))
+            self._render_after_physics(
+                1, int(goals[index]), (balls[index], robots[index], heights[index])
+            )
         return int(info_phys["goal"])
 
     def _render_after_physics(
         self,
         simulated_substeps: int,
         goal: int,
-        frame: Optional[tuple[np.ndarray, np.ndarray]] = None,
+        frame: Optional[tuple[np.ndarray, np.ndarray, float]] = None,
     ) -> None:
         """Render sparsely while preserving the simulation-time speed target."""
         self._render_substeps_since_frame += simulated_substeps
@@ -255,9 +258,9 @@ class VSSEnv(VSSBaseEnv):
     def _render_current_state(
         self,
         simulated_substeps: int,
-        frame: Optional[tuple[np.ndarray, np.ndarray]] = None,
+        frame: Optional[tuple[np.ndarray, np.ndarray, float]] = None,
     ) -> Optional[np.ndarray]:
-        """Draw ``frame`` (ball, robots) from a sub-step, or the current state."""
+        """Draw ``frame`` (ball, robots, ball height) from a sub-step, or the current state."""
         if self._renderer is None:
             from ..rendering import VSSRenderer
             self._renderer = VSSRenderer(
@@ -267,8 +270,12 @@ class VSSEnv(VSSBaseEnv):
                 control_dt=self._control_dt,
             )
 
-        ball, robots = (
-            (np.asarray(self._state.ball), np.asarray(self._state.robots))
+        ball, robots, ball_height = (
+            (
+                np.asarray(self._state.ball),
+                np.asarray(self._state.robots),
+                float(self._state.ball_vertical[0]),
+            )
             if frame is None
             else frame
         )
@@ -279,6 +286,7 @@ class VSSEnv(VSSBaseEnv):
             step=self._step_count,
             episode=self._episode_count,
             simulated_substeps=simulated_substeps,
+            ball_height=ball_height,
         )
 
     def close(self) -> None:

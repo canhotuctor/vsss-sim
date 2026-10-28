@@ -164,8 +164,9 @@ and one reward per robot.
 
 ## 5. Data model and RL interface
 
-The physics state is richer than the policy observation. Wheel speeds, score, and time remain
-internal; positions and velocities are normalized into one flat policy vector.
+The physics state is richer than the policy observation. Wheel speeds, ball spin and height,
+score, and time remain internal; positions and velocities are normalized into one flat policy
+vector.
 
 ```mermaid
 flowchart TB
@@ -183,6 +184,8 @@ flowchart TB
         wheels["wheel_speeds (2, 3, 2)<br/>last applied speeds"]
         score["score (2,)"]
         time["t scalar"]
+        spin["ball_spin (3,)<br/>angular velocity wx, wy, wz"]
+        vertical["ball_vertical (2,)<br/>height z, vertical velocity vz"]
     end
 
     subgraph observation["Policy observation: 46 float32 values"]
@@ -224,13 +227,13 @@ flowchart TD
     slew["Slew current wheel speeds<br/>toward targets using acceleration limit"]
     drive["Differential-drive kinematics<br/>left/right wheels -> vx, vy, omega"]
     integrateRobots["Integrate robot position + heading"]
-    friction["Apply rolling friction to ball"]
+    friction["Ball floor contact: skid until rolling,<br/>rolling resistance, or flight + bounce"]
     integrateBall["Integrate ball position"]
     walls["Resolve robot-wall collisions"]
     robotChamfers["Resolve robot-corner chamfers"]
-    ballwalls["Resolve ball-wall collisions<br/>and detect goals"]
+    ballwalls["Resolve ball-wall collisions<br/>with friction, detect goals"]
     ballChamfers["Resolve ball-corner chamfers"]
-    ballrobots["Resolve ball-robot collisions<br/>circle vs oriented box"]
+    ballrobots["Resolve ball-robot collisions<br/>circle vs oriented box, with friction"]
     robotrobots["Resolve robot-robot collisions<br/>oriented box SAT"]
     done["Advance simulation time by 1/10 s<br/>return first goal event"]
 
@@ -245,6 +248,32 @@ State is an immutable float32 `NamedTuple` PyTree. `step` returns a new state, u
 `lax.fori_loop` for substeps, and can be transformed directly with `jax.jit` and `jax.vmap`.
 `step_with_frames` runs the same sub-steps with `lax.scan` and also returns the state after each
 one, which human rendering draws.
+
+### Ball spin, skidding, and pop-ups
+
+The ball is a 3D sphere (moment of inertia `0.4·m·r²`) moving over the 2D field. Its spin and
+height are tracked, but robots and walls stay planar. Coefficients in `config.py` describe a golf
+ball on the rulebook's wooden board, which has a ping-pong-table finish, against painted wooden
+walls and PLA robot covers; their comments cite the measurements behind them.
+
+- **Skidding and rolling.** While the floor contact point slips, sliding friction
+  (`BALL_SLIDING_FRICTION`) slows the ball and spins it up until it rolls. A robot face strikes
+  the ball at its centre height and adds no topspin, so every kick starts a skid that lasts
+  longer the harder the hit; it ends rolling at 5/7 of the kicked speed. A rolling ball slows by
+  rolling resistance (`BALL_FRICTION`).
+- **Wall and robot friction.** Walls and robot faces apply friction (`BALL_WALL_FRICTION`,
+  `BALL_ROBOT_FRICTION`) as well as restitution. A rolling ball's front surface moves down, so
+  friction pushes it up: it pops up about 3 mm at 1 m/s and 1.5 cm at 2 m/s. A skidding ball has
+  no topspin and does not pop up. Glancing hits trade sideways speed for spin about the vertical
+  axis, which the floor slowly removes (`BALL_SPIN_DECEL`). Robot faces move with their robot,
+  including its spin.
+- **Flight.** A ball in the air follows its exact ballistic arc, ignores floor friction, and
+  bounces on landing (`BALL_FLOOR_RESTITUTION`) until a bounce cannot outlast one sub-step. It
+  still hits walls and robots, which are taller than any pop-up. Rendering draws its shadow on the
+  floor and the ball raised, with height exaggerated 3x.
+
+Friction can at most stop the slip at a contact, so contacts never add energy. Restarts and
+kickoffs place the ball with no spin or height.
 
 ## 7. Match and reset lifecycle
 
@@ -287,6 +316,8 @@ These details matter when comparing trajectories across execution paths:
   observation of the state carried forward after any kickoff. Single, vector, and Jumanji paths
   use this same ordering.
 - Physics resolves the field's 45-degree corner chamfers for both robots and the ball.
+- The policy observation omits ball spin and height; policies see only the ball's 2D position
+  and velocity.
 - `VSSVecEnv` uses Gymnasium next-step autoreset after truncation.
 - `VSSJumanjiEnv` is functional and renderer-free. Its built-in stationary and random opponents
   stay in JAX; arbitrary Python opponent callables are intentionally unsupported in this path.

@@ -233,7 +233,9 @@ class TestStep:
         e._state = e._state._replace(
             ball=e._state.ball.at[:].set(np.array(
                 [config.FIELD_LENGTH / 2.0 + 0.02, 0.0, 0.05, 0.0], dtype=np.float32
-            ))
+            )),
+            # Rolling, not skidding, so it creeps fully over the line.
+            ball_spin=np.array([0.0, 0.05 / config.BALL_RADIUS, 0.0], dtype=np.float32),
         )
 
         obs, reward, terminated, truncated, info = e.step(
@@ -258,7 +260,9 @@ class TestStep:
         e._state = e._state._replace(
             ball=e._state.ball.at[:].set(np.array(
                 [config.FIELD_LENGTH / 2.0 + 0.02, 0.0, 0.05, 0.0], dtype=np.float32
-            ))
+            )),
+            # Rolling, not skidding, so it creeps fully over the line.
+            ball_spin=np.array([0.0, 0.05 / config.BALL_RADIUS, 0.0], dtype=np.float32),
         )
 
         obs, reward, _, _, info = e.step(np.zeros(config.N_ROBOTS * 2))

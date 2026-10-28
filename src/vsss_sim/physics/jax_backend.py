@@ -26,6 +26,16 @@ class SimState(NamedTuple):
     score: jnp.ndarray         # (2,)   int32
     t: jnp.ndarray             # ()     float32
     wheel_speeds: jnp.ndarray  # (N_TEAMS, N_ROBOTS, 2) float32 — last applied (m/s)
+    ball_spin: jnp.ndarray     # (3,)   float32   [wx, wy, wz] angular velocity (rad/s)
+    ball_vertical: jnp.ndarray # (2,)   float32   [z, vz] height above floor (m), vertical velocity
+
+
+def _ball_at_rest() -> dict:
+    """Zero spin and height for a ball lying on the floor."""
+    return {
+        "ball_spin": jnp.zeros(3, dtype=jnp.float32),
+        "ball_vertical": jnp.zeros(2, dtype=jnp.float32),
+    }
 
 
 def empty_state() -> SimState:
@@ -36,6 +46,7 @@ def empty_state() -> SimState:
         score=jnp.zeros(2, dtype=jnp.int32),
         t=jnp.zeros((), dtype=jnp.float32),
         wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
+        **_ball_at_rest(),
     )
 
 
@@ -86,6 +97,7 @@ def reset_kickoff(key: jnp.ndarray, possession_team=None) -> SimState:
         ball=jnp.zeros(4, dtype=jnp.float32), robots=robots,
         score=jnp.zeros(2, dtype=jnp.int32), t=jnp.zeros((), dtype=jnp.float32),
         wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
+        **_ball_at_rest(),
     )
 
 
@@ -126,6 +138,7 @@ def reset_random(key: jnp.ndarray) -> SimState:
         score=jnp.zeros(2, dtype=jnp.int32),
         t=jnp.zeros((), dtype=jnp.float32),
         wheel_speeds=jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32),
+        **_ball_at_rest(),
     )
 
 
@@ -181,6 +194,138 @@ def _robot_wall_collisions(state: SimState) -> SimState:
 
 
 # ---------------------------------------------------------------------------
+# Ball spin — contact friction, floor contact, and flight
+# ---------------------------------------------------------------------------
+
+_BALL_K = config.BALL_INERTIA_FACTOR  # I / (m r²)
+_UP = (0.0, 0.0, 1.0)
+_NO_VELOCITY = (0.0, 0.0, 0.0)
+
+
+def _contact_friction(
+    velocity: jnp.ndarray,
+    spin: jnp.ndarray,
+    normal: jnp.ndarray,
+    surface_velocity: jnp.ndarray,
+    normal_impulse: jnp.ndarray,
+    friction: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Coulomb friction where a surface touches the ball, as velocity changes.
+
+    ``normal`` is the unit 3D contact normal pointing into the ball and
+    ``normal_impulse`` the normal impulse per unit ball mass (m/s). Friction
+    opposes the slip of the touching points and at most stops it, so it never
+    adds energy. Returns ``(velocity change, spin change, slip stopped)``.
+    """
+    r = jnp.float32(config.BALL_RADIUS)
+    normal = jnp.asarray(normal, dtype=jnp.float32)
+    offset = -r * normal  # contact point relative to the ball centre
+    slip = velocity + jnp.cross(spin, offset) - jnp.asarray(surface_velocity, jnp.float32)
+    slip = slip - jnp.dot(slip, normal) * normal
+    slip_speed = jnp.linalg.norm(slip)
+    # A tangential impulse p per unit mass changes the slip by p·(1 + 1/k).
+    stopping = slip_speed / (1.0 + 1.0 / _BALL_K)
+    available = friction * normal_impulse
+    impulse = jnp.minimum(available, stopping)
+    dv = -impulse * slip / jnp.where(slip_speed > 1e-9, slip_speed, 1.0)
+    dspin = jnp.cross(offset, dv) / (_BALL_K * r * r)
+    return dv, dspin, stopping <= available
+
+
+def _ball_face_impulse(
+    velocity: jnp.ndarray,
+    spin: jnp.ndarray,
+    normal: jnp.ndarray,
+    surface_velocity: jnp.ndarray,
+    restitution: float,
+    friction: float,
+    mass_share: float = 1.0,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Velocity and spin changes when a vertical face strikes the ball.
+
+    ``normal`` points from the face into the ball. ``mass_share`` scales the
+    normal impulse for a movable face: m_face / (m_ball + m_face). Friction
+    treats the face as immovable. Both changes are zero unless approaching.
+    """
+    normal = jnp.asarray(normal, dtype=jnp.float32)
+    approach = jnp.dot(velocity - jnp.asarray(surface_velocity, jnp.float32), normal)
+    normal_impulse = jnp.where(
+        approach < 0.0, -(1.0 + restitution) * approach * mass_share, 0.0
+    )
+    dv, dspin, _ = _contact_friction(
+        velocity, spin, normal, surface_velocity, normal_impulse, friction
+    )
+    return dv + normal_impulse * normal, dspin
+
+
+def _wall_bounce(
+    velocity: jnp.ndarray, spin: jnp.ndarray, hit: jnp.ndarray, normal: tuple
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Apply a static wall's restitution and friction where ``hit`` is set."""
+    dv, dspin = _ball_face_impulse(
+        velocity, spin, normal, _NO_VELOCITY,
+        config.BALL_WALL_RESTITUTION, config.BALL_WALL_FRICTION,
+    )
+    return velocity + jnp.where(hit, dv, 0.0), spin + jnp.where(hit, dspin, 0.0)
+
+
+def _ball_floor(state: SimState, sub_dt: jnp.ndarray) -> SimState:
+    """Advance the ball's floor contact, or its flight, by one sub-step.
+
+    On the floor, sliding friction acts on the contact point until the ball
+    rolls; a rolling ball then slows by rolling resistance. A ball knocked
+    upward flies under gravity and bounces when it lands.
+    """
+    g = jnp.float32(config.GRAVITY)
+    r = jnp.float32(config.BALL_RADIUS)
+    z, vz = state.ball_vertical[0], state.ball_vertical[1]
+
+    grounded = (z <= 0.0) & (vz <= 0.0)
+    # Flights last only a few sub-steps, so follow the exact ballistic arc.
+    z_air = z + vz * sub_dt - 0.5 * g * sub_dt * sub_dt
+    vz_air = vz - g * sub_dt
+    lands = ~grounded & (z_air <= 0.0)
+    impact = -jnp.sqrt(jnp.maximum(vz * vz + 2.0 * g * z, 0.0))
+    bounce = -jnp.float32(config.BALL_FLOOR_RESTITUTION) * impact
+    # A bounce whose flight would not outlast one sub-step settles instead.
+    bounce = jnp.where(bounce > 0.5 * g * sub_dt, bounce, 0.0)
+    on_floor = grounded | lands
+    new_vz = jnp.where(grounded, 0.0, jnp.where(lands, bounce, vz_air))
+    new_z = jnp.where(on_floor, 0.0, z_air)
+    # Floor normal impulse per unit mass: supporting the weight, or a landing.
+    normal_impulse = jnp.where(
+        grounded, g * sub_dt, jnp.where(lands, bounce - impact, 0.0)
+    )
+
+    planar = jnp.stack([state.ball[2], state.ball[3], jnp.float32(0.0)])
+    dv, dspin, slip_stopped = _contact_friction(
+        planar, state.ball_spin, _UP, _NO_VELOCITY, normal_impulse,
+        config.BALL_SLIDING_FRICTION,
+    )
+    velocity = planar[:2] + dv[:2]
+    spin = state.ball_spin + dspin
+
+    # A rolling ball slows by rolling resistance, and its spin follows.
+    rolling = on_floor & slip_stopped
+    speed = jnp.linalg.norm(velocity)
+    decel = jnp.minimum(speed, config.BALL_FRICTION * g * sub_dt)
+    rolled = velocity - velocity / jnp.where(speed > 1e-6, speed, 1.0) * decel
+    velocity = jnp.where(rolling, rolled, velocity)
+    rolling_spin = spin.at[0].set(-velocity[1] / r).at[1].set(velocity[0] / r)
+    spin = jnp.where(rolling, rolling_spin, spin)
+    # Floor contact also slows spin about the vertical axis.
+    wz = spin[2]
+    slowed = wz - jnp.sign(wz) * jnp.minimum(jnp.abs(wz), config.BALL_SPIN_DECEL * sub_dt)
+    spin = spin.at[2].set(jnp.where(on_floor, slowed, wz))
+
+    return state._replace(
+        ball=state.ball.at[2:4].set(velocity),
+        ball_spin=spin,
+        ball_vertical=jnp.stack([new_z, new_vz]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Chamfer collisions — shared geometry helpers
 # ---------------------------------------------------------------------------
 
@@ -192,7 +337,7 @@ _INV_SQRT2 = float(0.5 ** 0.5)
 
 
 def _ball_chamfer_collisions(state: SimState) -> SimState:
-    """Reflect ball off the four 45° corner chamfers.
+    """Bounce the ball off the four 45° corner chamfers, with wall friction.
 
     Each chamfer is a half-plane  sx·x + sy·y ≤ D − r·√2  where
     D = half_l + half_w − chamfer and (sx,sy) ∈ {±1}².
@@ -201,14 +346,14 @@ def _ball_chamfer_collisions(state: SimState) -> SimState:
     half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     c = jnp.float32(config.FIELD_CHAMFER)
-    e = jnp.float32(config.BALL_WALL_RESTITUTION)
-    inv_sqrt2 = jnp.float32(_INV_SQRT2)
 
     chamfer_diag = half_l + half_w - c
     # Limit in the "sum space" (sx·bx + sy·by must stay below this).
     limit = chamfer_diag - r * jnp.float32(2.0 ** 0.5)
 
-    bx, by, bvx, bvy = state.ball[0], state.ball[1], state.ball[2], state.ball[3]
+    bx, by = state.ball[0], state.ball[1]
+    velocity = jnp.stack([state.ball[2], state.ball[3], state.ball_vertical[1]])
+    spin = state.ball_spin
 
     for sx, sy in zip(_CHAMFER_SX, _CHAMFER_SY):
         sx_f = jnp.float32(sx)
@@ -221,15 +366,15 @@ def _ball_chamfer_collisions(state: SimState) -> SimState:
         # Displacement = (pen/√2) · n = pen · (-sx, -sy) / 2.
         bx = jnp.where(hit, bx - sx_f * pen * 0.5, bx)
         by = jnp.where(hit, by - sy_f * pen * 0.5, by)
+        velocity, spin = _wall_bounce(
+            velocity, spin, hit, (-sx * _INV_SQRT2, -sy * _INV_SQRT2, 0.0)
+        )
 
-        # Reflect velocity: new_v = v − (1+e)·v_n·n
-        # v_n = dot(v, n) = (−sx·vx − sy·vy) / √2  (negative = moving into corner)
-        v_n = (-sx_f * bvx - sy_f * bvy) * inv_sqrt2
-        do_reflect = hit & (v_n < 0.0)
-        bvx = jnp.where(do_reflect, bvx + (1.0 + e) * v_n * sx_f * inv_sqrt2, bvx)
-        bvy = jnp.where(do_reflect, bvy + (1.0 + e) * v_n * sy_f * inv_sqrt2, bvy)
-
-    return state._replace(ball=jnp.stack([bx, by, bvx, bvy]))
+    return state._replace(
+        ball=jnp.stack([bx, by, velocity[0], velocity[1]]),
+        ball_spin=spin,
+        ball_vertical=state.ball_vertical.at[1].set(velocity[2]),
+    )
 
 
 def _robot_chamfer_collisions(state: SimState) -> SimState:
@@ -289,7 +434,7 @@ def _robot_chamfer_collisions(state: SimState) -> SimState:
 # ---------------------------------------------------------------------------
 
 def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
-    """Reflect ball off field walls and detect goals.
+    """Bounce the ball off field walls, with wall friction, and detect goals.
 
     Returns
     -------
@@ -301,17 +446,18 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     half_goal = jnp.float32(config.GOAL_WIDTH / 2.0)
     goal_depth = jnp.float32(config.GOAL_DEPTH)
-    e_wall = jnp.float32(config.BALL_WALL_RESTITUTION)
 
-    bx, by, bvx, bvy = state.ball[0], state.ball[1], state.ball[2], state.ball[3]
+    bx, by = state.ball[0], state.ball[1]
+    velocity = jnp.stack([state.ball[2], state.ball[3], state.ball_vertical[1]])
+    spin = state.ball_spin
 
     # --- y walls (top / bottom of field) ---
     hit_bot = by - r < -half_w
     hit_top = by + r > half_w
     by = jnp.where(hit_bot, -half_w + r, by)
     by = jnp.where(hit_top, half_w - r, by)
-    bvy = jnp.where(hit_bot, jnp.abs(bvy) * e_wall, bvy)
-    bvy = jnp.where(hit_top, -jnp.abs(bvy) * e_wall, bvy)
+    velocity, spin = _wall_bounce(velocity, spin, hit_bot, (0.0, 1.0, 0.0))
+    velocity, spin = _wall_bounce(velocity, spin, hit_top, (0.0, -1.0, 0.0))
 
     # The mouth is open while a ball is straddling the goal line. Do not
     # bounce it off that line before its trailing edge can cross (Rule 8.1).
@@ -330,8 +476,8 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     )
     bx = jnp.where(hit_left_front, -half_l + r, bx)
     bx = jnp.where(hit_right_front, half_l - r, bx)
-    bvx = jnp.where(hit_left_front, jnp.abs(bvx) * e_wall, bvx)
-    bvx = jnp.where(hit_right_front, -jnp.abs(bvx) * e_wall, bvx)
+    velocity, spin = _wall_bounce(velocity, spin, hit_left_front, (1.0, 0.0, 0.0))
+    velocity, spin = _wall_bounce(velocity, spin, hit_right_front, (-1.0, 0.0, 0.0))
 
     # The 10 cm pocket has side rails from the goal line to the back wall.
     # Constrain the ball by its radius and reflect it away from either rail.
@@ -343,8 +489,8 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     hit_lower_rail = overlaps_pocket_depth & (by - r < -half_goal)
     by = jnp.where(hit_upper_rail, half_goal - r, by)
     by = jnp.where(hit_lower_rail, -half_goal + r, by)
-    bvy = jnp.where(hit_upper_rail, -jnp.abs(bvy) * e_wall, bvy)
-    bvy = jnp.where(hit_lower_rail, jnp.abs(bvy) * e_wall, bvy)
+    velocity, spin = _wall_bounce(velocity, spin, hit_upper_rail, (0.0, -1.0, 0.0))
+    velocity, spin = _wall_bounce(velocity, spin, hit_lower_rail, (0.0, 1.0, 0.0))
 
     # Rear goal walls sit exactly GOAL_DEPTH beyond each end line.
     in_goal_y = jnp.abs(by) + r <= half_goal + 1e-7
@@ -352,8 +498,8 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     right_back = (bx + r > half_l + goal_depth) & in_goal_y
     bx = jnp.where(left_back, -half_l - goal_depth + r, bx)
     bx = jnp.where(right_back, half_l + goal_depth - r, bx)
-    bvx = jnp.where(left_back, jnp.abs(bvx) * e_wall, bvx)
-    bvx = jnp.where(right_back, -jnp.abs(bvx) * e_wall, bvx)
+    velocity, spin = _wall_bounce(velocity, spin, left_back, (1.0, 0.0, 0.0))
+    velocity, spin = _wall_bounce(velocity, spin, right_back, (-1.0, 0.0, 0.0))
 
     goal = jnp.where(
         right_goal,
@@ -361,8 +507,12 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
         jnp.where(left_goal, jnp.int32(-1), jnp.int32(0)),
     )
 
-    new_ball = jnp.stack([bx, by, bvx, bvy])
-    return state._replace(ball=new_ball), goal
+    new_state = state._replace(
+        ball=jnp.stack([bx, by, velocity[0], velocity[1]]),
+        ball_spin=spin,
+        ball_vertical=state.ball_vertical.at[1].set(velocity[2]),
+    )
+    return new_state, goal
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +609,7 @@ def _resolve_ball_robot_pair(
 
 
 def _ball_robot_collisions(state: SimState) -> SimState:
-    """Resolve elastic collisions between the ball and all 6 robots in parallel.
+    """Resolve ball collisions, with face friction, against all 6 robots in parallel.
 
     All penetrations are computed simultaneously via vmap, then corrections are
     summed. Slightly less accurate than sequential resolution but equivalent
@@ -469,7 +619,6 @@ def _ball_robot_collisions(state: SimState) -> SimState:
     robots_flat = state.robots.reshape(_N_ROBOTS_TOTAL, 6)
     m_b = jnp.float32(config.BALL_MASS)
     m_r = jnp.float32(config.ROBOT_MASS)
-    e = jnp.float32(config.BALL_ROBOT_RESTITUTION)
     total_m = m_b + m_r
 
     normals, penetrations = jax.vmap(_ball_obb_penetration, in_axes=(None, 0, 0))(
@@ -487,23 +636,33 @@ def _ball_robot_collisions(state: SimState) -> SimState:
     rob_pos_delta = (-normals * penetrations[:, None] * (m_b / total_m))
     rob_pos_new = robots_flat[:, 0:2] + jnp.where(collide[:, None], rob_pos_delta, 0.0)
 
-    # Velocity impulses
-    ball_vel = state.ball[2:4]
-    rob_vel = robots_flat[:, 3:5]
-    rel_vel = ball_vel[None, :] - rob_vel                      # (6, 2)
-    vel_along = jnp.sum(rel_vel * normals, axis=-1)             # (6,)
-    do_impulse = collide & (vel_along < 0)
-    j = -(1.0 + e) * vel_along / (1.0 / m_b + 1.0 / m_r)      # (6,)
-    impulses = j[:, None] * normals                             # (6, 2)
+    # Velocity impulses, with friction. Each face moves with its robot,
+    # including the robot's spin, at the point touching the ball.
+    ball_vel = jnp.stack([state.ball[2], state.ball[3], state.ball_vertical[1]])
+    arm = state.ball[0:2] - normals * jnp.float32(config.BALL_RADIUS) - robots_flat[:, 0:2]
+    surface = robots_flat[:, 3:5] + robots_flat[:, 5:6] * jnp.stack(
+        [-arm[:, 1], arm[:, 0]], axis=-1
+    )
+    flat = jnp.zeros((_N_ROBOTS_TOTAL, 1), dtype=jnp.float32)
+    normals_3d = jnp.concatenate([normals, flat], axis=-1)
+    dv, dspin = jax.vmap(_ball_face_impulse, in_axes=(None, None, 0, 0, None, None, None))(
+        ball_vel, state.ball_spin, normals_3d, jnp.concatenate([surface, flat], axis=-1),
+        config.BALL_ROBOT_RESTITUTION, config.BALL_ROBOT_FRICTION, m_r / total_m,
+    )
+    dv = jnp.where(collide[:, None], dv, 0.0)
+    dspin = jnp.where(collide[:, None], dspin, 0.0)
+    ball_vel_new = ball_vel + dv.sum(axis=0)
 
-    ball_vel_new = ball_vel + jnp.where(do_impulse[:, None], impulses / m_b, 0.0).sum(axis=0)
-    rob_vel_new = rob_vel + jnp.where(do_impulse[:, None], -impulses / m_r, 0.0)
+    # Each robot takes the opposite normal impulse.
+    normal_dv = jnp.sum(dv * normals_3d, axis=-1)
+    rob_vel_new = robots_flat[:, 3:5] - normal_dv[:, None] * normals * (m_b / m_r)
 
     new_robots_flat = robots_flat.at[:, 0:2].set(rob_pos_new).at[:, 3:5].set(rob_vel_new)
-    new_ball = jnp.concatenate([ball_pos_new, ball_vel_new])
     return state._replace(
-        ball=new_ball,
+        ball=jnp.concatenate([ball_pos_new, ball_vel_new[:2]]),
         robots=new_robots_flat.reshape(config.N_TEAMS, config.N_ROBOTS, 6),
+        ball_spin=state.ball_spin + dspin.sum(axis=0),
+        ball_vertical=state.ball_vertical.at[1].set(ball_vel_new[2]),
     )
 
 
@@ -686,16 +845,9 @@ def _substep(
     robots = robots.at[:, :, 2].set(new_theta)
     state = state._replace(robots=robots)
 
-    # Ball friction (rolling).
-    ball_vel = state.ball[2:4]
-    speed = jnp.linalg.norm(ball_vel)
-    safe_speed = jnp.where(speed > 1e-6, speed, 1.0)
-    decel = jnp.minimum(speed, config.BALL_FRICTION * 9.81 * sub_dt)
-    new_vel = ball_vel - (ball_vel / safe_speed) * decel
-    new_vel = jnp.where(speed > 1e-6, new_vel, ball_vel)
-    ball = state.ball.at[2:4].set(new_vel)
-    ball = ball.at[0:2].add(new_vel * sub_dt)
-    state = state._replace(ball=ball)
+    # Ball floor contact (skidding, rolling) or flight, then motion.
+    state = _ball_floor(state, sub_dt)
+    state = state._replace(ball=state.ball.at[0:2].add(state.ball[2:4] * sub_dt))
 
     # Collisions.
     state = _robot_wall_collisions(state)
@@ -704,7 +856,10 @@ def _substep(
     state = _ball_chamfer_collisions(state)
     state = _ball_robot_collisions(state)
     state = _robot_robot_collisions(state)
-    return state, goal
+    # The floor absorbs any downward push from wall or robot friction.
+    z, vz = state.ball_vertical[0], state.ball_vertical[1]
+    vz = jnp.where(z <= 0.0, jnp.maximum(vz, 0.0), vz)
+    return state._replace(ball_vertical=jnp.stack([z, vz])), goal
 
 
 def _control_inputs(

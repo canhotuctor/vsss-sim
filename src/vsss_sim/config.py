@@ -82,12 +82,41 @@ N_ROBOTS: int = 3            # per team (3 v 3 format)
 TEAM_BLUE: int = 0           # blue team index
 TEAM_YELLOW: int = 1         # yellow team index
 
+GRAVITY: float = 9.81        # m/s²
+
 # Ball
 BALL_RADIUS: float = 0.02135  # golf ball: 42.67 mm diameter → 21.35 mm radius
 BALL_MASS: float = 0.046      # kg  (~45.9 g golf ball)
-BALL_FRICTION: float = 0.05   # rolling-friction coefficient (μ_r)
-BALL_WALL_RESTITUTION: float = 0.80
-BALL_ROBOT_RESTITUTION: float = 0.80
+# Moment of inertia I = k·m·r²; a measured golf ball gives k = 0.40 (Cross,
+# Am. J. Phys. 70, 1093, 2002).
+BALL_INERTIA_FACTOR: float = 0.4
+# The VSSS board is black wood with the surface of a ping-pong table, and the
+# 5 cm walls are painted wood (rules, Law 1). Robot covers are PLA.
+#
+# Rolling resistance (μ_r): a rolling ball decelerates at μ_r·g. A golf ball
+# on carpet measures 0.05; hard balls on smooth hard surfaces stay around
+# 0.005-0.015, so this is the least certain value here (estimate).
+BALL_FRICTION: float = 0.01
+# Floor kinetic friction while the ball skids (contact point slipping), e.g.
+# after a kick with no spin. Skidding ends in rolling at 1/(1+k) = 5/7 of the
+# kicked speed. A golf ball slides on polished granite at 0.18 (Cross 2002);
+# a matte painted board grips slightly more.
+BALL_SLIDING_FRICTION: float = 0.25
+# Spin about the vertical axis lost to floor contact (estimate).
+BALL_SPIN_DECEL: float = 5.0  # rad/s²
+# Golf ball on 25 mm wood: e = 0.68 at 5 m/s, rising about 0.02 per m/s
+# slower (normal drop test, IOP Conf. Ser. 36, 012038). VSSS impacts are
+# 0.5-3 m/s. No PLA data exists; a printed shell on a light robot is taken to
+# behave like the wood.
+BALL_FLOOR_RESTITUTION: float = 0.75  # bounce when a popped-up ball lands
+BALL_WALL_RESTITUTION: float = 0.75
+BALL_ROBOT_RESTITUTION: float = 0.75
+# Friction where walls and robot faces touch the ball. It turns a rolling
+# ball's topspin into a small pop-up at walls and adds spin on glancing hits.
+# Painted wood as for the floor; PLA slides at 0.26-0.35 against hard
+# counterfaces.
+BALL_WALL_FRICTION: float = 0.25
+BALL_ROBOT_FRICTION: float = 0.30
 
 # Robot
 ROBOT_SIZE: float = 0.075                # max 7.5 cm × 7.5 cm footprint
@@ -143,6 +172,7 @@ COLOR_ROBOT_YELLOW = (230, 190, 0)
 COLOR_ROBOT_OUTLINE = (0, 0, 0)
 COLOR_BALL = (255, 128, 0)
 COLOR_BALL_OUTLINE = (200, 80, 0)
+COLOR_BALL_SHADOW = (0, 90, 0)
 COLOR_BACKGROUND = (40, 40, 40)
 
 # Minimum ball rendering radius in pixels (ensures ball is always visible)

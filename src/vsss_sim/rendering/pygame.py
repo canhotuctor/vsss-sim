@@ -37,6 +37,8 @@ except ImportError:
 # After a longer stall (e.g. JIT compilation), restart the frame schedule
 # instead of racing through the backlog.
 _MAX_PACING_LAG = 0.25  # s
+# Pop-ups reach about 2 cm; draw height exaggerated so they stay visible.
+_BALL_HEIGHT_EXAGGERATION = 3.0
 
 
 def _require_pygame() -> None:
@@ -279,9 +281,16 @@ class VSSRenderer:
         tip = self._to_px(x + cos_t * half * 0.85, y + sin_t * half * 0.85)
         pygame.draw.aaline(surf, config.COLOR_ROBOT_OUTLINE, (cx, cy), tip)
 
-    def _draw_ball(self, surf: pygame.Surface, x: float, y: float) -> None:
+    def _draw_ball(
+        self, surf: pygame.Surface, x: float, y: float, height: float = 0.0
+    ) -> None:
         cx, cy = self._to_px(x, y)
         r_px = max(config.MIN_BALL_RENDER_RADIUS, self._m_to_px(config.BALL_RADIUS))
+        if height > 0.0:
+            # A ball in the air leaves its shadow on the floor and is drawn
+            # raised toward the top of the screen.
+            gfxdraw.filled_circle(surf, cx, cy, r_px, config.COLOR_BALL_SHADOW)
+            cy -= int(round(height * _BALL_HEIGHT_EXAGGERATION * self.scale))
         # filled_circle + aacircle in the fill colour gives an AA filled disc;
         # a second aacircle in the outline colour adds the visible border.
         gfxdraw.filled_circle(surf, cx, cy, r_px, config.COLOR_BALL)
@@ -391,6 +400,7 @@ class VSSRenderer:
         step: Optional[int] = None,
         episode: Optional[int] = None,
         simulated_substeps: int = 1,
+        ball_height: float = 0.0,
     ) -> Optional[np.ndarray]:
         """
         Render one frame.
@@ -406,6 +416,7 @@ class VSSRenderer:
             step counter in human mode.
         simulated_substeps : number of physics substeps represented by this
             frame, used to calculate the achieved speedup in human mode.
+        ball_height : height of the ball above the floor (m).
 
         Returns
         -------
@@ -425,7 +436,7 @@ class VSSRenderer:
                 )
                 self._draw_robot(surf, rx, ry, theta, team)
 
-        self._draw_ball(surf, ball[0], ball[1])
+        self._draw_ball(surf, ball[0], ball[1], float(ball_height))
         self._draw_score(surf, int(score[0]), int(score[1]))
 
         if self.render_mode == "human":

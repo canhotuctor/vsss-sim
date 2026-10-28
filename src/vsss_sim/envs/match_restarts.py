@@ -245,4 +245,6 @@ def _restart_positions(
         ball=stopped_ball,
         robots=robots,
         wheel_speeds=jnp.zeros_like(simulation.wheel_speeds),
+        ball_spin=jnp.zeros_like(simulation.ball_spin),
+        ball_vertical=jnp.zeros_like(simulation.ball_vertical),
     )

@@ -15,6 +15,8 @@ class TestSimState:
         assert s.robots.shape == (config.N_TEAMS, config.N_ROBOTS, 6)
         assert s.score.shape == (2,)
         assert s.t.shape == ()
+        assert s.ball_spin.shape == (3,)
+        assert s.ball_vertical.shape == (2,)
 
     def test_empty_state_dtype(self):
         s = jb.empty_state()
@@ -33,7 +35,7 @@ class TestSimState:
     def test_is_pytree(self):
         s = jb.empty_state()
         leaves = jax.tree_util.tree_leaves(s)
-        assert len(leaves) == 5  # ball, robots, score, t, wheel_speeds
+        assert len(leaves) == 7  # ball, robots, score, t, wheel_speeds, ball_spin, ball_vertical
 
 class TestDiffDrive:
     def test_straight_forward(self):

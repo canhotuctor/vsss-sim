@@ -22,6 +22,7 @@ def rotate(simulation):
     return simulation._replace(
         ball=-simulation.ball, robots=robots, score=simulation.score[::-1],
         wheel_speeds=simulation.wheel_speeds[::-1],
+        ball_spin=simulation.ball_spin * jnp.asarray([-1.0, -1.0, 1.0]),
     )
 
 
@@ -33,6 +34,8 @@ def assert_geometry_equal(actual, expected):
     np.testing.assert_allclose(jnp.cos(actual.robots[..., 2]), jnp.cos(expected.robots[..., 2]), atol=1e-5)
     np.testing.assert_array_equal(actual.score, expected.score)
     np.testing.assert_allclose(actual.wheel_speeds, expected.wheel_speeds, atol=1e-5)
+    np.testing.assert_allclose(actual.ball_spin, expected.ball_spin, atol=1e-3)
+    np.testing.assert_allclose(actual.ball_vertical, expected.ball_vertical, atol=1e-5)
 
 
 @pytest.mark.parametrize("restart", [RestartType.PENALTY_KICK, RestartType.GOAL_KICK, RestartType.FREE_KICK])
