@@ -139,8 +139,33 @@ class VSSRenderer:
         ]
         field_poly = [self._to_px(x, y) for x, y in corners_world]
         gfxdraw.filled_polygon(surf, field_poly, config.COLOR_FIELD)
-        gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD)
-        gfxdraw.aapolygon(surf, field_poly, config.COLOR_FIELD_LINES)
+
+        # Draw the field boundary as individual edges so the two goal mouths
+        # remain open in the picture. The goal frame below starts at these
+        # exact 40 cm aperture edges and extends 10 cm behind the end line.
+        for start, end in zip(corners_world, corners_world[1:] + corners_world[:1]):
+            is_goal_line = (
+                start[0] == end[0]
+                and abs(start[0]) == config.FIELD_LENGTH / 2.0
+            )
+            if is_goal_line:
+                x = start[0]
+                upper = max(start[1], end[1])
+                lower = min(start[1], end[1])
+                half_goal = config.GOAL_WIDTH / 2.0
+                pygame.draw.aaline(
+                    surf, config.COLOR_FIELD_LINES,
+                    self._to_px(x, upper), self._to_px(x, half_goal),
+                )
+                pygame.draw.aaline(
+                    surf, config.COLOR_FIELD_LINES,
+                    self._to_px(x, -half_goal), self._to_px(x, lower),
+                )
+            else:
+                pygame.draw.aaline(
+                    surf, config.COLOR_FIELD_LINES,
+                    self._to_px(*start), self._to_px(*end),
+                )
 
         mid_x = self.margin + self._field_px_w // 2
         pygame.draw.aaline(
@@ -172,36 +197,23 @@ class VSSRenderer:
                     self._to_px(mark_x, mark_y + cross_half_length),
                 )
 
-        goal_px_h = self._m_to_px(config.GOAL_WIDTH)
-        goal_px_d = self._m_to_px(config.GOAL_DEPTH)
-
-        gx_left, gy_top = self._to_px(
-            -config.FIELD_LENGTH / 2.0 - config.GOAL_DEPTH,
-            config.GOAL_WIDTH / 2.0,
-        )
-        pygame.draw.rect(
-            surf, config.COLOR_GOAL_BLUE,
-            pygame.Rect(gx_left, gy_top, goal_px_d, goal_px_h),
-        )
-        pygame.draw.rect(
-            surf, config.COLOR_FIELD_LINES,
-            pygame.Rect(gx_left, gy_top, goal_px_d, goal_px_h),
-            2,
-        )
-
-        gx_right, gy_top = self._to_px(
-            config.FIELD_LENGTH / 2.0,
-            config.GOAL_WIDTH / 2.0,
-        )
-        pygame.draw.rect(
-            surf, config.COLOR_GOAL_YELLOW,
-            pygame.Rect(gx_right, gy_top, goal_px_d, goal_px_h),
-        )
-        pygame.draw.rect(
-            surf, config.COLOR_FIELD_LINES,
-            pygame.Rect(gx_right, gy_top, goal_px_d, goal_px_h),
-            2,
-        )
+        half_l = config.FIELD_LENGTH / 2.0
+        half_goal = config.GOAL_WIDTH / 2.0
+        # U-shaped goal frames: the 40 cm front is open, with side rails and
+        # a back wall spanning the configured 10 cm pocket depth.
+        for side, color in (
+            (-1.0, config.COLOR_GOAL_BLUE),
+            (1.0, config.COLOR_GOAL_YELLOW),
+        ):
+            front_x = side * half_l
+            back_x = side * (half_l + config.GOAL_DEPTH)
+            frame = [
+                self._to_px(front_x, half_goal),
+                self._to_px(back_x, half_goal),
+                self._to_px(back_x, -half_goal),
+                self._to_px(front_x, -half_goal),
+            ]
+            pygame.draw.lines(surf, color, False, frame, 2)
 
         # Goal areas — 3 inner sides each (end-line is shared with the field border).
         ga_half_y = config.GOAL_AREA_LENGTH_Y / 2.0

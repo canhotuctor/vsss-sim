@@ -316,18 +316,44 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     # The mouth is open while a ball is straddling the goal line. Do not
     # bounce it off that line before its trailing edge can cross (Rule 8.1).
     in_goal_y = jnp.abs(by) + r <= half_goal + 1e-7
-    hit_left = (bx - r < -half_l) & ~in_goal_y
-    hit_right = (bx + r > half_l) & ~in_goal_y
     left_goal = (bx + r < -half_l) & in_goal_y
     right_goal = (bx - r > half_l) & in_goal_y
-    left_back = bx - r < -half_l - goal_depth
-    right_back = bx + r > half_l + goal_depth
-    bx = jnp.where(hit_left, -half_l + r, bx)
-    bx = jnp.where(hit_right, half_l - r, bx)
-    bx = jnp.where(left_back & in_goal_y, -half_l - goal_depth + r, bx)
-    bx = jnp.where(right_back & in_goal_y, half_l + goal_depth - r, bx)
-    bvx = jnp.where(hit_left | (left_back & in_goal_y), jnp.abs(bvx) * e_wall, bvx)
-    bvx = jnp.where(hit_right | (right_back & in_goal_y), -jnp.abs(bvx) * e_wall, bvx)
+
+    # At the goal line, the portions outside the 40 cm mouth act as posts.
+    # Only resolve this front-wall contact while the ball centre is still on
+    # the field side; once inside, the pocket's side rails handle contact.
+    hit_left_front = (
+        (bx >= -half_l) & (bx - r < -half_l) & ~in_goal_y
+    )
+    hit_right_front = (
+        (bx <= half_l) & (bx + r > half_l) & ~in_goal_y
+    )
+    bx = jnp.where(hit_left_front, -half_l + r, bx)
+    bx = jnp.where(hit_right_front, half_l - r, bx)
+    bvx = jnp.where(hit_left_front, jnp.abs(bvx) * e_wall, bvx)
+    bvx = jnp.where(hit_right_front, -jnp.abs(bvx) * e_wall, bvx)
+
+    # The 10 cm pocket has side rails from the goal line to the back wall.
+    # Constrain the ball by its radius and reflect it away from either rail.
+    overlaps_pocket_depth = (
+        ((bx + r > half_l) & (bx - r < half_l + goal_depth))
+        | ((bx - r < -half_l) & (bx + r > -half_l - goal_depth))
+    )
+    hit_upper_rail = overlaps_pocket_depth & (by + r > half_goal)
+    hit_lower_rail = overlaps_pocket_depth & (by - r < -half_goal)
+    by = jnp.where(hit_upper_rail, half_goal - r, by)
+    by = jnp.where(hit_lower_rail, -half_goal + r, by)
+    bvy = jnp.where(hit_upper_rail, -jnp.abs(bvy) * e_wall, bvy)
+    bvy = jnp.where(hit_lower_rail, jnp.abs(bvy) * e_wall, bvy)
+
+    # Rear goal walls sit exactly GOAL_DEPTH beyond each end line.
+    in_goal_y = jnp.abs(by) + r <= half_goal + 1e-7
+    left_back = (bx - r < -half_l - goal_depth) & in_goal_y
+    right_back = (bx + r > half_l + goal_depth) & in_goal_y
+    bx = jnp.where(left_back, -half_l - goal_depth + r, bx)
+    bx = jnp.where(right_back, half_l + goal_depth - r, bx)
+    bvx = jnp.where(left_back, jnp.abs(bvx) * e_wall, bvx)
+    bvx = jnp.where(right_back, -jnp.abs(bvx) * e_wall, bvx)
 
     goal = jnp.where(
         right_goal,
