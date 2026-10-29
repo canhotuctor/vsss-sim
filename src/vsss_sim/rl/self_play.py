@@ -102,6 +102,8 @@ class ExperimentConfig:
     max_episode_steps: int = sim_config.MAX_EPISODE_STEPS
     terminate_on_goal: bool = False
     init_mode: str = "kickoff"
+    curriculum_replay_fraction: float = 0.0
+    curriculum_buffer_size: int = 1024
     reward_profile: str = RewardProfile.DEFAULT.value
     referee_mode: str = RefereeMode.FULL.value
     policy_architecture: str = "joint"
@@ -158,6 +160,8 @@ class ExperimentConfig:
             raise ValueError("opponent_update_threshold must be non-negative")
         if self.init_mode not in ("kickoff", "random"):
             raise ValueError("init_mode must be 'kickoff' or 'random'")
+        if self.curriculum_replay_fraction and self.init_mode != "random":
+            raise ValueError("curriculum replay requires init_mode='random'")
         if self.policy_architecture not in _POLICY_ARCHITECTURES:
             raise ValueError(
                 "policy_architecture must be 'joint', 'brandao_shared', or 'brandao_sets'"
@@ -247,6 +251,8 @@ class ExperimentConfig:
             num_minibatches=self.num_minibatches,
             hidden_sizes=self.hidden_sizes,
             mirror_augmentation=bool(self.mirror_augmentation),
+            curriculum_replay_fraction=self.curriculum_replay_fraction,
+            curriculum_buffer_size=self.curriculum_buffer_size,
         )
 
     @classmethod
@@ -959,6 +965,11 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                         host_history["mean_episode_length"][update_in_chunk, lineage]
                     ),
                     "episodes": int(host_history["episodes"][update_in_chunk, lineage]),
+                    "curriculum_replay_resets": int(host_history["curriculum_replay_resets"][update_in_chunk, lineage]),
+                    "curriculum_total_resets": int(host_history["curriculum_total_resets"][update_in_chunk, lineage]),
+                    "curriculum_buffer_count": int(host_history["curriculum_buffer_count"][update_in_chunk, lineage]),
+                    "curriculum_return_min": float(host_history["curriculum_return_min"][update_in_chunk, lineage]),
+                    "curriculum_return_max": float(host_history["curriculum_return_max"][update_in_chunk, lineage]),
                     "episode_terminations": int(
                         host_history["episodes"][update_in_chunk, lineage]
                     ),
