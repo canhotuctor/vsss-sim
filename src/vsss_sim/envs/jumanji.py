@@ -182,7 +182,11 @@ class VSSJumanjiEnv(Environment[State, specs.BoundedArray, jax.Array]):
 
     def reset(self, key: chex.PRNGKey) -> tuple[State, TimeStep[jax.Array]]:
         state_key, reset_key, observation_key = jax.random.split(key, 3)
-        simulation = self._reset_simulation(reset_key)
+        return self.reset_level(reset_key, state_key, observation_key)
+
+    def reset_level(self, level_key, state_key, observation_key):
+        """Reset a reproducible initial situation with fresh episode randomness."""
+        simulation = self._reset_simulation(level_key)
         previous_actions = jnp.zeros(
             (config.N_TEAMS, config.N_ROBOTS, 2), dtype=jnp.float32
         )

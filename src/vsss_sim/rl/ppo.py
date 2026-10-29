@@ -29,6 +29,17 @@ from ..envs.match_referee import RefereeEvent
 _LOG_2PI = jnp.log(jnp.float32(2.0 * jnp.pi))
 
 
+def _curriculum_scores(returns: jax.Array, valid: jax.Array):
+    """Batch min-max return normalization and bounded learnability heuristic."""
+    any_valid = jnp.any(valid)
+    low = jnp.min(jnp.where(valid, returns, jnp.inf))
+    high = jnp.max(jnp.where(valid, returns, -jnp.inf))
+    span = high - low
+    normalized = jnp.where(span > 1e-8, (returns - low) / jnp.maximum(span, 1e-8), 0.5)
+    scores = jnp.where(valid, normalized * (1.0 - normalized), 0.0)
+    return scores, jnp.where(any_valid, low, 0.0), jnp.where(any_valid, high, 0.0)
+
+
 @dataclass(frozen=True)
 class PPOConfig:
     """Hyperparameters that determine one compiled PPO update."""
@@ -46,8 +57,14 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     hidden_sizes: tuple[int, ...] = (64, 64)
     mirror_augmentation: bool = False
+    curriculum_replay_fraction: float = 0.0
+    curriculum_buffer_size: int = 1024
 
     def __post_init__(self) -> None:
+        if not 0.0 <= self.curriculum_replay_fraction <= 1.0:
+            raise ValueError("curriculum_replay_fraction must be between 0 and 1")
+        if self.curriculum_buffer_size < 1:
+            raise ValueError("curriculum_buffer_size must be positive")
         batch_size = self.num_envs * self.rollout_length
         if self.num_envs < 1 or self.rollout_length < 1:
             raise ValueError("num_envs and rollout_length must be at least 1")
@@ -273,6 +290,10 @@ class RunnerState(NamedTuple):
     opponent_modes: jax.Array
     opponent_categories: jax.Array
     opponent_generations: jax.Array
+    initial_level_keys: jax.Array
+    replay_level_keys: jax.Array
+    replay_weights: jax.Array
+    replay_valid: jax.Array
 
 
 class _Transition(NamedTuple):
@@ -292,6 +313,8 @@ class _Transition(NamedTuple):
     opponent_mode: jax.Array
     opponent_category: jax.Array
     opponent_generation: jax.Array
+    level_key: jax.Array
+    replay_selected: jax.Array
     mirrored_old_log_prob: jax.Array | None = None
     mirrored_old_value: jax.Array | None = None
     mirrored_bootstrap_value: jax.Array | None = None
@@ -710,6 +733,10 @@ class PPO:
             opponent_modes=jnp.full(self.config.num_envs, 2, dtype=jnp.int32),
             opponent_categories=jnp.full(self.config.num_envs, 4, dtype=jnp.int32),
             opponent_generations=jnp.full(self.config.num_envs, -1, dtype=jnp.int32),
+            initial_level_keys=jax.vmap(lambda k: jax.random.split(k, 3)[1])(reset_keys),
+            replay_level_keys=jnp.zeros((self.config.curriculum_buffer_size, 2), dtype=jnp.uint32),
+            replay_weights=jnp.zeros((self.config.curriculum_buffer_size,), dtype=jnp.float32),
+            replay_valid=jnp.zeros((self.config.curriculum_buffer_size,), dtype=jnp.bool_),
         )
 
     def _sample_opponent(
@@ -806,12 +833,17 @@ class PPO:
         opponent_pool: dict,
         opponent_probabilities: jax.Array,
         opponent_generations: jax.Array,
+        level_key: jax.Array,
     ) -> tuple[EnvState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
         def reset(args) -> tuple[
             EnvState, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
         ]:
             reset_key, sample_key = args
-            reset_state, reset_timestep = self.env.reset(reset_key)
+            if self.config.curriculum_replay_fraction:
+                state_key, _, obs_key = jax.random.split(reset_key, 3)
+                reset_state, reset_timestep = self.env.reset_level(level_key, state_key, obs_key)
+            else:
+                reset_state, reset_timestep = self.env.reset(reset_key)
             index, mode, category, generation = self._sample_opponent(
                 sample_key, opponent_pool, opponent_probabilities, opponent_generations
             )
@@ -923,9 +955,22 @@ class PPO:
             completed_length = jnp.where(episode_end, running_length, 0)
 
             reset_keys = jax.random.split(reset_key, self.config.num_envs)
+            if self.config.curriculum_replay_fraction:
+                weights = jnp.where(carry.replay_valid, carry.replay_weights + 1e-3, 0.0)
+                weights = jnp.where(jnp.any(carry.replay_valid), weights, jnp.ones_like(weights))
+                cumulative = jnp.cumsum(weights) / jnp.sum(weights)
+                def select_level(k):
+                    fresh_key, choice_key, coin_key = jax.random.split(jax.random.fold_in(k, 99991), 3)
+                    selected = jnp.minimum(jnp.searchsorted(cumulative, jax.random.uniform(choice_key)), self.config.curriculum_buffer_size - 1)
+                    use_replay = (jax.random.uniform(coin_key) < self.config.curriculum_replay_fraction) & jnp.any(carry.replay_valid)
+                    return jnp.where(use_replay, carry.replay_level_keys[selected], fresh_key), use_replay
+                level_keys, replay_selected = jax.vmap(select_level)(reset_keys)
+            else:
+                replay_selected = jnp.zeros_like(episode_end)
+                level_keys = jax.vmap(lambda k: jax.random.split(k, 3)[1])(reset_keys)
             if opponent_pool is None:
                 next_env_state, next_observation = jax.vmap(self._maybe_reset_legacy)(
-                    episode_end, stepped_state, timestep.observation, reset_keys
+                    episode_end, stepped_state, timestep.observation, reset_keys, level_keys
                 )
                 next_opponent_indices = carry.opponent_indices
                 next_opponent_modes = carry.opponent_modes
@@ -941,6 +986,7 @@ class PPO:
                     carry.opponent_modes,
                     carry.opponent_categories,
                     carry.opponent_generations,
+                    level_keys,
                 )
                 (
                     next_env_state,
@@ -950,7 +996,7 @@ class PPO:
                     next_opponent_categories,
                     next_opponent_generations,
                 ) = jax.vmap(
-                    lambda done, state, obs, key, index, mode, category, generation: self._maybe_reset(
+                    lambda done, state, obs, key, index, mode, category, generation, level: self._maybe_reset(
                         done,
                         state,
                         obs,
@@ -962,6 +1008,7 @@ class PPO:
                         opponent_pool,
                         opponent_probabilities,
                         opponent_generations,
+                        level,
                     )
                 )(*reset_args)
             next_runner = RunnerState(
@@ -976,6 +1023,10 @@ class PPO:
                 opponent_modes=next_opponent_modes,
                 opponent_categories=next_opponent_categories,
                 opponent_generations=next_opponent_generations,
+                initial_level_keys=jnp.where(episode_end[:, None], level_keys, carry.initial_level_keys),
+                replay_level_keys=carry.replay_level_keys,
+                replay_weights=carry.replay_weights,
+                replay_valid=carry.replay_valid,
             )
             transition_data = _Transition(
                 # Consecutive Brandao histories overlap in seven of eight
@@ -1001,6 +1052,8 @@ class PPO:
                 opponent_mode=carry.opponent_modes,
                 opponent_category=carry.opponent_categories,
                 opponent_generation=carry.opponent_generations,
+                level_key=carry.initial_level_keys,
+                replay_selected=episode_end & replay_selected,
                 mirrored_old_log_prob=mirrored_log_prob,
                 mirrored_old_value=mirrored_value,
                 mirrored_bootstrap_value=mirrored_bootstrap_value,
@@ -1020,9 +1073,14 @@ class PPO:
         state: EnvState,
         observation: jax.Array,
         key: jax.Array,
+        level_key: jax.Array,
     ) -> tuple[EnvState, jax.Array]:
         def reset(reset_key: jax.Array) -> tuple[EnvState, jax.Array]:
-            reset_state, reset_timestep = self.env.reset(reset_key)
+            if self.config.curriculum_replay_fraction:
+                state_key, _, obs_key = jax.random.split(reset_key, 3)
+                reset_state, reset_timestep = self.env.reset_level(level_key, state_key, obs_key)
+            else:
+                reset_state, reset_timestep = self.env.reset(reset_key)
             return reset_state, reset_timestep.observation
 
         def keep(_: None) -> tuple[EnvState, jax.Array]:
@@ -1183,6 +1241,31 @@ class PPO:
         rollout_runner, trajectory = self._collect_rollout(
             runner, opponent_pool, opponent_probabilities, opponent_generations
         )
+        curriculum_return_min = jnp.float32(0.0)
+        curriculum_return_max = jnp.float32(0.0)
+        if self.config.curriculum_replay_fraction:
+            valid = trajectory.episode_end.reshape(-1)
+            returns = trajectory.completed_return
+            if self.is_shared_agent_policy:
+                returns = jnp.mean(returns, axis=-1)
+            returns = returns.reshape(-1)
+            score, curriculum_return_min, curriculum_return_max = _curriculum_scores(returns, valid)
+            keys = trajectory.level_key.reshape((-1, 2))
+            capacity = self.config.curriculum_buffer_size
+            # Pad so top_k also works for short rollout batches.
+            valid = jnp.concatenate((valid, jnp.zeros(capacity, dtype=jnp.bool_)))
+            score = jnp.concatenate((score, jnp.zeros(capacity)))
+            keys = jnp.concatenate((keys, jnp.zeros((capacity, 2), dtype=jnp.uint32)))
+            sample_key, next_key = jax.random.split(rollout_runner.key)
+            random_order = jax.random.uniform(sample_key, valid.shape)
+            _, chosen = jax.lax.top_k(jnp.where(valid, random_order, -1.0), capacity)
+            any_valid = jnp.any(valid)
+            rollout_runner = rollout_runner._replace(
+                key=next_key,
+                replay_level_keys=jnp.where(any_valid, keys[chosen], rollout_runner.replay_level_keys),
+                replay_weights=jnp.where(any_valid, score[chosen], rollout_runner.replay_weights),
+                replay_valid=jnp.where(any_valid, valid[chosen], rollout_runner.replay_valid),
+            )
         episode_ends = trajectory.episode_end
         discounts = trajectory.discount
         if trajectory.reward.ndim > episode_ends.ndim:
@@ -1268,6 +1351,11 @@ class PPO:
         yellow_goals_by_env = jnp.sum(trajectory.goal == -1, axis=0)
         metrics.update(
             {
+                "curriculum_replay_resets": jnp.sum(trajectory.replay_selected),
+                "curriculum_total_resets": jnp.sum(trajectory.episode_end),
+                "curriculum_buffer_count": jnp.sum(runner.replay_valid),
+                "curriculum_return_min": curriculum_return_min,
+                "curriculum_return_max": curriculum_return_max,
                 "mean_reward": jnp.mean(trajectory.reward),
                 "agent_transitions": runner.env_steps
                 * (3 if self.is_shared_agent_policy else 1),
