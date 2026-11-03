@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from .. import config
+from . import contact_projection, swept_collisions
 
 # ---------------------------------------------------------------------------
 # State container (PyTree)
@@ -466,14 +467,10 @@ def _ball_wall_collisions(state: SimState) -> tuple[SimState, jnp.ndarray]:
     right_goal = (bx - r > half_l) & in_goal_y
 
     # At the goal line, the portions outside the 40 cm mouth act as posts.
-    # Only resolve this front-wall contact while the ball centre is still on
-    # the field side; once inside, the pocket's side rails handle contact.
-    hit_left_front = (
-        (bx >= -half_l) & (bx - r < -half_l) & ~in_goal_y
-    )
-    hit_right_front = (
-        (bx <= half_l) & (bx + r > half_l) & ~in_goal_y
-    )
+    # Recover invalid states outside the opening on the field side. Normal
+    # movement uses the swept geometry, which preserves the approach side.
+    hit_left_front = (bx - r < -half_l) & ~in_goal_y
+    hit_right_front = (bx + r > half_l) & ~in_goal_y
     bx = jnp.where(hit_left_front, -half_l + r, bx)
     bx = jnp.where(hit_right_front, half_l - r, bx)
     velocity, spin = _wall_bounce(velocity, spin, hit_left_front, (1.0, 0.0, 0.0))
@@ -552,8 +549,9 @@ def _ball_obb_penetration(
     pen_x_in = half - jnp.abs(local_x)
     pen_y_in = half - jnp.abs(local_y)
     use_x = pen_x_in <= pen_y_in
-    lnx_in = jnp.where(use_x, jnp.sign(local_x), 0.0)
-    lny_in = jnp.where(use_x, 0.0, jnp.sign(local_y))
+    # A ball exactly at the robot centre still needs a nonzero escape normal.
+    lnx_in = jnp.where(use_x, jnp.where(local_x >= 0.0, 1.0, -1.0), 0.0)
+    lny_in = jnp.where(use_x, 0.0, jnp.where(local_y >= 0.0, 1.0, -1.0))
     pen_in = jnp.where(use_x, pen_x_in, pen_y_in) + r_ball
 
     inside = dist < 1e-9
@@ -824,6 +822,8 @@ def _substep(
     max_delta: jnp.ndarray,
 ) -> tuple[SimState, jnp.ndarray]:
     """One physics sub-step. Returns ``(new_state, goal_event)``."""
+    # Save robot poses for relative-motion collision detection.
+    robot_start = state.robots
     # Slew current wheel speeds toward the commanded target (torque limit).
     delta = jnp.clip(target_speeds - state.wheel_speeds, -max_delta, max_delta)
     wheel_speeds = state.wheel_speeds + delta
@@ -847,15 +847,32 @@ def _substep(
 
     # Ball floor contact (skidding, rolling) or flight, then motion.
     state = _ball_floor(state, sub_dt)
-    state = state._replace(ball=state.ball.at[0:2].add(state.ball[2:4] * sub_dt))
 
-    # Collisions.
+    # Constrain the predicted robot motion, then advance the ball through the
+    # earliest wall, robot, and goal events within this substep.
     state = _robot_wall_collisions(state)
     state = _robot_chamfer_collisions(state)
-    state, goal = _ball_wall_collisions(state)
-    state = _ball_chamfer_collisions(state)
+    state, goal = swept_collisions.advance_ball(state, robot_start, sub_dt, _ball_face_impulse)
+
+    # Keep the velocity-level impulses, but solve positions together so later
+    # robot contacts cannot undo an earlier wall constraint. Positional
+    # iterations never reapply restitution, friction, or spin impulses.
+    positions = state
     state = _ball_robot_collisions(state)
     state = _robot_robot_collisions(state)
+    state = state._replace(
+        ball=state.ball.at[:2].set(positions.ball[:2]),
+        robots=state.robots.at[:, :, :2].set(positions.robots[:, :, :2]),
+    )
+    state = contact_projection.project_contacts(
+        state, _ball_obb_penetration, _sat_square_overlap,
+        _robot_wall_collisions, _robot_chamfer_collisions,
+        iterations=4,
+    )
+    # A goal terminates the substep at its crossing event. Later contact
+    # projection must not move the ball or apply an impulse after that event.
+    state = jax.tree_util.tree_map(lambda before, after: jnp.where(goal != 0, before, after),
+                                   positions, state)
     # The floor absorbs any downward push from wall or robot friction.
     z, vz = state.ball_vertical[0], state.ball_vertical[1]
     vz = jnp.where(z <= 0.0, jnp.maximum(vz, 0.0), vz)
