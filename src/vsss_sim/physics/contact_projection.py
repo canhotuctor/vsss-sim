@@ -3,6 +3,12 @@
 The velocity-level collision pass remains responsible for impulses, restitution,
 friction and spin. These iterations only repair geometry; their equal positional
 weights are a numerical preconditioner, not a model of physical masses.
+
+Robot pairs are relaxed Gauss-Seidel style: the complete graph on six robots
+splits into five perfect matchings, so each round corrects three independent
+pairs at once, then re-clamps against the field. Walls therefore act as
+zero-inverse-mass bodies that every later round sees, rather than something
+estimated once per pass.
 """
 from __future__ import annotations
 
@@ -18,10 +24,27 @@ from . import swept_collisions
 # Treat sub-micrometre numerical overlap as contact slop. Counting a tiny
 # roundoff contact in a normalization denominator can otherwise halve the
 # correction of another, deeply overlapping pair.
-_CONTACT_SLOP = 1e-6
+_CONTACT_SLOP = swept_collisions.CONTACT_SLOP
 _N_ROBOTS = config.N_TEAMS * config.N_ROBOTS
 _PAIR_A = jnp.asarray([i for i in range(_N_ROBOTS) for j in range(i + 1, _N_ROBOTS)])
 _PAIR_B = jnp.asarray([j for i in range(_N_ROBOTS) for j in range(i + 1, _N_ROBOTS)])
+
+
+def _matching_rounds(n: int) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Round-robin schedule: ``n - 1`` rounds of ``n // 2`` disjoint pairs."""
+    assert n % 2 == 0
+    rounds = []
+    for r in range(n - 1):
+        pairs = [(r, n - 1)]
+        for k in range(1, n // 2):
+            pairs.append(((r + k) % (n - 1), (r - k) % (n - 1)))
+        rounds.append(tuple(pairs))
+    return tuple(rounds)
+
+
+_ROUNDS = _matching_rounds(_N_ROBOTS)
+_ROUND_A = jnp.asarray([[a for a, _ in rnd] for rnd in _ROUNDS])
+_ROUND_B = jnp.asarray([[b for _, b in rnd] for rnd in _ROUNDS])
 
 
 def _first_wall_contact(start, proposed):
@@ -76,14 +99,17 @@ def project_contacts(
     an impulse or score a goal. The initial ball position must already be in
     the permitted region; continuous movement should precede this projection.
 
-    Jacobi corrections are recomputed each iteration and damped for bodies with
-    multiple simultaneous contacts. Wall projections run after every pass.
-    The fixed iteration budget can leave residual penetration, especially in
-    dense/infeasible configurations; it is not an intersection-free guarantee.
+    Ball corrections are Jacobi, averaged over simultaneous contacts. Robot
+    pairs are Gauss-Seidel over five matchings; a robot the field clamped on the
+    previous iteration is treated as immovable, so its partner absorbs the whole
+    separation. The fixed iteration budget can leave residual penetration,
+    especially in dense/infeasible configurations; it is not an
+    intersection-free guarantee.
     """
     original = state
 
-    def iteration(_, current):
+    def iteration(_, carry):
+        current, pinned = carry
         robots = current.robots.reshape((_N_ROBOTS, 6))
         ball_xy = current.ball[:2]
         ball_normals, ball_penetrations = jax.vmap(
@@ -98,37 +124,6 @@ def project_contacts(
         # motion still uses the full swept bounce/sliding implementation.
         safe_ball = _first_wall_contact(ball_xy, proposed_ball)
 
-        first = robots[_PAIR_A]
-        second = robots[_PAIR_B]
-        overlapping, normals, overlaps = jax.vmap(sat_square_overlap)(
-            first[:, :2], first[:, 2], second[:, :2], second[:, 2]
-        )
-        overlapping = overlapping & (overlaps > _CONTACT_SLOP)
-        pair_separation = 0.5 * normals * overlaps[:, None]
-        pair_separation = jnp.where(overlapping[:, None], pair_separation, 0.0)
-        pair_delta = jnp.zeros((_N_ROBOTS, 2), dtype=robots.dtype)
-        pair_delta = pair_delta.at[_PAIR_A].add(pair_separation)
-        pair_delta = pair_delta.at[_PAIR_B].add(-pair_separation)
-
-        # Estimate the fraction of each body's proposed pair correction that
-        # a field wall blocks. If exactly one side of a pair is wall-pinned,
-        # transfer its positional correction to the free side of the pair.
-        probe_robots = robots.at[:, :2].add(pair_delta)
-        probe = current._replace(robots=probe_robots.reshape(current.robots.shape))
-        probe = robot_chamfer(robot_wall(probe))
-        actual_delta = probe.robots.reshape((_N_ROBOTS, 6))[:, :2] - robots[:, :2]
-        desired2 = jnp.sum(pair_delta * pair_delta, axis=-1)
-        ratio = jnp.sum(actual_delta * pair_delta, axis=-1) / jnp.where(desired2 > 1e-16, desired2, 1.0)
-        blocked = jnp.where(desired2 > 1e-16, jnp.clip(1.0 - ratio, 0.0, 1.0), 0.0)
-        weight_a = jnp.clip(1.0 + blocked[_PAIR_B] - blocked[_PAIR_A], 0.0, 2.0)
-        weight_b = 2.0 - weight_a
-        pair_delta = jnp.zeros((_N_ROBOTS, 2), dtype=robots.dtype)
-        pair_delta = pair_delta.at[_PAIR_A].add(pair_separation * weight_a[:, None])
-        pair_delta = pair_delta.at[_PAIR_B].add(-pair_separation * weight_b[:, None])
-        pair_count = jnp.zeros((_N_ROBOTS,), dtype=robots.dtype)
-        pair_count = pair_count.at[_PAIR_A].add(overlapping.astype(robots.dtype))
-        pair_count = pair_count.at[_PAIR_B].add(overlapping.astype(robots.dtype))
-
         # Absorb the portion of each separation that the ball could not make.
         # In particular a wall-pinned or symmetrically pinched ball remains
         # still, so the robot moves by the full penetration in this pass. This
@@ -137,19 +132,45 @@ def project_contacts(
         achieved = jnp.sum(ball_normals * ball_move[None, :], axis=-1)
         robot_depth = jnp.clip(ball_depth - achieved, 0.0, 1.5 * ball_depth)
         robot_ball_delta = -ball_normals * robot_depth[:, None]
-        robot_delta = pair_delta + robot_ball_delta
-        contact_count = pair_count + ball_contacts.astype(robots.dtype)
-        robot_delta /= jnp.maximum(contact_count[:, None], 1.0)
-        robots = robots.at[:, :2].add(robot_delta)
+        robots = robots.at[:, :2].add(robot_ball_delta)
         current = current._replace(
             ball=current.ball.at[:2].set(safe_ball),
             robots=robots.reshape(current.robots.shape),
         )
-        # Existing wall helpers also touch velocity; retain only their positions.
-        wall_state = robot_chamfer(robot_wall(current))
-        return current._replace(robots=current.robots.at[:, :, :2].set(wall_state.robots[:, :, :2]))
 
-    result = jax.lax.fori_loop(0, iterations, iteration, state)
+        def clamp_to_field(state_):
+            # Existing wall helpers also touch velocity; retain only positions.
+            walled = robot_chamfer(robot_wall(state_))
+            return state_._replace(
+                robots=state_.robots.at[:, :, :2].set(walled.robots[:, :, :2])
+            )
+
+        def pair_round(index, state_):
+            flat = state_.robots.reshape((_N_ROBOTS, 6))
+            a, b = _ROUND_A[index], _ROUND_B[index]
+            overlapping, normals, overlaps = jax.vmap(sat_square_overlap)(
+                flat[a, :2], flat[a, 2], flat[b, :2], flat[b, 2]
+            )
+            overlapping = overlapping & (overlaps > _CONTACT_SLOP)
+            # Inverse-mass weights: a robot the field clamped last pass cannot
+            # yield, so its partner absorbs the whole separation.
+            free_a, free_b = 1.0 - pinned[a], 1.0 - pinned[b]
+            total = free_a + free_b
+            share_a = jnp.where(total > 0.0, free_a / jnp.where(total > 0.0, total, 1.0), 0.5)
+            full = jnp.where(overlapping[:, None], normals * overlaps[:, None], 0.0)
+            flat = flat.at[a, :2].add(full * share_a[:, None]).at[b, :2].add(-full * (1.0 - share_a)[:, None])
+            return state_._replace(robots=flat.reshape(state_.robots.shape))
+
+        current = clamp_to_field(current)
+        moved = jax.lax.fori_loop(0, _ROUND_A.shape[0], pair_round, current)
+        clamped = clamp_to_field(moved)
+        shove = clamped.robots[:, :, :2] - moved.robots[:, :, :2]
+        pinned = (jnp.linalg.norm(shove, axis=-1) > _CONTACT_SLOP).reshape(-1).astype(robots.dtype)
+        return clamped, pinned
+
+    result, _ = jax.lax.fori_loop(
+        0, iterations, iteration, (state, jnp.zeros((_N_ROBOTS,), dtype=state.robots.dtype))
+    )
     # Keep the velocity/friction/spin effects of the single collision impulse
     # pass; position relaxation is intentionally not an additional bounce.
     robots = result.robots.at[:, :, 3:].set(original.robots[:, :, 3:])

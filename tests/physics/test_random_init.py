@@ -47,6 +47,27 @@ class TestJaxResetRandom:
         assert float(blue_xs.min()) < 0 and float(blue_xs.max()) > 0
         assert float(yellow_xs.min()) < 0 and float(yellow_xs.max()) > 0
 
+    def test_no_initial_overlap_between_bodies(self):
+        keys = jax.random.split(jax.random.PRNGKey(3), 2000)
+        states = jax.vmap(jb.reset_random)(keys)
+        flat = states.robots.reshape((-1, 6, 6))
+        first, second = np.triu_indices(6, 1)
+
+        def robot_overlap(robots):
+            overlapping, _, _ = jax.vmap(jb._sat_square_overlap)(
+                robots[first, :2], robots[first, 2], robots[second, :2], robots[second, 2]
+            )
+            return jnp.any(overlapping)
+
+        def ball_overlap(ball, robots):
+            _, depth = jax.vmap(jb._ball_obb_penetration, in_axes=(None, 0, 0))(
+                ball[:2], robots[:, :2], robots[:, 2]
+            )
+            return jnp.any(depth > 0.0)
+
+        assert not bool(jnp.any(jax.vmap(robot_overlap)(flat)))
+        assert not bool(jnp.any(jax.vmap(ball_overlap)(states.ball, flat)))
+
     def test_different_seeds_differ(self):
         s0 = self._reset(0)
         s1 = self._reset(1)

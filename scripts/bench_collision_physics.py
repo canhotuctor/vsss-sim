@@ -18,6 +18,7 @@ parser.add_argument("--substeps", type=int, default=6)
 parser.add_argument("--repeats", type=int, default=7)
 parser.add_argument("--seed", type=int, default=17)
 parser.add_argument("--scenario", choices=["kickoff", "contact"], default="kickoff")
+parser.add_argument("--drive", choices=c.ROBOT_DRIVE_MODELS, default=c.ROBOT_DRIVE_MODEL)
 parser.add_argument(
     "--restart-each-chunk",
     action="store_true",
@@ -26,7 +27,7 @@ parser.add_argument(
 args = parser.parse_args()
 B, STEPS = args.envs, args.steps
 print(
-    f"jax={jax.__version__} backend={jax.default_backend()} devices={jax.devices()} batch={B} rollout_chunk={STEPS} substeps={args.substeps} scenario={args.scenario} seed={args.seed}",
+    f"jax={jax.__version__} backend={jax.default_backend()} devices={jax.devices()} batch={B} rollout_chunk={STEPS} substeps={args.substeps} drive={args.drive} scenario={args.scenario} seed={args.seed}",
     flush=True,
 )
 initial = jax.vmap(p.reset_kickoff)(jax.random.split(jax.random.PRNGKey(args.seed), B))
@@ -56,7 +57,7 @@ if args.scenario == "contact":
     actions = jnp.zeros_like(actions)
     actions = actions.at[:, :, 0, 0, :].set(1.0)
     actions = actions.at[:, B // 2 :, 0, 1, :].set(1.0)
-vstep = jax.vmap(lambda state, action: p.step(state, action, sub_steps=args.substeps)[0])
+vstep = jax.vmap(lambda state, action: p.step(state, action, sub_steps=args.substeps, drive_model=args.drive)[0])
 
 
 def rollout(states, seq):

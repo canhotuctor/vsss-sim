@@ -6,6 +6,7 @@ same implementation runs efficiently on CPU and accelerators.
 """
 from __future__ import annotations
 
+import math
 from functools import partial
 from typing import NamedTuple
 
@@ -71,6 +72,52 @@ def _diff_drive(
     return vx, vy, omega
 
 
+def _dynamic_drive(
+    robots: jnp.ndarray, wheel_speeds: jnp.ndarray, sub_dt: jnp.ndarray
+) -> jnp.ndarray:
+    """Advance robot velocities one sub-step under force-limited wheel motors.
+
+    Each wheel pushes with a force proportional to its speed error (a DC motor
+    against back-EMF), capped by traction and by what would overshoot the
+    target in one step. Wheels cannot push sideways: lateral velocity decays
+    only through wheel friction. Contact impulses applied earlier persist
+    because velocity is state. Returns ``robots`` with new ``vx, vy, omega``.
+    """
+    mass = jnp.float32(config.ROBOT_MASS)
+    inertia = jnp.float32(config.ROBOT_INERTIA)
+    half_b = jnp.float32(config.ROBOT_WHEELBASE / 2.0)
+    traction = jnp.float32(config.ROBOT_WHEEL_FLOOR_FRICTION * config.GRAVITY)
+    wheel_force_cap = traction * mass / 2.0
+    stiffness = jnp.float32(
+        config.ROBOT_MOTOR_MAX_TORQUE / config.ROBOT_WHEEL_RADIUS / config.ROBOT_MAX_WHEEL_SPEED
+    )
+    # Worst-case wheel acceleration per unit wheel force (both wheels pushing).
+    wheel_compliance = 1.0 / mass + half_b * half_b / inertia
+
+    theta = robots[..., 2]
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    v_fwd = robots[..., 3] * c + robots[..., 4] * s
+    v_lat = -robots[..., 3] * s + robots[..., 4] * c
+    omega = robots[..., 5]
+
+    speed_left = v_fwd - omega * half_b
+    speed_right = v_fwd + omega * half_b
+    error = jnp.stack([wheel_speeds[..., 0] - speed_left,
+                       wheel_speeds[..., 1] - speed_right], axis=-1)
+    no_overshoot = jnp.abs(error) / (sub_dt * wheel_compliance)
+    cap = jnp.minimum(wheel_force_cap, no_overshoot)
+    force = jnp.clip(stiffness * error, -cap, cap)
+
+    v_fwd = v_fwd + (force[..., 0] + force[..., 1]) / mass * sub_dt
+    omega = omega + (force[..., 1] - force[..., 0]) * half_b / inertia * sub_dt
+    shed = jnp.minimum(jnp.abs(v_lat), traction * sub_dt)
+    v_lat = v_lat - jnp.sign(v_lat) * shed
+
+    vx = v_fwd * c - v_lat * s
+    vy = v_fwd * s + v_lat * c
+    return robots.at[..., 3].set(vx).at[..., 4].set(vy).at[..., 5].set(omega)
+
+
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
@@ -103,30 +150,53 @@ def reset_kickoff(key: jnp.ndarray, possession_team=None) -> SimState:
 
 
 # ---------------------------------------------------------------------------
+_RESET_CANDIDATES = 16
+
+
 def reset_random(key: jnp.ndarray) -> SimState:
     """Place robots and ball at uniformly random positions anywhere on the field.
 
     All robots (both teams) sample from the full field; no half-restriction.
     - Ball: random anywhere within field bounds (margin from walls).
     - All robots: random x/y within field bounds (margin from walls), random headings.
-    - No overlap-rejection; any initial interpenetration resolves in the first
-      few physics sub-steps.
+    - Bodies are rejection-sampled so none starts overlapping another.
     """
     half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     margin = jnp.float32(config.ROBOT_SIZE)
 
-    key_bx, key_by, key_x, key_y, key_t = jax.random.split(key, 5)
+    key_xy, key_t = jax.random.split(key)
 
-    # Ball: full field (same margin from walls as robots)
-    ball_x = jax.random.uniform(key_bx, (), minval=-half_l + margin, maxval=half_l - margin)
-    ball_y = jax.random.uniform(key_by, (), minval=-half_w + margin, maxval=half_w - margin)
-    ball = jnp.array([ball_x, ball_y, 0.0, 0.0], dtype=jnp.float32)
+    # Rejection-sample the 6 robots, then the ball, so nothing starts
+    # overlapping. Spacing uses circumscribed circles (a conservative bound for
+    # rotated squares); 16 candidates per body make exhaustion negligible.
+    n_robots = config.N_TEAMS * config.N_ROBOTS
+    corner = config.ROBOT_SIZE / math.sqrt(2.0)
+    spacing = jnp.asarray([2.0 * corner] * n_robots + [corner + config.BALL_RADIUS],
+                          dtype=jnp.float32)
+    low = jnp.stack([-half_l + margin, -half_w + margin])
+    high = jnp.stack([half_l - margin, half_w - margin])
+    candidates = jax.random.uniform(
+        key_xy, (n_robots + 1, _RESET_CANDIDATES, 2), minval=low, maxval=high
+    )
 
-    # All robots: full field
-    all_x = jax.random.uniform(key_x, (config.N_TEAMS, config.N_ROBOTS), minval=-half_l + margin, maxval=half_l - margin)
-    all_y = jax.random.uniform(key_y, (config.N_TEAMS, config.N_ROBOTS), minval=-half_w + margin, maxval=half_w - margin)
-    all_t = jax.random.uniform(key_t, (config.N_TEAMS, config.N_ROBOTS), minval=-jnp.pi, maxval=jnp.pi)
+    def place(placed, inputs):
+        index, options, required = inputs
+        distance = jnp.linalg.norm(options[:, None, :] - placed[None, :, :], axis=-1)
+        # Unfilled slots sit far outside the field and never conflict.
+        valid = jnp.all(distance >= required, axis=-1)
+        return placed.at[index].set(options[jnp.argmax(valid)]), None
+
+    unfilled = jnp.full((n_robots + 1, 2), 1e3, dtype=jnp.float32)
+    placed, _ = jax.lax.scan(
+        place, unfilled, (jnp.arange(n_robots + 1), candidates, spacing)
+    )
+    ball = jnp.concatenate([placed[n_robots], jnp.zeros(2)]).astype(jnp.float32)
+    all_x = placed[:n_robots, 0].reshape(config.N_TEAMS, config.N_ROBOTS)
+    all_y = placed[:n_robots, 1].reshape(config.N_TEAMS, config.N_ROBOTS)
+    all_t = jax.random.uniform(
+        key_t, (config.N_TEAMS, config.N_ROBOTS), minval=-jnp.pi, maxval=jnp.pi
+    )
 
     robots = jnp.zeros((config.N_TEAMS, config.N_ROBOTS, 6), dtype=jnp.float32)
     robots = robots.at[:, :, 0].set(all_x)
@@ -577,7 +647,7 @@ def _resolve_ball_robot_pair(
     theta = robot[2]
 
     normal, penetration = _ball_obb_penetration(ball_pos, rob_pos, theta)
-    collide = penetration > 0.0
+    collide = penetration > swept_collisions.CONTACT_SLOP
 
     m_b = jnp.float32(config.BALL_MASS)
     m_r = jnp.float32(config.ROBOT_MASS)
@@ -623,7 +693,7 @@ def _ball_robot_collisions(state: SimState) -> SimState:
         state.ball[0:2], robots_flat[:, 0:2], robots_flat[:, 2]
     )  # normals: (6, 2), penetrations: (6,)
 
-    collide = penetrations > 0.0  # (6,)
+    collide = penetrations > swept_collisions.CONTACT_SLOP  # (6,)
 
     # Ball position: sum push-out from all colliding robots
     ball_pos_delta = (normals * penetrations[:, None] * (m_r / total_m))
@@ -820,8 +890,13 @@ def _substep(
     target_speeds: jnp.ndarray,
     sub_dt: jnp.ndarray,
     max_delta: jnp.ndarray,
+    dynamic: bool = False,
 ) -> tuple[SimState, jnp.ndarray]:
-    """One physics sub-step. Returns ``(new_state, goal_event)``."""
+    """One physics sub-step. Returns ``(new_state, goal_event)``.
+
+    ``dynamic`` selects force-limited motors (velocity persists across
+    sub-steps) over the kinematic wheel-command velocity overwrite.
+    """
     # Save robot poses for relative-motion collision detection.
     robot_start = state.robots
     # Slew current wheel speeds toward the commanded target (torque limit).
@@ -829,15 +904,19 @@ def _substep(
     wheel_speeds = state.wheel_speeds + delta
     state = state._replace(wheel_speeds=wheel_speeds)
 
-    v_l = wheel_speeds[:, :, 0]
-    v_r = wheel_speeds[:, :, 1]
-    theta = state.robots[:, :, 2]
-    vx, vy, omega = _diff_drive(v_l, v_r, theta)
+    if dynamic:
+        robots = _dynamic_drive(state.robots, wheel_speeds, sub_dt)
+        vx, vy, omega = robots[:, :, 3], robots[:, :, 4], robots[:, :, 5]
+    else:
+        v_l = wheel_speeds[:, :, 0]
+        v_r = wheel_speeds[:, :, 1]
+        theta = state.robots[:, :, 2]
+        vx, vy, omega = _diff_drive(v_l, v_r, theta)
 
-    robots = state.robots
-    robots = robots.at[:, :, 3].set(vx)
-    robots = robots.at[:, :, 4].set(vy)
-    robots = robots.at[:, :, 5].set(omega)
+        robots = state.robots
+        robots = robots.at[:, :, 3].set(vx)
+        robots = robots.at[:, :, 4].set(vy)
+        robots = robots.at[:, :, 5].set(omega)
     robots = robots.at[:, :, 0].add(vx * sub_dt)
     robots = robots.at[:, :, 1].add(vy * sub_dt)
     new_theta = robots[:, :, 2] + omega * sub_dt
@@ -867,7 +946,7 @@ def _substep(
     state = contact_projection.project_contacts(
         state, _ball_obb_penetration, _sat_square_overlap,
         _robot_wall_collisions, _robot_chamfer_collisions,
-        iterations=4,
+        iterations=6,
     )
     # A goal terminates the substep at its crossing event. Later contact
     # projection must not move the ball or apply an impulse after that event.
@@ -895,12 +974,13 @@ def _control_substep(
     target_speeds: jnp.ndarray,
     sub_dt: jnp.ndarray,
     max_delta: jnp.ndarray,
+    dynamic: bool = False,
 ) -> tuple[tuple[SimState, jnp.ndarray], jnp.ndarray]:
     """One sub-step of a control interval; the state freezes after a goal."""
     state, goal_acc = carry
     state, g = jax.lax.cond(
         goal_acc == 0,
-        lambda current: _substep(current, target_speeds, sub_dt, max_delta),
+        lambda current: _substep(current, target_speeds, sub_dt, max_delta, dynamic),
         lambda current: (current, jnp.int32(0)),
         state,
     )
@@ -908,12 +988,21 @@ def _control_substep(
     return (state, goal_acc), g
 
 
-@partial(jax.jit, static_argnames=("sub_steps",))
+def _is_dynamic(drive_model: str) -> bool:
+    if drive_model not in config.ROBOT_DRIVE_MODELS:
+        raise ValueError(
+            f"drive_model must be one of {config.ROBOT_DRIVE_MODELS}, got {drive_model!r}"
+        )
+    return drive_model == "dynamic"
+
+
+@partial(jax.jit, static_argnames=("sub_steps", "drive_model"))
 def step(
     state: SimState,
     actions: jnp.ndarray,
     dt: float = config.DT,
     sub_steps: int = config.SUB_STEPS,
+    drive_model: str = config.ROBOT_DRIVE_MODEL,
 ) -> tuple[SimState, dict]:
     """Advance the simulation by one control timestep (functional + jitted).
 
@@ -923,6 +1012,8 @@ def step(
     actions : (N_TEAMS, N_ROBOTS, 2) jnp.float32 — normalised wheel speeds in [-1, 1].
     dt : float — control timestep (default ``config.DT``).
     sub_steps : int — physics sub-steps per control step (static, default 6).
+    drive_model : ``"kinematic"`` (wheel commands set velocity) or ``"dynamic"``
+        (force-limited motors, momentum-carrying contacts); static.
 
     Returns
     -------
@@ -930,9 +1021,10 @@ def step(
     info : dict with ``"goal"`` (int32 scalar).
     """
     inputs = _control_inputs(actions, dt, sub_steps)
+    dynamic = _is_dynamic(drive_model)
 
     def body(_, carry):
-        carry, _ = _control_substep(carry, *inputs)
+        carry, _ = _control_substep(carry, *inputs, dynamic)
         return carry
 
     state, goal = jax.lax.fori_loop(
@@ -942,12 +1034,13 @@ def step(
     return state, {"goal": goal}
 
 
-@partial(jax.jit, static_argnames=("sub_steps",))
+@partial(jax.jit, static_argnames=("sub_steps", "drive_model"))
 def step_with_frames(
     state: SimState,
     actions: jnp.ndarray,
     dt: float = config.DT,
     sub_steps: int = config.SUB_STEPS,
+    drive_model: str = config.ROBOT_DRIVE_MODEL,
 ) -> tuple[SimState, dict, SimState]:
     """Advance one control timestep exactly like :func:`step`, keeping sub-steps.
 
@@ -963,9 +1056,10 @@ def step_with_frames(
         ``t`` advances only on ``new_state``.
     """
     inputs = _control_inputs(actions, dt, sub_steps)
+    dynamic = _is_dynamic(drive_model)
 
     def body(carry, _):
-        carry, g = _control_substep(carry, *inputs)
+        carry, g = _control_substep(carry, *inputs, dynamic)
         return carry, (carry[0], g)
 
     (state, goal), (frames, goals) = jax.lax.scan(

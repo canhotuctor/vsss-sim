@@ -1,8 +1,8 @@
 """Bounded continuous collision checks for the ball's planar motion.
 
 The field is a fixed set of segments. Robots are swept as translating squares
-at their initial substep orientation; rotation during the sweep is an
-approximation and is still handled discretely by the contact solver. The
+with the ball's path in the robot frame swept over a few chords; the residual
+rotation error is handled discretely by the contact solver. The
 bounded dynamic loops allow early exit but do not support JAX reverse-mode
 differentiation through the physics step.
 """
@@ -60,6 +60,17 @@ _FIELD_VERTEX_SEGMENTS = ((0, 4), (0, 2), (1, 5), (1, 3), (2, 6), (3, 7),
 _SQUARE_VERTEX_ENDS = ((0, 0), (0, 1), (1, 1), (2, 1))
 
 
+# A robot spins up to ~49 rad/s, nearly a radian per substep. The ball's path in
+# the robot frame is an arc; each interval replaces it by its chord. The chord's
+# sagitta is r * dtheta**2 / 8 (well under 1 mm at four intervals), and the
+# contact normal uses the interval's mean orientation.
+ROBOT_SWEEP_INTERVALS = 2
+
+# A swept impact leaves the ball exactly touching. Overlap below this is float
+# roundoff, not contact: counting it makes a second impulse depend on noise.
+CONTACT_SLOP = 1e-6
+
+
 def _vertices(segments, ends):
     return segments[jnp.asarray([i for i, _ in ends]),
                     jnp.asarray([j for _, j in ends])]
@@ -100,12 +111,16 @@ def _allow_field_reentry(times, pos, delta, segments):
 
 def _cast_segments(
     pos: jnp.ndarray, delta: jnp.ndarray, segments: jnp.ndarray,
-    vertices: jnp.ndarray,
+    vertices: jnp.ndarray, inward: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Cast a circle centre against finite segments expanded by its radius.
 
     Return candidate fractions and unit normals for faces and both endpoints.
-    Initial deep overlaps are left for the discrete position solver. Candidates
+    Initial overlaps are left for the discrete position solver, except that
+    when ``inward`` (the playable-side normal of each segment) is given, a
+    face the centre is still on the playable side of, and is moving into,
+    is a t=0 hit: otherwise a ball a hair inside a wall escapes it in one
+    substep. Candidates
     at contact moving away or parallel are rejected, avoiding repeated zero-time
     events. Fractions outside [0, 1] are returned as infinity.
     """
@@ -121,10 +136,15 @@ def _cast_segments(
     normal_speed = jnp.sum(delta[None, :] * normals, axis=-1)
     safe_speed = jnp.where(jnp.abs(normal_speed) > 1e-12, normal_speed, 1.0)
     face_t = (side * radius - signed) / safe_speed
+    overlapping = jnp.abs(signed) < radius - 1e-6
+    if inward is not None:
+        playable_side = signed * jnp.sum(normals * inward, axis=-1) > 0.0
+        face_t = jnp.where(overlapping & playable_side, 0.0, face_t)
+        overlapping = overlapping & ~playable_side
     face_point = pos[None, :] + face_t[:, None] * delta[None, :]
     along = jnp.sum((face_point - a) * tangent, axis=-1)
     face_valid = (
-        (jnp.abs(signed) >= radius - 1e-6)
+        ~overlapping
         & (normal_speed * side < -1e-9)
         # Float32 may represent an exact contact just inside the radius. For
         # an approaching sweep treat that numerical overlap as a t=0 hit,
@@ -245,12 +265,15 @@ def advance_ball(state, robot_start, sub_dt, ball_face_impulse):
     (including ball spin and vertical velocity). If the event budget is fully
     consumed, residual travel is conservatively discarded for this substep.
 
-    Robot paths use linear translation and constant starting orientation.
-    Angular motion and trajectory changes caused by impacts are not swept.
+    Robot paths use linear translation and linearly interpolated orientation,
+    swept in ``ROBOT_SWEEP_INTERVALS`` chords of the ball's robot-frame path. Trajectory
+    changes caused by impacts are not swept.
     """
     start = robot_start.reshape((-1, 6))
     end_pos = state.robots.reshape((-1, 6))[:, :2]
     robot_theta = start[:, 2]
+    end_theta = state.robots.reshape((-1, 6))[:, 2]
+    robot_dtheta = (end_theta - robot_theta + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
     field_segments = _field_segments()
     square_segments = _square_segments()
     field_vertices = _vertices(field_segments, _FIELD_VERTEX_ENDS)
@@ -268,23 +291,42 @@ def advance_ball(state, robot_start, sub_dt, ball_face_impulse):
         current, remaining, elapsed, goal = carry
         pos = current.ball[:2]
         delta = current.ball[2:4] * remaining
-        wall_t, wall_n = _cast_segments(pos, delta, field_segments, field_vertices)
+        wall_t, wall_n = _cast_segments(pos, delta, field_segments, field_vertices, _field_inward_normals())
         wall_t = _allow_field_reentry(wall_t, pos, delta, field_segments)
 
         at_start = start[:, :2] + elapsed * (end_pos - start[:, :2])
         robot_delta = (1.0 - elapsed) * (end_pos - start[:, :2])
-        local_pos = _to_local(pos[None, :] - at_start, robot_theta)
-        local_delta = _to_local(delta[None, :] - robot_delta, robot_theta)
-        robot_t, local_n = jax.vmap(_cast_segments, in_axes=(0, 0, None, None))(
-            local_pos, local_delta, square_segments, square_vertices
-        )
-        # A segment cast is two-sided: without this mask a ball that starts
-        # inside a robot can spuriously bounce from the robot's interior face.
-        # Existing overlaps are resolved by the discrete contact solver.
-        outside = jnp.maximum(jnp.abs(local_pos) - config.ROBOT_SIZE / 2.0, 0.0)
-        initially_overlapping = jnp.linalg.norm(outside, axis=-1) < radius - 1e-6
-        robot_t = jnp.where(initially_overlapping[:, None], jnp.inf, robot_t)
-        robot_n = _to_world(local_n, robot_theta[:, None])
+        # Cast the ball's path in the robot's own frame, one chord per interval
+        # of the remaining window. Expressing both interval endpoints in the
+        # robot frame at their own times captures the robot's rotation, so a
+        # spinning corner can hit a stationary ball.
+        interval_t, interval_n = [], []
+        for k in range(ROBOT_SWEEP_INTERVALS):
+            lead0 = k / ROBOT_SWEEP_INTERVALS
+            lead1 = (k + 1) / ROBOT_SWEEP_INTERVALS
+            theta0 = robot_theta + (elapsed + (1.0 - elapsed) * lead0) * robot_dtheta
+            theta1 = robot_theta + (elapsed + (1.0 - elapsed) * lead1) * robot_dtheta
+            local_pos = _to_local(pos[None, :] + lead0 * delta[None, :] - at_start - lead0 * robot_delta, theta0)
+            local_end = _to_local(pos[None, :] + lead1 * delta[None, :] - at_start - lead1 * robot_delta, theta1)
+            local_delta = local_end - local_pos
+            theta_k = 0.5 * (theta0 + theta1)
+            t_k, local_n = jax.vmap(_cast_segments, in_axes=(0, 0, None, None))(
+                local_pos, local_delta, square_segments, square_vertices
+            )
+            # A segment cast is two-sided: without this mask a ball that starts
+            # inside a robot can spuriously bounce from the robot's interior face.
+            # Existing overlaps are resolved by the discrete contact solver.
+            outside = jnp.maximum(jnp.abs(local_pos) - config.ROBOT_SIZE / 2.0, 0.0)
+            initially_overlapping = jnp.linalg.norm(outside, axis=-1) < radius - 1e-6
+            t_k = jnp.where(initially_overlapping[:, None], jnp.inf, t_k)
+            interval_t.append((k + t_k) / ROBOT_SWEEP_INTERVALS)
+            interval_n.append(_to_world(local_n, theta_k[:, None]))
+        interval_t = jnp.stack(interval_t)
+        first_interval = jnp.argmin(interval_t, axis=0)
+        robot_t = jnp.min(interval_t, axis=0)
+        robot_n = jnp.take_along_axis(
+            jnp.stack(interval_n), first_interval[None, :, :, None], axis=0
+        )[0]
         # The translating-square cast approximates rotation, while response
         # includes the robot's angular surface velocity. Discard candidates
         # that are separating under that same response model: they produce no

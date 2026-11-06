@@ -11,6 +11,7 @@ References
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 
 
@@ -136,6 +137,21 @@ ROBOT_MAX_WHEEL_SPEED: float = ROBOT_MAX_MOTOR_SPEED * ROBOT_WHEEL_RADIUS  # ≈
 # producing smoother (less jerky) trajectories. 1 g ≈ 9.81 m/s² is a typical
 # bound for VSSS-class robots; 0 → max takes ~133 ms (~8 physics sub-steps).
 ROBOT_WHEEL_ACCEL_LIMIT: float = 1.0 * 9.81  # m/s² (≈ 1 g)
+
+# Dynamic drive (``ROBOT_DRIVE_MODEL == "dynamic"``). In the default
+# "kinematic" model wheel commands overwrite robot velocity every sub-step.
+# In "dynamic" the velocity is state: each wheel is a DC motor whose force is
+# proportional to the wheel-speed error (stall force at full error equal to
+# ``ROBOT_MOTOR_MAX_TORQUE / ROBOT_WHEEL_RADIUS``), capped by wheel traction.
+# Sources: motor torque from travesim ``protos/GenericVssRobot.proto``
+# (``maxTorque 0.073``); wheel-floor friction from ITAndroids VSS firmware
+# (``STATIC_FRICTION_COEF 0.7``). Traction caps acceleration at mu*g (~0.7 g),
+# below the kinematic model's 1 g wheel slew.
+ROBOT_MOTOR_MAX_TORQUE: float = 0.073       # N*m per wheel at stall
+ROBOT_WHEEL_FLOOR_FRICTION: float = 0.7     # wheel-floor Coulomb coefficient
+GRAVITY: float = 9.81                       # m/s^2
+ROBOT_DRIVE_MODEL: str = os.environ.get("VSSS_ROBOT_DRIVE", "kinematic")
+ROBOT_DRIVE_MODELS: tuple[str, ...] = ("kinematic", "dynamic")
 
 # Simulation
 FPS: float = 10.0           # control loop frequency in-game (Hz)
