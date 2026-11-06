@@ -16,6 +16,7 @@ final snapshot already exists is skipped, so a crashed run resumes where it stop
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -90,6 +91,44 @@ def max_lineages(config: dict, probe_generations: int) -> int:
     return low
 
 
+def fits_concurrent(config: dict, processes: int, probe_generations: int) -> bool:
+    """True if ``processes`` single-lineage runs complete at the same time."""
+    with tempfile.TemporaryDirectory(prefix="vsss-probe-") as tmp:
+        def one(index: int) -> int:
+            probe = {
+                **config,
+                "experiment_name": f"probe_p{index}",
+                "num_lineages": 1,
+                "num_generations": probe_generations,
+                "snapshot_interval": 1,
+                "output_root": str(Path(tmp) / f"out{index}"),
+                "require_gpu": True,
+            }
+            return run_training(probe, Path(tmp) / f"cfg{index}", Path(tmp) / f"probe{index}.log")
+
+        with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+            ok = all(code == 0 for code in pool.map(one, range(processes)))
+    print(f"  probe {processes:>3} concurrent processes: {'fit' if ok else 'FAILED'}", flush=True)
+    return ok
+
+
+def max_concurrent(config: dict, probe_generations: int) -> int:
+    total = int(config["num_lineages"])
+    if not fits_concurrent(config, 1, probe_generations):
+        raise SystemExit("one process does not fit (or training is broken)")
+    low, high = 1, total
+    if fits_concurrent(config, total, probe_generations):
+        return total
+    high -= 1
+    while low < high:
+        mid = (low + high + 1) // 2
+        if fits_concurrent(config, mid, probe_generations):
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
 def split_waves(total: int, width: int) -> list[int]:
     count = math.ceil(total / width)
     base, extra = divmod(total, count)
@@ -110,39 +149,64 @@ def main() -> None:
     parser.add_argument("--margin", type=int, default=0,
                         help="Subtract this many lineages from the probed maximum for headroom.")
     parser.add_argument("--probe-only", action="store_true")
+    parser.add_argument("--per-lineage-processes", action="store_true",
+                        help="Run every lineage as its own process (num_lineages=1), several at once, "
+                             "so all running lineages progress together. Lower total throughput than "
+                             "batching lineages in one process.")
+    parser.add_argument("--concurrent", type=int,
+                        help="With --per-lineage-processes: processes at once (default: probed).")
     args = parser.parse_args()
 
     for name in args.xp:
         config, source = load_config(name)
         total = int(config["num_lineages"])
         print(f"== {config['experiment_name']}: {total} lineages x {config['num_envs_per_lineage']} envs ==")
-        width = args.lineages_per_wave or max_lineages(config, args.probe_generations)
-        width = max(1, min(total, width - args.margin))
-        sizes = split_waves(total, width)
-        print(f"  max fitting width (after margin): {width} -> waves {sizes}", flush=True)
+        if args.per_lineage_processes:
+            concurrency = args.concurrent or max_concurrent(config, args.probe_generations)
+            concurrency = max(1, min(total, concurrency - args.margin))
+            sizes = [1] * total
+            print(f"  concurrent single-lineage processes (after margin): {concurrency}", flush=True)
+        else:
+            width = args.lineages_per_wave or max_lineages(config, args.probe_generations)
+            width = max(1, min(total, width - args.margin))
+            sizes = split_waves(total, width)
+            concurrency = 1
+            print(f"  max fitting width (after margin): {width} -> waves {sizes}", flush=True)
         if args.probe_only:
             continue
         out_dir = Path(config["output_root"]) / config["experiment_name"]
         out_dir.parent.mkdir(parents=True, exist_ok=True)
-        for index, size in enumerate(sizes):
+        suffix = "l" if args.per_lineage_processes else "w"
+
+        def run_unit(index: int, size: int) -> None:
             wave = {
                 **config,
-                "experiment_name": f"{config['experiment_name']}_w{index:02d}",
+                "experiment_name": f"{config['experiment_name']}_{suffix}{index:02d}",
                 "num_lineages": size,
                 "seed": int(config["seed"]) + 1000 * index,
             }
             if wave_done(wave):
-                print(f"  wave {index}: already complete, skipping")
-                continue
+                print(f"  {suffix}{index}: already complete, skipping", flush=True)
+                return
             partial = Path(wave["output_root"]) / wave["experiment_name"]
             if partial.exists():
                 shutil.move(str(partial), str(partial) + ".incomplete")  # run_experiment needs a fresh dir
-                print(f"  wave {index}: moved unfinished output to {partial}.incomplete")
+                print(f"  {suffix}{index}: moved unfinished output to {partial}.incomplete", flush=True)
             log = Path(wave["output_root"]) / f"{wave['experiment_name']}.log"
-            print(f"  wave {index}: {size} lineages, log {log}", flush=True)
+            print(f"  {suffix}{index}: {size} lineage(s), log {log}", flush=True)
             code = run_training(wave, Path(wave["output_root"]) / "_wave_configs", log)
             if code != 0:
-                raise SystemExit(f"wave {index} failed (exit {code}); see {log}")
+                raise RuntimeError(f"{suffix}{index} failed (exit {code}); see {log}")
+
+        with concurrent.futures.ThreadPoolExecutor(concurrency) as pool:
+            futures = [pool.submit(run_unit, i, size) for i, size in enumerate(sizes)]
+            for future in futures:
+                try:
+                    future.result()
+                except RuntimeError as error:
+                    for other in futures:
+                        other.cancel()
+                    raise SystemExit(str(error))
         print(f"== {config['experiment_name']} done ==")
 
 
