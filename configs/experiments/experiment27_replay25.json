@@ -1,0 +1,29 @@
+{
+  "experiment_name": "experiment27_replay25",
+  "num_generations": 3000,
+  "num_lineages": 16,
+  "num_envs_per_lineage": 1024,
+  "rollout_length": 128,
+  "learning_rate": 0.0003,
+  "update_epochs": 4,
+  "num_minibatches": 8,
+  "hidden_sizes": [
+    300,
+    200,
+    100
+  ],
+  "seed": 2700,
+  "snapshot_interval": 50,
+  "active_pool_limit": null,
+  "max_episode_steps": 100,
+  "init_mode": "random",
+  "curriculum_replay_fraction": 0.25,
+  "reward_profile": "brandao_reward",
+  "output_root": "outputs/experiments",
+  "evaluation_matches": 100,
+  "evaluation_seconds": 120,
+  "require_gpu": true,
+  "policy_architecture": "brandao_shared",
+  "opponent_update_threshold": 0.6,
+  "opponent_update_score": "evaluation"
+}
