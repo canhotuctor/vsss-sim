@@ -398,6 +398,44 @@ def _normal_entropy(log_std: jax.Array) -> jax.Array:
     return jnp.sum(log_std + 0.5 * (1.0 + _LOG_2PI), axis=-1)
 
 
+# Marsaglia-Tsang accepts each proposal with probability >= 0.95 for shape >= 1
+# (smaller shapes are boosted to shape + 1), so all ten are rejected with
+# probability <= 0.05**10 ~ 1e-13 per draw.
+_GAMMA_PROPOSALS = 10
+
+
+def _fixed_trip_loggamma(key: jax.Array, shape: jax.Array) -> jax.Array:
+    """Log of Gamma(shape, 1) draws from a fixed number of proposals.
+
+    Marsaglia-Tsang rejection sampling, as in ``jax.random.loggamma``, but
+    every element evaluates the same ``_GAMMA_PROPOSALS`` candidates and keeps
+    the first accepted one. That replaces a data-dependent while loop (a host
+    round trip per trip on GPU) with straight-line code. If every proposal is
+    rejected, the element falls back to ``log(d)``, the proposal's centre.
+    """
+    dtype = shape.dtype
+    boost = shape < 1.0
+    boosted = jnp.where(boost, shape + 1.0, shape)
+    d = boosted - jnp.asarray(1.0 / 3.0, dtype)
+    c = jax.lax.rsqrt(9.0 * d)
+    normal_key, accept_key, boost_key = jax.random.split(key, 3)
+    proposal_shape = (_GAMMA_PROPOSALS, *shape.shape)
+    x = jax.random.normal(normal_key, proposal_shape, dtype)
+    log_u = jnp.log1p(-jax.random.uniform(accept_key, proposal_shape, dtype))
+    t = 1.0 + c * x
+    positive = t > 0.0
+    log_v = 3.0 * jnp.log(jnp.where(positive, t, 1.0))
+    v = t * t * t
+    accepted = positive & (log_u < 0.5 * x * x + d - d * v + d * log_v)
+    log_d = jnp.log(d)
+    log_sample = log_d
+    for proposal in reversed(range(_GAMMA_PROPOSALS)):
+        log_sample = jnp.where(accepted[proposal], log_d + log_v[proposal], log_sample)
+    # Gamma(a) = Gamma(a + 1) * U ** (1 / a) for a < 1.
+    log_boost = jnp.log1p(-jax.random.uniform(boost_key, shape.shape, dtype)) / shape
+    return log_sample + jnp.where(boost, log_boost, 0.0)
+
+
 def _sample_beta(
     key: jax.Array, alpha: jax.Array, beta: jax.Array
 ) -> jax.Array:
@@ -409,7 +447,7 @@ def _sample_beta(
     while retaining independent draws for every element.
     """
     alpha, beta = jnp.broadcast_arrays(alpha, beta)
-    log_alpha, log_beta = jax.random.loggamma(key, jnp.stack((alpha, beta)))
+    log_alpha, log_beta = _fixed_trip_loggamma(key, jnp.stack((alpha, beta)))
     log_max = jnp.maximum(log_alpha, log_beta)
     alpha_scaled = jnp.exp(log_alpha - log_max)
     beta_scaled = jnp.exp(log_beta - log_max)

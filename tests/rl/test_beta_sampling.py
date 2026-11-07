@@ -42,20 +42,43 @@ def test_batched_beta_moments_and_independent_policy_groups():
     assert (np.abs(correlations) < 0.04).all()
 
 
-def _count_gamma_draws(graph):
+def _while_loops(graph):
     if isinstance(graph, (tuple, list)):
-        return sum(_count_gamma_draws(value) for value in graph)
+        return sum(_while_loops(value) for value in graph)
     graph = getattr(graph, "jaxpr", graph)
     if not hasattr(graph, "eqns"):
         return 0
     return sum(
-        int(equation.primitive.name == "random_gamma")
-        + sum(_count_gamma_draws(value) for value in equation.params.values())
+        int(equation.primitive.name == "while")
+        + sum(_while_loops(value) for value in equation.params.values())
         for equation in graph.eqns
     )
 
 
-def test_self_play_rollout_batches_learner_and_opponent_gamma_draws():
+def test_beta_sampler_has_no_data_dependent_loop():
+    graph = jax.make_jaxpr(_sample_beta)(
+        jax.random.PRNGKey(0), jnp.ones((4, 2)), jnp.full((4, 2), 3.0)
+    )
+    assert _while_loops(graph) == 0
+
+
+def test_beta_sampler_matches_jax_beta_distribution():
+    alpha = jnp.full((65536,), 1.3)
+    beta = jnp.full((65536,), 4.0)
+    ours = np.sort(np.asarray(_sample_beta(jax.random.PRNGKey(1), alpha, beta)))
+    reference = np.sort(np.asarray(jax.random.beta(jax.random.PRNGKey(2), alpha, beta)))
+    # Two-sample Kolmogorov-Smirnov statistic; critical value ~0.0085 at 1e-3.
+    grid = np.linspace(0.0, 1.0, 2001)
+    ks = np.max(np.abs(
+        np.searchsorted(ours, grid) / ours.size
+        - np.searchsorted(reference, grid) / reference.size
+    ))
+    assert ks < 0.0085
+
+
+def test_self_play_rollout_batches_learner_and_opponent_beta_draws(monkeypatch):
+    from vsss_sim.rl import ppo
+
     trainer = PPO(
         VSSJumanjiEnv(
             max_episode_steps=2,
@@ -71,8 +94,14 @@ def test_self_play_rollout_batches_learner_and_opponent_gamma_draws():
     generations = jnp.asarray((0,), dtype=jnp.int32)
     runner = trainer.initialize(key, pool, probabilities, generations)
 
-    rollout = jax.make_jaxpr(trainer._collect_rollout)(
-        runner, pool, probabilities, generations
-    )
+    calls = []
+    sample_beta = ppo._sample_beta
 
-    assert _count_gamma_draws(rollout) == 1
+    def counting_sample_beta(*args):
+        calls.append(None)
+        return sample_beta(*args)
+
+    monkeypatch.setattr(ppo, "_sample_beta", counting_sample_beta)
+    jax.make_jaxpr(trainer._collect_rollout)(runner, pool, probabilities, generations)
+
+    assert len(calls) == 1

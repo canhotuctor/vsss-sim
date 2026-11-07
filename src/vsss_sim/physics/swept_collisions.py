@@ -66,6 +66,11 @@ _SQUARE_VERTEX_ENDS = ((0, 0), (0, 1), (1, 1), (2, 1))
 # contact normal uses the interval's mean orientation.
 ROBOT_SWEEP_INTERVALS = 2
 
+# Ball wall/robot/goal events resolved per substep; leftover travel is dropped.
+# The first UNROLLED_BALL_EVENTS run without a data-dependent loop.
+MAX_BALL_EVENTS = 4
+UNROLLED_BALL_EVENTS = 2
+
 # A swept impact leaves the ball exactly touching. Overlap below this is float
 # roundoff, not contact: counting it makes a second impulse depend on noise.
 CONTACT_SLOP = 1e-6
@@ -261,7 +266,7 @@ def advance_ball(state, robot_start, sub_dt, ball_face_impulse):
 
     ``state`` contains the pre-movement ball and predicted end-of-substep
     robots. ``robot_start`` contains robot poses at the beginning of that
-    substep. A bounded four-event loop preserves the existing contact impulse
+    substep. A bounded ``MAX_BALL_EVENTS`` loop preserves the existing contact impulse
     (including ball spin and vertical velocity). If the event budget is fully
     consumed, residual travel is conservatively discarded for this substep.
 
@@ -408,16 +413,24 @@ def advance_ball(state, robot_start, sub_dt, ball_face_impulse):
         elapsed = jnp.where(active, hit_elapsed, elapsed)
         return current, remaining, elapsed, new_goal
 
-    def event_cond(carry):
-        count, _, remaining, _, goal = carry
-        return (count < 4) & (remaining > 0.0) & (goal == 0)
+    # Nearly every environment needs one event and a batch rarely more than
+    # two, so run the first ``UNROLLED_BALL_EVENTS`` unconditionally (no loop
+    # predicate, which a GPU while loop syncs to the host on every trip) and
+    # loop only for the rare remainder. Once an environment has no remaining
+    # travel or has scored, ``body`` is a no-op for it (zero fraction, no impulse).
+    carry = (state, sub_dt, jnp.float32(0.0), initial_goal)
+    for event in range(UNROLLED_BALL_EVENTS):
+        carry = body(event, carry)
 
-    def event_body(carry):
-        count, current, remaining, elapsed, goal = carry
-        current, remaining, elapsed, goal = body(count, (current, remaining, elapsed, goal))
-        return count + 1, current, remaining, elapsed, goal
+    def event_cond(loop_carry):
+        count, (_, remaining, _, goal) = loop_carry
+        return (count < MAX_BALL_EVENTS) & (remaining > 0.0) & (goal == 0)
 
-    _, current, _, _, goal = jax.lax.while_loop(
-        event_cond, event_body, (0, state, sub_dt, jnp.float32(0.0), initial_goal)
+    def event_body(loop_carry):
+        count, inner = loop_carry
+        return count + 1, body(count, inner)
+
+    _, (current, _, _, goal) = jax.lax.while_loop(
+        event_cond, event_body, (UNROLLED_BALL_EVENTS, carry)
     )
     return current, goal

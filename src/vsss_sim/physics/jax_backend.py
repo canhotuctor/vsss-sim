@@ -216,21 +216,21 @@ def reset_random(key: jnp.ndarray) -> SimState:
 # Robot–wall collisions (vectorised)
 # ---------------------------------------------------------------------------
 
-def _robot_wall_collisions(state: SimState) -> SimState:
-    """Keep robot footprints inside the field and the two goal pockets."""
+def _robot_wall_positions(
+    x: jnp.ndarray, y: jnp.ndarray, cos_t: jnp.ndarray, sin_t: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Clamp robot centres to the field and goal pockets.
+
+    Returns ``(new_x, new_y, lim_x, effective_lim_y)``; the limits let the
+    velocity-level caller detect which walls were exceeded.
+    """
     half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     half = jnp.float32(config.ROBOT_SIZE / 2.0)
 
-    theta = state.robots[:, :, 2]
-    extent = half * (jnp.abs(jnp.cos(theta)) + jnp.abs(jnp.sin(theta)))
+    extent = half * (jnp.abs(cos_t) + jnp.abs(sin_t))
 
     lim_y = half_w - extent
-
-    x = state.robots[:, :, 0]
-    y = state.robots[:, :, 1]
-    vx = state.robots[:, :, 3]
-    vy = state.robots[:, :, 4]
 
     # Once the centre is behind the goal line, the pocket side walls confine
     # the robot. At the entrance its entire footprint must fit between posts.
@@ -243,13 +243,25 @@ def _robot_wall_collisions(state: SimState) -> SimState:
     lim_x = half_l - extent + jnp.where(in_pocket | fits_opening, config.GOAL_DEPTH, 0.0)
     # Side-wall contact applies only behind the goal line.
     effective_lim_y = jnp.where(in_pocket, pocket_y, lim_y)
+    new_x = jnp.clip(x, -lim_x, lim_x)
+    return new_x, new_y, lim_x, effective_lim_y
+
+
+def _robot_wall_collisions(state: SimState) -> SimState:
+    """Keep robot footprints inside the field and the two goal pockets."""
+    theta = state.robots[:, :, 2]
+    x = state.robots[:, :, 0]
+    y = state.robots[:, :, 1]
+    vx = state.robots[:, :, 3]
+    vy = state.robots[:, :, 4]
+    new_x, new_y, lim_x, effective_lim_y = _robot_wall_positions(
+        x, y, jnp.cos(theta), jnp.sin(theta)
+    )
 
     exceeded_neg_x = x < -lim_x
     exceeded_pos_x = x > lim_x
     exceeded_neg_y = y < -effective_lim_y
     exceeded_pos_y = y > effective_lim_y
-
-    new_x = jnp.clip(x, -lim_x, lim_x)
 
     new_vx = jnp.where(exceeded_neg_x & (vx < 0), 0.0, vx)
     new_vx = jnp.where(exceeded_pos_x & (new_vx > 0), 0.0, new_vx)
@@ -448,30 +460,24 @@ def _ball_chamfer_collisions(state: SimState) -> SimState:
     )
 
 
-def _robot_chamfer_collisions(state: SimState) -> SimState:
-    """Clamp robots (OBB) inside the four 45° corner chamfers; zero outward velocity.
+def _robot_chamfer_positions(
+    rx: jnp.ndarray, ry: jnp.ndarray, cos_t: jnp.ndarray, sin_t: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray, list[jnp.ndarray]]:
+    """Clamp robot (OBB) centres inside the four 45° corner chamfers.
 
     For each chamfer half-plane sx·x + sy·y ≤ D, the effective limit for the
     robot centre is D − support(OBB, (sx,sy)/√2), where
       support = half · (|sx·cos θ + sy·sin θ| + |sy·cos θ − sx·sin θ|).
+    Corners apply in order; returns the clamped centres and each corner's hit
+    mask.
     """
     half_l = jnp.float32(config.FIELD_LENGTH / 2.0)
     half_w = jnp.float32(config.FIELD_WIDTH / 2.0)
     half = jnp.float32(config.ROBOT_SIZE / 2.0)
     c = jnp.float32(config.FIELD_CHAMFER)
-    inv_sqrt2 = jnp.float32(_INV_SQRT2)
 
     chamfer_diag = half_l + half_w - c
-
-    rx = state.robots[:, :, 0]
-    ry = state.robots[:, :, 1]
-    theta = state.robots[:, :, 2]
-    vx = state.robots[:, :, 3]
-    vy = state.robots[:, :, 4]
-
-    cos_t = jnp.cos(theta)
-    sin_t = jnp.sin(theta)
-
+    hits = []
     for sx, sy in zip(_CHAMFER_SX, _CHAMFER_SY):
         sx_f = jnp.float32(sx)
         sy_f = jnp.float32(sy)
@@ -488,7 +494,23 @@ def _robot_chamfer_collisions(state: SimState) -> SimState:
 
         rx = jnp.where(hit, rx - sx_f * pen * 0.5, rx)
         ry = jnp.where(hit, ry - sy_f * pen * 0.5, ry)
+        hits.append(hit)
+    return rx, ry, hits
 
+
+def _robot_chamfer_collisions(state: SimState) -> SimState:
+    """Clamp robots (OBB) inside the four 45° corner chamfers; zero outward velocity."""
+    inv_sqrt2 = jnp.float32(_INV_SQRT2)
+    theta = state.robots[:, :, 2]
+    vx = state.robots[:, :, 3]
+    vy = state.robots[:, :, 4]
+    rx, ry, hits = _robot_chamfer_positions(
+        state.robots[:, :, 0], state.robots[:, :, 1], jnp.cos(theta), jnp.sin(theta)
+    )
+
+    for sx, sy, hit in zip(_CHAMFER_SX, _CHAMFER_SY, hits):
+        sx_f = jnp.float32(sx)
+        sy_f = jnp.float32(sy)
         # Zero the velocity component pointing into the corner.
         v_out = (sx_f * vx + sy_f * vy) * inv_sqrt2
         do_zero = hit & (v_out > 0.0)
@@ -498,6 +520,15 @@ def _robot_chamfer_collisions(state: SimState) -> SimState:
     robots = state.robots.at[:, :, 0].set(rx).at[:, :, 1].set(ry)
     robots = robots.at[:, :, 3].set(vx).at[:, :, 4].set(vy)
     return state._replace(robots=robots)
+
+
+def _clamp_robot_positions(
+    xy: jnp.ndarray, cos_t: jnp.ndarray, sin_t: jnp.ndarray
+) -> jnp.ndarray:
+    """Position-only wall then chamfer clamp for flat ``(n, 2)`` robot centres."""
+    x, y, _, _ = _robot_wall_positions(xy[:, 0], xy[:, 1], cos_t, sin_t)
+    x, y, _ = _robot_chamfer_positions(x, y, cos_t, sin_t)
+    return jnp.stack([x, y], axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -593,10 +624,15 @@ def _ball_obb_penetration(
     ball_pos: jnp.ndarray, rob_pos: jnp.ndarray, theta: jnp.ndarray
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Return (world-space normal, penetration) for a ball vs square OBB."""
+    return _ball_obb_penetration_cs(ball_pos, rob_pos, jnp.cos(theta), jnp.sin(theta))
+
+
+def _ball_obb_penetration_cs(
+    ball_pos: jnp.ndarray, rob_pos: jnp.ndarray, cos_t: jnp.ndarray, sin_t: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """:func:`_ball_obb_penetration` with the robot heading's cos/sin precomputed."""
     half = jnp.float32(config.ROBOT_SIZE / 2.0)
     r_ball = jnp.float32(config.BALL_RADIUS)
-    cos_t = jnp.cos(theta)
-    sin_t = jnp.sin(theta)
 
     dx = ball_pos[0] - rob_pos[0]
     dy = ball_pos[1] - rob_pos[1]
@@ -746,10 +782,19 @@ def _sat_square_overlap(
 
     Returns ``(overlapping_bool, normal_from_B_to_A, min_overlap)``.
     """
+    return _sat_square_overlap_cs(
+        pos_a, jnp.cos(theta_a), jnp.sin(theta_a),
+        pos_b, jnp.cos(theta_b), jnp.sin(theta_b),
+    )
+
+
+def _sat_square_overlap_cs(
+    pos_a: jnp.ndarray, ca: jnp.ndarray, sa: jnp.ndarray,
+    pos_b: jnp.ndarray, cb: jnp.ndarray, sb: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """:func:`_sat_square_overlap` with both headings' cos/sin precomputed."""
     half = jnp.float32(config.ROBOT_SIZE / 2.0)
     delta = pos_a - pos_b
-    ca, sa = jnp.cos(theta_a), jnp.sin(theta_a)
-    cb, sb = jnp.cos(theta_b), jnp.sin(theta_b)
 
     axes = jnp.stack([
         jnp.stack([ca, sa]),
@@ -944,8 +989,8 @@ def _substep(
         robots=state.robots.at[:, :, :2].set(positions.robots[:, :, :2]),
     )
     state = contact_projection.project_contacts(
-        state, _ball_obb_penetration, _sat_square_overlap,
-        _robot_wall_collisions, _robot_chamfer_collisions,
+        state, _ball_obb_penetration_cs, _sat_square_overlap_cs,
+        _clamp_robot_positions,
         iterations=6,
     )
     # A goal terminates the substep at its crossing event. Later contact

@@ -229,7 +229,10 @@ as its performance baseline:
    stable scaling as JAX's Beta implementation. Standalone stochastic actions
    use the same helper. This preserves the distribution and independent draws,
    but changes the stochastic stream for a given seed; old training runs will
-   not replay bit for bit.
+   not replay bit for bit. The batched draw now uses `_fixed_trip_loggamma`
+   instead of `jax.random.loggamma`: the same Marsaglia-Tsang sampler, with ten
+   proposals per element evaluated unconditionally in place of the rejection
+   while loop. That again changes the stochastic stream.
 3. **T5: dense contact accumulation.** Pack the 15 unique robot pairs with static
    slices and broadcasts, evaluate SAT once per pair, and expand corrections
    into upper-triangular 6x6 arrays for row/column reductions. One-hot SAT axis,
