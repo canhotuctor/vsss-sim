@@ -26,5 +26,7 @@
   "policy_architecture": "brandao_shared",
   "opponent_update_threshold": 0.6,
   "opponent_update_score": "evaluation",
-  "opponent_evaluation_interval": 10
+  "opponent_evaluation_interval": 10,
+  "mirror_augmentation": true,
+  "referee_mode": "simplified"
 }
