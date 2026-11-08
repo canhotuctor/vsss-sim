@@ -454,6 +454,16 @@ def _make_env(config: ExperimentConfig) -> Any:
     )
 
 
+def _pool_capacity(config: ExperimentConfig) -> int | None:
+    """Fixed pool size for ``random_history`` so training compiles once, not per snapshot."""
+    if config.uses_promotion or config.policy_architecture not in _BRANDAO_POLICY_ARCHITECTURES:
+        return None
+    capacity = len(_snapshot_generations(config)) + 1 + (1 if config.initial_opponent_snapshot else 0)
+    if config.active_pool_limit is not None:
+        capacity = min(capacity, config.active_pool_limit)
+    return capacity
+
+
 def _active_pools(
     archives: list[SnapshotArchive],
     template_params: dict,
@@ -467,9 +477,23 @@ def _active_pools(
             expected_hidden_sizes=config.hidden_sizes,
             expected_policy_architecture=config.policy_architecture,
         )
+        ids = jnp.asarray(generations, dtype=jnp.int32)
+        capacity = _pool_capacity(config)
+        if capacity is not None:
+            if len(generations) > capacity:
+                raise ValueError(f"pool of {len(generations)} snapshots exceeds capacity {capacity}")
+            extra = capacity - len(generations)
+            # Padding repeats the first snapshot; id -1 keeps it from ever being sampled.
+            pool = jax.tree_util.tree_map(
+                lambda value: jnp.concatenate(
+                    [value, jnp.broadcast_to(value[:1], (extra,) + value.shape[1:])]
+                ),
+                pool,
+            )
+            ids = jnp.concatenate([ids, jnp.full((extra,), -1, dtype=jnp.int32)])
         pools.append(pool)
         probabilities.append(config.opponent_weights.category_probabilities())
-        generation_ids.append(jnp.asarray(generations, dtype=jnp.int32))
+        generation_ids.append(ids)
         pool_generations.append(generations)
     return (
         _stack_lineages(pools),

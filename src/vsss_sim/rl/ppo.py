@@ -816,12 +816,14 @@ class PPO:
         category_probabilities: jax.Array,
         generation_ids: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        pool_size = jax.tree_util.tree_leaves(opponent_pool)[0].shape[0]
+        # Slots with generation id -1 are padding (a fixed-capacity pool keeps the
+        # compiled shapes constant as snapshots accumulate); padding sits at the end.
+        pool_size = jnp.maximum(jnp.sum(generation_ids >= 0).astype(jnp.int32), 1)
         category_key, all_key, recent_key = jax.random.split(key, 3)
         category = jax.random.categorical(
             category_key, jnp.log(category_probabilities)
         ).astype(jnp.int32)
-        recent_count = max(1, (pool_size + 1) // 2)
+        recent_count = jnp.maximum(1, (pool_size + 1) // 2)
         all_index = jax.random.randint(all_key, (), 0, pool_size, dtype=jnp.int32)
         recent_index = pool_size - recent_count + jax.random.randint(
             recent_key, (), 0, recent_count, dtype=jnp.int32
