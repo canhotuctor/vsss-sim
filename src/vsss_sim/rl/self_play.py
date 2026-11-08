@@ -109,6 +109,7 @@ class ExperimentConfig:
     policy_architecture: str = "joint"
     mirror_augmentation: bool | None = None
     symmetry_augmentation: str = "none"
+    opponent_strategy: str = "promotion"
     opponent_update_threshold: float = 0.6
     opponent_evaluation_interval: int = 1
     opponent_update_score: str = "evaluation"
@@ -157,6 +158,8 @@ class ExperimentConfig:
             raise ValueError("opponent_evaluation_matches must be at least 1 when provided")
         if self.opponent_update_score not in ("evaluation", "training_rollout"):
             raise ValueError("opponent_update_score must be evaluation or training_rollout")
+        if self.opponent_strategy not in ("promotion", "random_history"):
+            raise ValueError("opponent_strategy must be 'promotion' or 'random_history'")
         if self.opponent_update_threshold < 0.0:
             raise ValueError("opponent_update_threshold must be non-negative")
         if self.init_mode not in ("kickoff", "random"):
@@ -281,6 +284,18 @@ class ExperimentConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def uses_promotion(self) -> bool:
+        """True when one fixed opponent is promoted by evaluation (Brandão default).
+
+        ``opponent_strategy="random_history"`` instead samples each episode's opponent
+        from all archived snapshots (``opponent_weights``), reloaded at every snapshot.
+        """
+        return (
+            self.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+            and self.opponent_strategy == "promotion"
+        )
 
 
 class SnapshotArchive:
@@ -502,7 +517,7 @@ def _snapshot_generations(config: ExperimentConfig) -> set[int]:
             config.snapshot_interval,
         )
     )
-    if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
+    if config.uses_promotion:
         # A promotion archives its candidate even between regular checkpoints.
         generations.update(range(
             config.generation_offset + config.opponent_evaluation_interval,
@@ -678,7 +693,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
     opponent_evaluator = (
         _make_candidate_evaluator(env, trainer.model, config.policy_architecture)
         if (
-            config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+            config.uses_promotion
             and config.opponent_update_score == "evaluation"
         )
         else None
@@ -809,7 +824,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
         )
 
     pool_load_started = time.perf_counter()
-    if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
+    if config.uses_promotion:
         selected_generation = (
             initial_opponent_generation
             if initial_opponent is not None
@@ -853,7 +868,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             ),
             "opponent_update_threshold": (
                 config.opponent_update_threshold
-                if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                if config.uses_promotion
                 else None
             ),
         },
@@ -871,7 +886,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
     while completed < config.num_generations:
         until_snapshot = config.snapshot_interval - completed % config.snapshot_interval
         chunk_size = min(until_snapshot, config.num_generations - completed)
-        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES:
+        if config.uses_promotion:
             until_evaluation = (
                 config.opponent_evaluation_interval
                 - completed % config.opponent_evaluation_interval
@@ -994,7 +1009,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     },
                     "opponent_generation": (
                         selected_opponent_generations[lineage]
-                        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                        if config.uses_promotion
                         else None
                     ),
                     "opponent_evaluated": False,
@@ -1006,7 +1021,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                     "opponent_replaced": False,
                     "selected_opponent_generation": (
                         selected_opponent_generations[lineage]
-                        if config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+                        if config.uses_promotion
                         else None
                     ),
                     "opponent_selector_step_counts": {
@@ -1072,7 +1087,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
             save_snapshots(range(config.num_lineages))
 
         should_evaluate = (
-            config.policy_architecture in _BRANDAO_POLICY_ARCHITECTURES
+            config.uses_promotion
             and (completed % config.opponent_evaluation_interval == 0 or is_final)
         )
         if should_evaluate:
@@ -1187,7 +1202,7 @@ def run_experiment(config: ExperimentConfig, config_source: str | Path | None = 
                 )
         elif (
             should_snapshot and not is_final
-            and config.policy_architecture not in _BRANDAO_POLICY_ARCHITECTURES
+            and not config.uses_promotion
         ):
             pool_load_started = time.perf_counter()
             pools, probabilities, generation_ids, pool_generations = _active_pools(

@@ -563,3 +563,14 @@ def test_rollout_promotion_happens_before_regular_snapshot(tmp_path, monkeypatch
     assert [item["generation"] for item in archive.list_snapshots()] == [0, 1, 2]
     events = [json.loads(line) for line in (directory / "performance.jsonl").read_text().splitlines()]
     assert len([event for event in events if event["event"] == "active_pool_reload"]) == 1
+
+
+def test_opponent_strategy_selects_promotion_or_random_history():
+    from vsss_sim.rl.self_play import ExperimentConfig
+
+    base = dict(experiment_name="x", num_generations=1, policy_architecture="brandao_shared")
+    assert ExperimentConfig(**base).uses_promotion
+    assert not ExperimentConfig(**base, opponent_strategy="random_history").uses_promotion
+    assert not ExperimentConfig(experiment_name="x", num_generations=1).uses_promotion
+    with pytest.raises(ValueError, match="opponent_strategy"):
+        ExperimentConfig(**base, opponent_strategy="bogus")
