@@ -331,3 +331,51 @@ def test_multiple_generations_run_inside_compiled_scan():
     assert all(
         np.isfinite(np.asarray(values)).all() for values in metrics_history.values()
     )
+
+
+def test_sampled_symmetry_augmentation_trains_and_keeps_stored_ppo_targets():
+    import pytest
+
+    for mode in ("mirror", "full"):
+        env = VSSJumanjiEnv(
+            max_episode_steps=2,
+            reward_profile="brandao_reward",
+            policy_architecture="brandao_shared",
+            terminate_on_goal=True,
+        )
+        config = PPOConfig(
+            num_envs=2,
+            rollout_length=2,
+            update_epochs=1,
+            num_minibatches=1,
+            symmetry_augmentation=mode,
+        )
+        trainer = PPO(env, config)
+        observation = jax.random.normal(jax.random.PRNGKey(5), (64, 3, 424))
+        batch = _TrainingBatch(
+            observation=observation,
+            raw_action=jax.random.uniform(jax.random.PRNGKey(6), (64, 3, 2)),
+            old_log_prob=jnp.ones((64, 3)),
+            old_value=jnp.ones((64, 3)),
+            advantage=jnp.ones((64, 3)),
+            target=jnp.ones((64, 3)),
+        )
+        element = jax.random.randint(
+            jax.random.PRNGKey(7), (64, 3), 0, trainer._symmetry_group_size
+        )
+        augmented = trainer._apply_symmetry(batch, element)
+        assert augmented.observation.shape == observation.shape
+        np.testing.assert_array_equal(augmented.old_log_prob, batch.old_log_prob)
+        np.testing.assert_array_equal(augmented.advantage, batch.advantage)
+        if mode == "mirror":
+            mirrored = mirror_x_axis_observation(observation)
+            same = jnp.all(augmented.observation == observation, axis=-1)
+            flipped = jnp.all(augmented.observation == mirrored, axis=-1)
+            assert bool(jnp.all(same | flipped)) and bool(jnp.any(flipped))
+
+        runner = trainer.initialize(jax.random.PRNGKey(51))
+        runner, metrics = trainer.update(runner)
+        assert all(np.isfinite(np.asarray(value)).all() for value in metrics.values())
+
+    with pytest.raises(ValueError):
+        PPOConfig(mirror_augmentation=True, symmetry_augmentation="full")

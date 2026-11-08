@@ -136,6 +136,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Use x-axis reflection augmentation (enabled by default for brandao_sets).",
     )
+    parser.add_argument(
+        "--symmetry-augmentation",
+        choices=("none", "mirror", "full"),
+        help="Update-time sampled symmetry augmentation; an override for experiment JSON.",
+    )
     parser.add_argument("--max-episode-steps", type=int)
     parser.add_argument("--opponent", choices=("stationary", "random"), default="stationary")
     parser.add_argument("--init-mode", choices=("kickoff", "random"), default="kickoff")
@@ -180,6 +185,8 @@ def main() -> None:
             )
     if args.mirror_augmentation is not None:
         overrides["mirror_augmentation"] = args.mirror_augmentation
+    if args.symmetry_augmentation is not None:
+        overrides["symmetry_augmentation"] = args.symmetry_augmentation
     if overrides:
         config = replace(config, **overrides)
     run_experiment(config, config_source=config_path)

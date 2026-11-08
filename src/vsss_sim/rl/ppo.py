@@ -20,7 +20,10 @@ from flax.training.train_state import TrainState
 from ..envs.brandao_observation import (
     FRAME_FEATURES,
     HISTORY_LENGTH,
+    MIRROR_GROUP_SIZE,
+    SYMMETRY_GROUP_SIZE,
     mirror_x_axis_observation,
+    symmetry_tables,
 )
 from ..envs.jumanji import State as EnvState
 from ..envs.jumanji import VSSJumanjiEnv
@@ -57,10 +60,22 @@ class PPOConfig:
     max_grad_norm: float = 0.5
     hidden_sizes: tuple[int, ...] = (64, 64)
     mirror_augmentation: bool = False
+    # Update-time augmentation that reuses each sample's stored old log-prob,
+    # advantage and value target (Mittal et al., ICRA 2024). Each update replaces
+    # every agent sample by one uniformly drawn group element, fixed across epochs:
+    # "mirror" draws from {identity, x-axis mirror}; "full" from the 24-element
+    # mirror x ally-order x opponent-order group.
+    symmetry_augmentation: str = "none"
     curriculum_replay_fraction: float = 0.0
     curriculum_buffer_size: int = 1024
 
     def __post_init__(self) -> None:
+        if self.symmetry_augmentation not in ("none", "mirror", "full"):
+            raise ValueError("symmetry_augmentation must be 'none', 'mirror', or 'full'")
+        if self.symmetry_augmentation != "none" and self.mirror_augmentation:
+            raise ValueError(
+                "use either mirror_augmentation or symmetry_augmentation, not both"
+            )
         if not 0.0 <= self.curriculum_replay_fraction <= 1.0:
             raise ValueError("curriculum_replay_fraction must be between 0 and 1")
         if self.curriculum_buffer_size < 1:
@@ -528,6 +543,23 @@ class PPO:
             "brandao_sets",
         ):
             raise ValueError("x-axis mirror augmentation requires a Brandao observation")
+        if config.symmetry_augmentation != "none" and self.policy_architecture not in (
+            "brandao_shared",
+            "brandao_sets",
+        ):
+            raise ValueError("symmetry augmentation requires a Brandao observation")
+        if config.symmetry_augmentation != "none":
+            index, sign, wheel_swap = symmetry_tables(
+                entity_ordered_actions=self.policy_architecture == "brandao_sets"
+            )
+            self._symmetry_index = jnp.asarray(index)
+            self._symmetry_sign = jnp.asarray(sign)
+            self._symmetry_wheel_swap = jnp.asarray(wheel_swap)
+            self._symmetry_group_size = (
+                MIRROR_GROUP_SIZE
+                if config.symmetry_augmentation == "mirror"
+                else SYMMETRY_GROUP_SIZE
+            )
         self.model = create_policy_model(self.policy_architecture, config.hidden_sizes)
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(config.max_grad_norm),
@@ -1178,6 +1210,29 @@ class PPO:
         }
         return total_loss, metrics
 
+    def _apply_symmetry(
+        self, minibatch: _TrainingBatch, element: jax.Array
+    ) -> _TrainingBatch:
+        """Replace each agent sample by its copy under group element ``element``.
+
+        Only the observation and action change. The stored old log-prob,
+        advantage, old value and value target belong to the original sample and
+        are reused unchanged, so the PPO ratio is pi(g.a | g.s) / pi_old(a | s).
+        """
+        observation = minibatch.observation
+        sample_shape = observation.shape[:-1]
+        robots = observation.shape[-2]
+        robot_rows = jnp.broadcast_to(jnp.arange(robots, dtype=jnp.int32), sample_shape)
+        index = self._symmetry_index[robot_rows, element]
+        sign = self._symmetry_sign[robot_rows, element]
+        transformed = jnp.take_along_axis(observation, index, axis=-1) * sign
+        raw_action = jnp.where(
+            self._symmetry_wheel_swap[element][..., None],
+            jnp.flip(minibatch.raw_action, axis=-1),
+            minibatch.raw_action,
+        )
+        return minibatch._replace(observation=transformed, raw_action=raw_action)
+
     def _optimize(
         self,
         train_state: TrainState,
@@ -1185,6 +1240,20 @@ class PPO:
         key: jax.Array,
         reconstruct_observation: Callable[[jax.Array], jax.Array] | None = None,
     ) -> tuple[TrainState, dict[str, jax.Array], jax.Array]:
+        # One group element per agent sample, drawn once per update and kept
+        # across epochs, so every epoch refits the same transformed samples as
+        # in ordinary multi-epoch PPO.
+        symmetry_elements = None
+        if self.config.symmetry_augmentation != "none":
+            key, element_key = jax.random.split(key)
+            symmetry_elements = jax.random.randint(
+                element_key,
+                batch.raw_action.shape[:-1],
+                0,
+                self._symmetry_group_size,
+                dtype=jnp.int32,
+            )
+
         def minibatch_step(state: TrainState, indices: jax.Array):
             if reconstruct_observation is None:
                 minibatch = jax.tree_util.tree_map(lambda value: value[indices], batch)
@@ -1217,6 +1286,8 @@ class PPO:
                         else None
                     ),
                 )
+            if self.config.symmetry_augmentation != "none":
+                minibatch = self._apply_symmetry(minibatch, symmetry_elements[indices])
             (_, metrics), grads = jax.value_and_grad(self._loss, has_aux=True)(
                 state.params, minibatch
             )

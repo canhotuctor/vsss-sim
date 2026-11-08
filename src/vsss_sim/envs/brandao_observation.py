@@ -175,3 +175,90 @@ def mirror_x_axis_observation(observation: jax.Array) -> jax.Array:
         previous_actions.reshape(frames.shape[:-1] + (6,))
     )
     return reflected.reshape(observation.shape)
+
+
+# Symmetry group of one robot's observation: x-axis mirror (2) x ally order (2)
+# x opponent order (3! = 6) = 24 elements. Element ``g`` is encoded as
+# ``mirror + 2 * (ally_swap + 2 * opponent_permutation)``, so elements 0 and 1
+# are the identity and the plain mirror.
+_OPPONENT_PERMUTATIONS = (
+    (0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)
+)
+SYMMETRY_GROUP_SIZE = 2 * 2 * len(_OPPONENT_PERMUTATIONS)
+MIRROR_GROUP_SIZE = 2
+
+
+def _frame_symmetry(
+    robot: int, mirror: bool, ally_swap: bool, opponents: tuple[int, ...],
+    entity_ordered_actions: bool,
+) -> tuple[list[int], list[float]]:
+    """Signed permutation of one 53-feature frame: ``out[j] = sign[j] * in[index[j]]``."""
+    index = list(range(FRAME_FEATURES))
+    allies = (1, 0) if ally_swap else (0, 1)
+    # Positions: entity slots self, ally0, ally1, opp0..2, ball.
+    entity_source = [0, 1 + allies[0], 1 + allies[1]] + [3 + o for o in opponents] + [6]
+    for slot, source in enumerate(entity_source):
+        index[2 * slot] = 2 * source
+        index[2 * slot + 1] = 2 * source + 1
+    # Bearings and distances: ally0, ally1, opp0..2, then fixed slots.
+    relative_source = [allies[0], allies[1]] + [2 + o for o in opponents]
+    for slot, source in enumerate(relative_source):
+        for component in range(3):
+            index[17 + 3 * slot + component] = 17 + 3 * source + component
+        index[38 + slot] = 38 + source
+    # Previous actions: blocks of (left, right) wheels per robot.
+    if entity_ordered_actions:
+        action_source = [0, 1 + allies[0], 1 + allies[1]]
+    else:
+        teammates = [other for other in range(config.N_ROBOTS) if other != robot]
+        action_source = list(range(config.N_ROBOTS))
+        if ally_swap:
+            action_source[teammates[0]], action_source[teammates[1]] = (
+                teammates[1], teammates[0]
+            )
+    for block, source in enumerate(action_source):
+        left, right = 46 + 2 * source, 47 + 2 * source
+        index[46 + 2 * block] = right if mirror else left
+        index[47 + 2 * block] = left if mirror else right
+
+    sign = [1.0] * FRAME_FEATURES
+    if mirror:
+        for slot in range(7):
+            sign[2 * slot + 1] = -1.0  # y coordinates
+        sign[14] = sign[16] = -1.0  # heading sin and normalized angle
+        for slot in range(7):
+            sign[17 + 3 * slot] = -1.0  # bearing sin
+            sign[19 + 3 * slot] = -1.0  # bearing normalized angle
+    return index, sign
+
+
+def symmetry_tables(entity_ordered_actions: bool):
+    """Return gather tables for the 24 observation symmetries.
+
+    ``index[robot, g]`` and ``sign[robot, g]`` (shape ``[3, 24, 424]``) map an
+    observation of robot row ``robot`` to its transformed copy via
+    ``obs[index] * sign``. ``wheel_swap[g]`` says whether the action's left and
+    right wheels swap. The robot row matters only for team-ordered previous
+    actions, where an ally swap exchanges two non-self action blocks.
+    """
+    import numpy as np
+
+    index = np.zeros((config.N_ROBOTS, SYMMETRY_GROUP_SIZE, OBSERVATION_SIZE), np.int32)
+    sign = np.ones((config.N_ROBOTS, SYMMETRY_GROUP_SIZE, OBSERVATION_SIZE), np.float32)
+    wheel_swap = np.zeros((SYMMETRY_GROUP_SIZE,), bool)
+    offsets = np.arange(HISTORY_LENGTH)[:, None] * FRAME_FEATURES
+    for robot in range(config.N_ROBOTS):
+        for g in range(SYMMETRY_GROUP_SIZE):
+            mirror, rest = g % 2, g // 2
+            ally_swap, opponent_index = rest % 2, rest // 2
+            frame_index, frame_sign = _frame_symmetry(
+                robot,
+                bool(mirror),
+                bool(ally_swap),
+                _OPPONENT_PERMUTATIONS[opponent_index],
+                entity_ordered_actions,
+            )
+            index[robot, g] = (offsets + np.asarray(frame_index)[None, :]).reshape(-1)
+            sign[robot, g] = np.tile(np.asarray(frame_sign, np.float32), HISTORY_LENGTH)
+            wheel_swap[g] = bool(mirror)
+    return index, sign, wheel_swap

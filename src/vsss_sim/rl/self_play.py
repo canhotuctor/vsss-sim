@@ -108,6 +108,7 @@ class ExperimentConfig:
     referee_mode: str = RefereeMode.FULL.value
     policy_architecture: str = "joint"
     mirror_augmentation: bool | None = None
+    symmetry_augmentation: str = "none"
     opponent_update_threshold: float = 0.6
     opponent_evaluation_interval: int = 1
     opponent_update_score: str = "evaluation"
@@ -224,6 +225,8 @@ class ExperimentConfig:
             "brandao_sets",
         ):
             raise ValueError("x-axis mirror augmentation requires a Brandao policy")
+        if self.symmetry_augmentation != "none" and not is_brandao_policy:
+            raise ValueError("symmetry augmentation requires a Brandao policy")
         try:
             profile = RewardProfile(self.reward_profile)
         except ValueError as error:
@@ -251,6 +254,7 @@ class ExperimentConfig:
             num_minibatches=self.num_minibatches,
             hidden_sizes=self.hidden_sizes,
             mirror_augmentation=bool(self.mirror_augmentation),
+            symmetry_augmentation=self.symmetry_augmentation,
             curriculum_replay_fraction=self.curriculum_replay_fraction,
             curriculum_buffer_size=self.curriculum_buffer_size,
         )
